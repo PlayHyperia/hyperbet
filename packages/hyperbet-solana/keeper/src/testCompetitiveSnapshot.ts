@@ -28,15 +28,19 @@ function contestant(input: {
   name: string;
   provider: string;
   model: string;
-  snapshotVersion: 1 | 2 | 3;
+  snapshotVersion: 1 | 2 | 3 | 4;
+  diagnostic: boolean;
+  loadoutFingerprint?: string | null;
 }): Record<string, unknown> {
   const availableCombatStyles = ["melee"];
+  const provider = input.diagnostic ? "diagnostic" : input.provider;
+  const model = input.diagnostic ? "diagnostic" : input.model;
   return {
     side: input.side,
     agentId: input.id,
     name: input.name,
-    provider: input.provider,
-    model: input.model,
+    provider,
+    model,
     combatLevel: 42,
     startingHp: 30,
     maxHp: 30,
@@ -45,9 +49,14 @@ function contestant(input: {
     rank: input.side === "agent1" ? 1 : 2,
     headToHeadWins: input.side === "agent1" ? 3 : 2,
     headToHeadLosses: input.side === "agent1" ? 2 : 3,
-    loadoutFingerprint: createHash("sha256")
-      .update(`test-loadout:${input.id}`)
-      .digest("hex"),
+    loadoutFingerprint:
+      input.loadoutFingerprint === undefined
+        ? createHash("sha256")
+            .update(
+              `${input.diagnostic ? "diagnostic-" : ""}test-loadout:${input.id}`,
+            )
+            .digest("hex")
+        : input.loadoutFingerprint,
     equipment: [{ slot: "weapon", itemId: "iron_sword", quantity: 1 }],
     inventory: [{ slot: 0, itemId: "shark", quantity: 3 }],
     selectedSpell: null,
@@ -72,7 +81,7 @@ function contestant(input: {
         arrowsId: null,
         shieldId: null,
         spellId: null,
-        ...(input.snapshotVersion === 3
+        ...(input.snapshotVersion >= 3
           ? {
               armorIds: {
                 helmet: null,
@@ -91,13 +100,15 @@ function contestant(input: {
     preparation: {
       primaryStyle: "melee",
       availableStyles: availableCombatStyles,
-      planningSource: "deterministic",
-      planningPolicyVersion: "keeper-test-policy-v1",
-      agentPolicyFingerprint: createHash("sha256")
-        .update(`test-policy:${input.id}`)
-        .digest("hex"),
-      modelProvider: input.provider,
-      model: input.model,
+      planningSource: input.diagnostic ? "diagnostic" : "deterministic",
+      planningPolicyVersion: input.diagnostic
+        ? "diagnostic-v1"
+        : "keeper-test-policy-v1",
+      agentPolicyFingerprint: input.diagnostic
+        ? null
+        : createHash("sha256").update(`test-policy:${input.id}`).digest("hex"),
+      modelProvider: provider,
+      model,
       ...(input.snapshotVersion >= 2
         ? {
             tacticalStrategy: {
@@ -124,19 +135,27 @@ export function buildTestCompetitiveSnapshot(input: {
   betCloseTime: number;
   agent1?: { id: string; name: string; provider?: string; model?: string };
   agent2?: { id: string; name: string; provider?: string; model?: string };
-  snapshotVersion?: 1 | 2 | 3;
+  snapshotVersion?: 1 | 2 | 3 | 4;
+  countdownDurationMs?: number;
+  diagnostic?: boolean;
+  loadoutFingerprint?: string | null;
 }): {
-  competitiveSnapshotVersion: 1 | 2 | 3;
+  competitiveSnapshotVersion: 1 | 2 | 3 | 4;
   competitiveSnapshotDigest: string;
   competitiveSnapshot: CompetitiveSnapshot;
 } {
   const agent1 = input.agent1 ?? { id: "agent-a", name: "Agent A" };
   const agent2 = input.agent2 ?? { id: "agent-b", name: "Agent B" };
-  const snapshotVersion = input.snapshotVersion ?? 3;
+  const snapshotVersion = input.snapshotVersion ?? 4;
+  const diagnostic = input.diagnostic === true;
+  const countdownDurationMs = input.countdownDurationMs ?? 10;
+  if (!Number.isSafeInteger(countdownDurationMs) || countdownDurationMs <= 0) {
+    throw new Error("test snapshot countdown must be a positive safe integer");
+  }
   const competitiveSnapshot = {
     snapshotVersion,
     persisted: true,
-    diagnostic: false,
+    diagnostic,
     preparationId: deterministicUuid(`test-preparation:${input.cycleId}`),
     cycleId: input.cycleId,
     duelId: input.duelId,
@@ -145,7 +164,21 @@ export function buildTestCompetitiveSnapshot(input: {
     betOpenTime: input.betOpenTime,
     betCloseTime: input.betCloseTime,
     combatPolicyVersion:
-      snapshotVersion === 3 ? "duel-combat-policy-v2" : "duel-combat-policy-v1",
+      snapshotVersion >= 3 ? "duel-combat-policy-v2" : "duel-combat-policy-v1",
+    ...(snapshotVersion >= 4
+      ? {
+          timing: {
+            contractVersion: 2 as const,
+            timeoutPolicy: "hp_percentage_then_damage_then_draw_v1" as const,
+            countdownDurationMs,
+            fightingDurationMs: 30,
+            endWarningDurationMs: 5,
+            maxFightDurationMs: 35,
+            fightStartTime: input.betCloseTime + countdownDurationMs,
+            fightDeadline: input.betCloseTime + countdownDurationMs + 35,
+          },
+        }
+      : {}),
     contestants: [
       contestant({
         side: "agent1",
@@ -154,6 +187,8 @@ export function buildTestCompetitiveSnapshot(input: {
         provider: agent1.provider ?? "provider-a",
         model: agent1.model ?? "model-a",
         snapshotVersion,
+        diagnostic,
+        loadoutFingerprint: input.loadoutFingerprint,
       }),
       contestant({
         side: "agent2",
@@ -162,6 +197,8 @@ export function buildTestCompetitiveSnapshot(input: {
         provider: agent2.provider ?? "provider-b",
         model: agent2.model ?? "model-b",
         snapshotVersion,
+        diagnostic,
+        loadoutFingerprint: input.loadoutFingerprint,
       }),
     ],
   } as CompetitiveSnapshot;

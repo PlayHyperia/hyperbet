@@ -16,6 +16,7 @@ const BASE_PROPS = {
   testId: "transaction-feedback",
   signatureTestId: "transaction-signature",
   signatureLabel: "Transaction signature",
+  detailsLabel: "Transaction proof",
   receiptLabel: "View transaction",
   reviewLabel: "Review latest quote",
   checkStatusLabel: "Check transaction status",
@@ -99,6 +100,17 @@ describe("SolanaTransactionFeedbackCard", () => {
     const link = container.querySelector("a");
     expect(card.getAttribute("aria-busy")).toBeNull();
     expect(card.getAttribute("data-state")).toBe("confirmed");
+    const details = getByTestId(container, "transaction-feedback-details");
+    expect(details.tagName).toBe("DETAILS");
+    expect(details.hasAttribute("open")).toBe(false);
+    expect(details.querySelector("summary")?.textContent).toBe(
+      "Transaction proof",
+    );
+    expect(details.querySelector("summary")?.getAttribute("style")).toContain(
+      "min-height: 44px",
+    );
+    click(details.querySelector("summary")!);
+    expect(details.hasAttribute("open")).toBe(true);
     expect(signature.textContent).toBe(SIGNATURE);
     expect(link?.getAttribute("href")).toBe(
       `https://explorer.solana.com/tx/${SIGNATURE}?cluster=devnet`,
@@ -108,6 +120,9 @@ describe("SolanaTransactionFeedbackCard", () => {
     expect(link?.getAttribute("aria-label")).toBe(
       "View transaction: Transaction signature",
     );
+    expect(link?.style.display).toBe("inline-flex");
+    expect(link?.style.alignItems).toBe("center");
+    expect(link?.style.minHeight).toBe("44px");
   });
 
   it("keeps the full local-validator signature visible without a broken explorer link", () => {
@@ -129,6 +144,11 @@ describe("SolanaTransactionFeedbackCard", () => {
     expect(getByTestId(container, "transaction-signature").textContent).toBe(
       SIGNATURE,
     );
+    expect(
+      getByTestId(container, "transaction-feedback-details").hasAttribute(
+        "open",
+      ),
+    ).toBe(false);
     expect(container.querySelector("a")).toBeNull();
   });
 
@@ -149,7 +169,9 @@ describe("SolanaTransactionFeedbackCard", () => {
     expect(card.getAttribute("role")).toBe("alert");
     expect(card.getAttribute("aria-live")).toBe("assertive");
     expect(card.getAttribute("aria-busy")).toBeNull();
-    click(getButtonByText(container, "Review latest quote"));
+    const reviewButton = getButtonByText(container, "Review latest quote");
+    expect(reviewButton.style.minHeight).toBe("44px");
+    click(reviewButton);
     expect(reviewCount).toBe(1);
   });
 

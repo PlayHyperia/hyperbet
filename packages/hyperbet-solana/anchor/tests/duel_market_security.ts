@@ -8,7 +8,10 @@ import {
   SIDE_BID,
   airdrop,
   createOpenMarketFixture,
+  deriveOrderPda,
+  derivePriceLevelPda,
   deriveMarketStatePda,
+  deriveUserBalancePda,
   claimClobWinnings,
   duelStatusBettingOpen,
   duelStatusLocked,
@@ -284,6 +287,260 @@ describe("duel_market security regressions", () => {
         hasProgramError(error, "InvalidRemainingAccount"),
         `expected InvalidRemainingAccount, got ${String(error)}`,
       );
+    }
+  });
+
+  it("rejects a deterministic malformed match-account matrix without custody drift", async () => {
+    const distractor = Keypair.generate();
+    const maker = Keypair.generate();
+    const taker = Keypair.generate();
+    await Promise.all([
+      airdrop(provider.connection, distractor.publicKey, 5),
+      airdrop(provider.connection, maker.publicKey, 5),
+      airdrop(provider.connection, taker.publicKey, 8),
+    ]);
+
+    const market = await createOpenMarketFixture(
+      fightProgram,
+      clobProgram,
+      authority,
+      { duelKey: uniqueDuelKey("malformed-match-account-matrix") },
+    );
+    const distractorBid = await placeClobOrder(clobProgram, {
+      marketState: market.marketState,
+      duelState: market.duelState,
+      config: market.config,
+      treasury: market.treasury,
+      marketMaker: market.marketMaker,
+      vault: market.vault,
+      user: distractor,
+      orderId: 1,
+      side: SIDE_BID,
+      price: 400,
+      amount: 1000,
+    });
+    const makerAsk = await placeClobOrder(clobProgram, {
+      marketState: market.marketState,
+      duelState: market.duelState,
+      config: market.config,
+      treasury: market.treasury,
+      marketMaker: market.marketMaker,
+      vault: market.vault,
+      user: maker,
+      orderId: 2,
+      side: SIDE_ASK,
+      price: 600,
+      amount: 1000,
+    });
+
+    const rejectedOrder = deriveOrderPda(
+      clobProgram.programId,
+      market.marketState,
+      3,
+    );
+    const rejectedBalance = deriveUserBalancePda(
+      clobProgram.programId,
+      market.marketState,
+      taker.publicKey,
+    );
+    const rejectedLevel = derivePriceLevelPda(
+      clobProgram.programId,
+      market.marketState,
+      SIDE_BID,
+      600,
+    );
+    const vaultBefore = await provider.connection.getBalance(market.vault);
+    const marketBefore = await clobProgram.account.marketState.fetch(
+      market.marketState,
+    );
+    const levelBefore = await clobProgram.account.priceLevel.fetch(
+      makerAsk.restingLevel,
+    );
+    const orderBefore = await clobProgram.account.order.fetch(makerAsk.order);
+    const makerBalanceBefore = await clobProgram.account.userBalance.fetch(
+      makerAsk.userBalance,
+    );
+    const distractorBalanceBefore = await clobProgram.account.userBalance.fetch(
+      distractorBid.userBalance,
+    );
+
+    const assertNoCustodyOrBookDrift = async (): Promise<void> => {
+      const [
+        marketAfter,
+        levelAfter,
+        orderAfter,
+        makerBalanceAfter,
+        distractorBalanceAfter,
+        vaultAfter,
+      ] = await Promise.all([
+        clobProgram.account.marketState.fetch(market.marketState),
+        clobProgram.account.priceLevel.fetch(makerAsk.restingLevel),
+        clobProgram.account.order.fetch(makerAsk.order),
+        clobProgram.account.userBalance.fetch(makerAsk.userBalance),
+        clobProgram.account.userBalance.fetch(distractorBid.userBalance),
+        provider.connection.getBalance(market.vault),
+      ]);
+
+      assert.strictEqual(
+        marketAfter.nextOrderId.toString(),
+        marketBefore.nextOrderId.toString(),
+      );
+      assert.strictEqual(marketAfter.bestBid, marketBefore.bestBid);
+      assert.strictEqual(marketAfter.bestAsk, marketBefore.bestAsk);
+      assert.strictEqual(
+        marketAfter.accruedTradeTreasuryFeeLamports.toString(),
+        marketBefore.accruedTradeTreasuryFeeLamports.toString(),
+      );
+      assert.strictEqual(
+        marketAfter.accruedTradeMarketMakerFeeLamports.toString(),
+        marketBefore.accruedTradeMarketMakerFeeLamports.toString(),
+      );
+      assert.strictEqual(
+        levelAfter.headOrderId.toString(),
+        levelBefore.headOrderId.toString(),
+      );
+      assert.strictEqual(
+        levelAfter.tailOrderId.toString(),
+        levelBefore.tailOrderId.toString(),
+      );
+      assert.strictEqual(
+        levelAfter.totalOpen.toString(),
+        levelBefore.totalOpen.toString(),
+      );
+      assert.strictEqual(
+        orderAfter.filled.toString(),
+        orderBefore.filled.toString(),
+      );
+      assert.strictEqual(orderAfter.active, orderBefore.active);
+      assert.strictEqual(
+        makerBalanceAfter.aShares.toString(),
+        makerBalanceBefore.aShares.toString(),
+      );
+      assert.strictEqual(
+        makerBalanceAfter.bShares.toString(),
+        makerBalanceBefore.bShares.toString(),
+      );
+      assert.strictEqual(
+        distractorBalanceAfter.aShares.toString(),
+        distractorBalanceBefore.aShares.toString(),
+      );
+      assert.strictEqual(
+        distractorBalanceAfter.bShares.toString(),
+        distractorBalanceBefore.bShares.toString(),
+      );
+      assert.strictEqual(vaultAfter, vaultBefore);
+      assert.strictEqual(
+        await clobProgram.account.order.fetchNullable(rejectedOrder),
+        null,
+      );
+      assert.strictEqual(
+        await clobProgram.account.userBalance.fetchNullable(rejectedBalance),
+        null,
+      );
+      assert.strictEqual(
+        await clobProgram.account.priceLevel.fetchNullable(rejectedLevel),
+        null,
+      );
+    };
+
+    const vectors: Array<{
+      name: string;
+      expectedError: string;
+      remainingAccounts: anchor.web3.AccountMeta[];
+    }> = [
+      {
+        name: "missing level",
+        expectedError: "MissingMatchAccounts",
+        remainingAccounts: [],
+      },
+      {
+        name: "order in level position",
+        expectedError: "InvalidRemainingAccount",
+        remainingAccounts: [writableAccount(makerAsk.order)],
+      },
+      {
+        name: "missing order",
+        expectedError: "MissingMatchAccounts",
+        remainingAccounts: [writableAccount(makerAsk.restingLevel)],
+      },
+      {
+        name: "market in order position",
+        expectedError: "InvalidRemainingAccount",
+        remainingAccounts: [
+          writableAccount(makerAsk.restingLevel),
+          writableAccount(market.marketState),
+        ],
+      },
+      {
+        name: "missing maker balance",
+        expectedError: "MissingMatchAccounts",
+        remainingAccounts: [
+          writableAccount(makerAsk.restingLevel),
+          writableAccount(makerAsk.order),
+        ],
+      },
+      {
+        name: "market in maker-balance position",
+        expectedError: "InvalidRemainingAccount",
+        remainingAccounts: [
+          writableAccount(makerAsk.restingLevel),
+          writableAccount(makerAsk.order),
+          writableAccount(market.marketState),
+        ],
+      },
+      {
+        name: "system account in maker-balance position",
+        expectedError: "InvalidRemainingAccount",
+        remainingAccounts: [
+          writableAccount(makerAsk.restingLevel),
+          writableAccount(makerAsk.order),
+          writableAccount(taker.publicKey),
+        ],
+      },
+      {
+        name: "same-market wrong-user maker balance",
+        expectedError: "InvalidRemainingAccount",
+        remainingAccounts: [
+          writableAccount(makerAsk.restingLevel),
+          writableAccount(makerAsk.order),
+          writableAccount(distractorBid.userBalance),
+        ],
+      },
+      {
+        name: "correct accounts in the wrong order",
+        expectedError: "InvalidRemainingAccount",
+        remainingAccounts: [
+          writableAccount(makerAsk.order),
+          writableAccount(makerAsk.restingLevel),
+          writableAccount(makerAsk.userBalance),
+        ],
+      },
+    ];
+
+    for (const vector of vectors) {
+      try {
+        await placeClobOrder(clobProgram, {
+          marketState: market.marketState,
+          duelState: market.duelState,
+          config: market.config,
+          treasury: market.treasury,
+          marketMaker: market.marketMaker,
+          vault: market.vault,
+          user: taker,
+          orderId: 3,
+          side: SIDE_BID,
+          price: 600,
+          amount: 1000,
+          remainingAccounts: vector.remainingAccounts,
+        });
+        assert.fail(`accepted malformed match graph: ${vector.name}`);
+      } catch (error: unknown) {
+        assert.ok(
+          hasProgramError(error, vector.expectedError),
+          `expected ${vector.expectedError} for ${vector.name}, got ${String(error)}`,
+        );
+      }
+      await assertNoCustodyOrBookDrift();
     }
   });
 
@@ -567,6 +824,10 @@ describe("duel_market security regressions", () => {
   it("rejects order mutation and claims during non-open lifecycle states", async () => {
     const maker = Keypair.generate();
     const now = Math.floor(Date.now() / 1000);
+    // Market/config initialization performs several finalized transactions.
+    // Keep enough wall-clock headroom for a loaded validator so the setup
+    // order is deterministically open before this test advances to Locked.
+    const betCloseTs = now + 30;
     await airdrop(provider.connection, maker.publicKey, 5);
 
     const market = await createOpenMarketFixture(
@@ -576,8 +837,8 @@ describe("duel_market security regressions", () => {
       {
         duelKey: uniqueDuelKey("guardrail-non-open-mutations"),
         betOpenTs: now - 120,
-        betCloseTs: now + 5,
-        duelStartTs: now + 5,
+        betCloseTs,
+        duelStartTs: betCloseTs,
       },
     );
 
@@ -595,12 +856,16 @@ describe("duel_market security regressions", () => {
       amount: 1000,
     });
 
-    await waitForChainUnixTimestamp(provider.connection, now + 6);
+    await waitForChainUnixTimestamp(
+      provider.connection,
+      betCloseTs + 1,
+      45_000,
+    );
     await upsertDuel(fightProgram, authority, market.duelKey, {
       status: duelStatusLocked(),
       betOpenTs: now - 120,
-      betCloseTs: now + 5,
-      duelStartTs: now + 5,
+      betCloseTs,
+      duelStartTs: betCloseTs,
       metadataUri: "https://hyperia.gg/tests/security/non-open-mutations",
     });
     await ensureOracleReady(

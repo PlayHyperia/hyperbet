@@ -23,11 +23,13 @@ jobs:
   deploy-solana-duel-v1-devnet:
     name: Deploy Solana Duel v1 to Devnet
     if: ${{ inputs.confirmation == 'DEPLOY_SOLANA_DUEL_V1_DEVNET' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: solana-devnet
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Hyperbet toolchain
         uses: ./.github/actions/setup-hyperbet
@@ -38,6 +40,11 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci-install-verified.sh root
+
+      - name: Prove SOL-only launch closure before exposing authorities
+        run: |
+          bun run ci:gate:registry:launch
+          bun run ci:scope:solana
 
       - name: Prepare and validate SOL-only deployment identities
         shell: bash
@@ -60,6 +67,7 @@ jobs:
           WINNINGS_MARKET_MAKER_FEE_BPS: ${{ vars.SOLANA_DEVNET_WINNINGS_MARKET_MAKER_FEE_BPS }}
         run: |
           set -euo pipefail
+          umask 077
           required_values=(
             TESTNET_SOLANA_DEPLOYER_KEYPAIR
             TESTNET_SOLANA_FIGHT_ORACLE_PROGRAM_KEYPAIR
@@ -92,7 +100,13 @@ jobs:
             exit 1
           fi
 
-          identity_root="$RUNNER_TEMP/hyperbet-solana-duel-v1"
+          identity_parent="${RUNNER_TEMP}/hyperbet-solana-duel-v1-identities"
+          if [[ -e "${identity_parent}" ]]; then
+            echo "Refusing to reuse an existing Solana deployment identity directory" >&2
+            exit 1
+          fi
+          install -d -m 700 "${identity_parent}"
+          identity_root="$(mktemp -d "${identity_parent}/run.XXXXXX")"
           program_keys_dir="$identity_root/solana-programs"
           install -d -m 700 "$identity_root" "$program_keys_dir"
           wallet_path="$identity_root/deployer.json"
@@ -153,11 +167,6 @@ jobs:
       - name: Prepare deployment evidence directories
         run: mkdir -p .ci-artifacts/testnet-deployment .ci-artifacts/testnet-verification
 
-      - name: Prove SOL-only launch closure
-        run: |
-          bun run ci:gate:registry:launch
-          bun run ci:scope:solana
-
       - name: Run read-only Solana deployment preflight
         run: bun run --cwd packages/hyperbet-solana deploy:preflight:devnet
 
@@ -180,9 +189,27 @@ jobs:
             --cluster devnet \
             --require-deployed
 
+      - name: Cleanup Solana deployment identities
+        if: always()
+        run: |
+          set -euo pipefail
+          identity_parent="${RUNNER_TEMP}/hyperbet-solana-duel-v1-identities"
+          case "${identity_parent}" in
+            "${RUNNER_TEMP%/}"/hyperbet-solana-duel-v1-identities)
+              if [[ -d "${identity_parent}" ]]; then
+                find "${identity_parent}" -depth -mindepth 1 -delete
+                rmdir "${identity_parent}"
+              fi
+              ;;
+            *)
+              echo "Refusing to clean an unexpected Solana deployment identity path" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Upload Solana deployment evidence
         if: always()
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: solana-duel-v1-devnet-deployment
           path: .ci-artifacts

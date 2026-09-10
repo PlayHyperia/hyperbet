@@ -9,6 +9,7 @@
 export * from './cancelOrder.js';
 export * from './claim.js';
 export * from './closeEmptyPriceLevel.js';
+export * from './closeEmptyUserBalance.js';
 export * from './closeFilledOrder.js';
 export * from './closeLosingBalance.js';
 export * from './continueOrder.js';

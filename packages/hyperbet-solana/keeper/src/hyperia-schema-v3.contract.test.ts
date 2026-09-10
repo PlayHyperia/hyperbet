@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   GameClient,
@@ -11,6 +11,7 @@ import {
   type BettingFeedStateUpdate,
 } from "./game-client";
 import { classifyDuelTerminal } from "./duelTerminalPolicy";
+import { parseStreamingOperatorMetrics as parseHyperbetStreamingOperatorMetrics } from "./streamOperatorHealth";
 
 type ExpectedTerminalDisposition =
   | { action: "settle"; winnerSide: "A" | "B" }
@@ -28,12 +29,7 @@ type HyperiaContractPayload = BettingFeedStateUpdate &
     outcome: "win" | "draw" | "cancelled" | null;
     cancellationReason: string | null;
     winReason:
-      | "kill"
-      | "forfeit"
-      | "hp_advantage"
-      | "damage_advantage"
-      | "draw"
-      | null;
+      "kill" | "forfeit" | "hp_advantage" | "damage_advantage" | "draw" | null;
     seed: string | null;
     replayHash: string | null;
   };
@@ -165,7 +161,155 @@ describe("Hyperia schema-v3 producer/Hyperbet consumer contract", () => {
         replayHash: null,
       },
     });
+    const activeCases = fixture.cases.filter(
+      ({ payload }) => payload.duelId !== null,
+    );
+    expect(activeCases).toHaveLength(16);
+    for (const contractCase of activeCases) {
+      expect(
+        contractCase.payload.competitiveSnapshotVersion,
+        contractCase.name,
+      ).toBe(4);
+      const snapshot = contractCase.payload.competitiveSnapshot as Record<
+        string,
+        unknown
+      >;
+      const timing = snapshot.timing as Record<string, unknown>;
+      expect(snapshot.snapshotVersion, contractCase.name).toBe(4);
+      expect(timing.contractVersion, contractCase.name).toBe(2);
+      expect(timing.timeoutPolicy, contractCase.name).toBe(
+        "hp_percentage_then_damage_then_draw_v1",
+      );
+      for (const field of [
+        "countdownDurationMs",
+        "fightingDurationMs",
+        "endWarningDurationMs",
+        "maxFightDurationMs",
+        "fightStartTime",
+        "fightDeadline",
+      ]) {
+        expect(Number.isSafeInteger(timing[field]), contractCase.name).toBe(
+          true,
+        );
+      }
+      expect(timing.maxFightDurationMs, contractCase.name).toBe(
+        Number(timing.fightingDurationMs) + Number(timing.endWarningDurationMs),
+      );
+      expect(timing.fightStartTime, contractCase.name).toBe(
+        Number(contractCase.payload.betCloseTime) +
+          Number(timing.countdownDurationMs),
+      );
+      expect(timing.fightDeadline, contractCase.name).toBe(
+        Number(timing.fightStartTime) + Number(timing.maxFightDurationMs),
+      );
+    }
   });
+
+  test("keeps the numeric streaming-operations producer and consumer contracts aligned", async () => {
+    const producerModulePath = resolve(
+      hyperiaRepository,
+      "packages/server/src/routes/streaming-operator-metrics.ts",
+    );
+    if (!existsSync(producerModulePath)) {
+      throw new Error(
+        `Hyperia streaming-operator producer is required at ${producerModulePath}`,
+      );
+    }
+    const producer = (await import(pathToFileURL(producerModulePath).href)) as {
+      buildStreamingOperatorMetrics(input: {
+        nowMs: number;
+        health: {
+          ready: boolean;
+          emittedAt: number;
+          checks: Record<
+            | "schedulerAuthority"
+            | "bettingFeed"
+            | "renderer"
+            | "captureClient"
+            | "encoder"
+            | "audio"
+            | "rtmpDelivery"
+            | "keeper"
+            | "projectileCostCustody",
+            { ready: boolean; reason: string | null; observedAt: number | null }
+          >;
+        };
+        rendererPerformance: {
+          overall: {
+            frames: number;
+            frameIntervalMs: { average: number; p95: number };
+            frameWorkMs: { p95: number };
+          };
+          longFrames: unknown[];
+        } | null;
+        captureHealth: {
+          targetFps: number;
+          measuredFps: number | null;
+        } | null;
+        encoderFps: number | null;
+        droppedFrames: number;
+      }): unknown;
+      parseStreamingOperatorMetrics(value: unknown): unknown;
+    };
+    const observedAtMs = 10_000;
+    const checks = Object.fromEntries(
+      [
+        "schedulerAuthority",
+        "bettingFeed",
+        "renderer",
+        "captureClient",
+        "encoder",
+        "audio",
+        "rtmpDelivery",
+        "keeper",
+        "projectileCostCustody",
+      ].map((name, index) => [
+        name,
+        {
+          ready: true,
+          reason: null,
+          observedAt: observedAtMs - 100 - index,
+        },
+      ]),
+    ) as Record<
+      | "schedulerAuthority"
+      | "bettingFeed"
+      | "renderer"
+      | "captureClient"
+      | "encoder"
+      | "audio"
+      | "rtmpDelivery"
+      | "keeper"
+      | "projectileCostCustody",
+      { ready: boolean; reason: string | null; observedAt: number | null }
+    >;
+    const metrics = producer.buildStreamingOperatorMetrics({
+      nowMs: observedAtMs,
+      health: { ready: true, emittedAt: observedAtMs, checks },
+      rendererPerformance: {
+        overall: {
+          frames: 600,
+          frameIntervalMs: { average: 16.667, p95: 18 },
+          frameWorkMs: { p95: 7 },
+        },
+        longFrames: [],
+      },
+      captureHealth: { targetFps: 30, measuredFps: 29.97 },
+      encoderFps: 29.9,
+      droppedFrames: 0,
+    });
+
+    expect(parseHyperbetStreamingOperatorMetrics(metrics)).toEqual(
+      producer.parseStreamingOperatorMetrics(metrics),
+    );
+    const corrupted = structuredClone(metrics) as {
+      frames: { rendererLongFrameCount: number; rendererSamples: number };
+    };
+    corrupted.frames.rendererLongFrameCount =
+      corrupted.frames.rendererSamples + 1;
+    expect(parseHyperbetStreamingOperatorMetrics(corrupted)).toBeNull();
+    expect(producer.parseStreamingOperatorMetrics(corrupted)).toBeNull();
+  }, 60_000);
 
   test("parses every actual Hyperia frame without losing canonical identity or terminal semantics", () => {
     for (const contractCase of fixture.cases) {
@@ -319,7 +463,10 @@ describe("Hyperia schema-v3 producer/Hyperbet consumer contract", () => {
       { ...announcement.payload, phase: "SETTLING" },
       { ...announcement.payload, betOpenTime: -1 },
       { ...announcement.payload, outcome: "loss" as "win" },
-      { ...announcement.payload, agent1: { id: "", name: "Agent Alpha" } },
+      {
+        ...announcement.payload,
+        agent1: { ...announcement.payload.agent1!, id: "" },
+      },
       { ...announcement.payload, replayHash: "not-a-hash" },
       { ...win.payload, winnerId: null },
       { ...win.payload, phase: "FIGHTING" },
@@ -356,6 +503,35 @@ describe("Hyperia schema-v3 producer/Hyperbet consumer contract", () => {
       },
       {
         ...announcement.payload,
+        agent1: {
+          ...(announcement.payload.agent1 as Record<string, unknown>),
+          strategySummary: null,
+        } as never,
+      },
+      {
+        ...announcement.payload,
+        agent1: {
+          ...(announcement.payload.agent1 as Record<string, unknown>),
+          strategySummary: {
+            ...((announcement.payload.agent1 as Record<string, unknown>)
+              .strategySummary as Record<string, unknown>),
+            tacticalMacro: "kite",
+          },
+        } as never,
+      },
+      {
+        ...announcement.payload,
+        agent1: {
+          ...(announcement.payload.agent1 as Record<string, unknown>),
+          strategySummary: {
+            ...((announcement.payload.agent1 as Record<string, unknown>)
+              .strategySummary as Record<string, unknown>),
+            reasoning: "private model rationale",
+          },
+        } as never,
+      },
+      {
+        ...announcement.payload,
         privateBankSnapshot: [],
       } as BettingFeedStateUpdate,
       mutateSnapshot(announcement.payload, (snapshot) => {
@@ -363,6 +539,29 @@ describe("Hyperia schema-v3 producer/Hyperbet consumer contract", () => {
       }),
       mutateSnapshot(announcement.payload, (snapshot) => {
         snapshot.combatPolicyVersion = "unknown-policy";
+      }),
+      mutateSnapshot(announcement.payload, (snapshot) => {
+        const timing = snapshot.timing as Record<string, unknown>;
+        timing.timeoutPolicy = "unknown-timeout-policy";
+      }),
+      mutateSnapshot(announcement.payload, (snapshot) => {
+        const timing = snapshot.timing as Record<string, unknown>;
+        timing.contractVersion = 3;
+      }),
+      mutateSnapshot(announcement.payload, (snapshot) => {
+        const timing = snapshot.timing as Record<string, unknown>;
+        timing.maxFightDurationMs = Number(timing.maxFightDurationMs) + 1;
+      }),
+      mutateSnapshot(announcement.payload, (snapshot) => {
+        const timing = snapshot.timing as Record<string, unknown>;
+        timing.fightStartTime = Number(timing.fightStartTime) + 1;
+      }),
+      mutateSnapshot(announcement.payload, (snapshot) => {
+        const timing = snapshot.timing as Record<string, unknown>;
+        timing.fightDeadline = Number(timing.fightDeadline) + 1;
+      }),
+      mutateSnapshot(announcement.payload, (snapshot) => {
+        delete snapshot.timing;
       }),
       mutateSnapshot(announcement.payload, (snapshot) => {
         const contestants = snapshot.contestants as Array<

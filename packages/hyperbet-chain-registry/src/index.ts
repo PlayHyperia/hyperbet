@@ -316,8 +316,8 @@ const SOLANA_DEPLOYMENTS: Record<BettingSolanaCluster, BettingSolanaDeployment> 
   {
     localnet: {
       cluster: "localnet",
-      fightOracleProgramId: "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
-      goldClobMarketProgramId: "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy",
+      fightOracleProgramId: "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
+      goldClobMarketProgramId: "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG",
       goldPerpsMarketProgramId: "BFbmQbSbf3R6fMDdXKMKQZCTyMhMs9MCcjAhGDBLETXS",
       goldAmmMarketProgramId: "12E8Lz5w8Qxyj8Fh6LgsCgPDQNJMCLMV1y43LhPrH66w",
       goldMint: "DK9nBUMfdu4XprPRWeh8f6KnQiGWD8Z4xz3yzs9gpump",
@@ -325,8 +325,8 @@ const SOLANA_DEPLOYMENTS: Record<BettingSolanaCluster, BettingSolanaDeployment> 
     },
     devnet: {
       cluster: "devnet",
-      fightOracleProgramId: "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
-      goldClobMarketProgramId: "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy",
+      fightOracleProgramId: "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
+      goldClobMarketProgramId: "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG",
       goldPerpsMarketProgramId: "BFbmQbSbf3R6fMDdXKMKQZCTyMhMs9MCcjAhGDBLETXS",
       goldAmmMarketProgramId: "12E8Lz5w8Qxyj8Fh6LgsCgPDQNJMCLMV1y43LhPrH66w",
       goldMint: "DK9nBUMfdu4XprPRWeh8f6KnQiGWD8Z4xz3yzs9gpump",
@@ -334,8 +334,8 @@ const SOLANA_DEPLOYMENTS: Record<BettingSolanaCluster, BettingSolanaDeployment> 
     },
     testnet: {
       cluster: "testnet",
-      fightOracleProgramId: "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
-      goldClobMarketProgramId: "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy",
+      fightOracleProgramId: "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
+      goldClobMarketProgramId: "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG",
       goldPerpsMarketProgramId: "BFbmQbSbf3R6fMDdXKMKQZCTyMhMs9MCcjAhGDBLETXS",
       goldAmmMarketProgramId: "12E8Lz5w8Qxyj8Fh6LgsCgPDQNJMCLMV1y43LhPrH66w",
       goldMint: "",
@@ -343,8 +343,8 @@ const SOLANA_DEPLOYMENTS: Record<BettingSolanaCluster, BettingSolanaDeployment> 
     },
     "mainnet-beta": {
       cluster: "mainnet-beta",
-      fightOracleProgramId: "B5mRCRDJk9BrnH7regMWW5mpTQ8QG1CcCGSnDxMt8hmo",
-      goldClobMarketProgramId: "DYtd7AoyTX2tbmZ8vpC3mxZgqTpyaDei4TFXZukWBJEf",
+      fightOracleProgramId: "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
+      goldClobMarketProgramId: "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG",
       goldPerpsMarketProgramId: "6YjWiway8kaSjwtAinJxqWPvV3DqBVapDWAsSEZjjmbP",
       goldAmmMarketProgramId: "",
       goldMint: "DK9nBUMfdu4XprPRWeh8f6KnQiGWD8Z4xz3yzs9gpump",

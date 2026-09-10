@@ -17,7 +17,7 @@ curl -fsSL "$KEEPER_URL/api/keeper/bot-health" | jq
 
 ## Immediate Containment
 
-1. Halt quoting on affected chains.
+1. Stop the dedicated Solana duel bot so the affected market cannot receive new quotes or privileged lifecycle writes.
 2. Treat stale oracle or stale stream as higher priority than preserving uptime.
 3. Do not resolve markets manually unless lifecycle state is confirmed from authoritative chain state.
 

@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["tests/**/*.ts"],
+  "exclude": ["scripts", "target", "vendor", "tests/market_maker_bot_smoke.ts"]
+}

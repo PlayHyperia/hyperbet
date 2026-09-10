@@ -1,12 +1,24 @@
-import { defineConfig, loadEnv, type UserConfig } from "vite";
+import {
+  defineConfig,
+  loadEnv,
+  type PluginOption,
+  type PreviewServer,
+  type UserConfig,
+  type ViteDevServer,
+} from "vite";
 import react from "@vitejs/plugin-react";
 import * as path from "path";
 import * as fs from "fs";
 import { execSync } from "child_process";
 import { fileURLToPath } from "url";
-// @ts-ignore
 import { createRequire } from "module";
 import { nodePolyfills } from "vite-plugin-node-polyfills";
+import {
+  formatBundleBudgetReport,
+  verifyBundleDirectory,
+} from "./build/bundleBudget";
+import { resolveSolanaPagesBuildIdentity } from "../../../scripts/solana-pages-build-identity.mjs";
+import { resolveSolanaPagesBundleManifest } from "../../../scripts/solana-pages-bundle-manifest.mjs";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PUBLIC_SECRET_PATTERNS = [
@@ -69,7 +81,28 @@ function assertPublicBuildSecrets(
 export default defineConfig(async ({ mode }) => {
   const env = loadEnv(mode, __dirname, "");
   assertPublicBuildSecrets(mode, env);
-  const plugins: any[] = [react()];
+  const completeEnvironment = { ...env, ...process.env };
+  const deploymentIdentityInputPresent = [
+    "DEPLOY_TARGET",
+    "PAGES_PROJECT_NAME",
+    "PAGES_BUILD_IDENTITY_SHA256",
+  ].some((name) => completeEnvironment[name]?.trim());
+  const expectedDeploymentIdentitySha =
+    completeEnvironment.PAGES_BUILD_IDENTITY_SHA256?.trim() ?? "";
+  const deploymentIdentity = deploymentIdentityInputPresent
+    ? resolveSolanaPagesBuildIdentity(completeEnvironment)
+    : null;
+  if (
+    deploymentIdentity &&
+    (!/^[0-9a-f]{64}$/.test(expectedDeploymentIdentitySha) ||
+      deploymentIdentity.configSha256 !== expectedDeploymentIdentitySha)
+  ) {
+    throw new Error("[build] Pages deployment identity does not match inputs");
+  }
+  if (deploymentIdentity && mode !== deploymentIdentity.cluster) {
+    throw new Error("[build] Vite mode does not match Pages deployment rail");
+  }
+  const plugins: PluginOption[] = [react()];
   const alias: Record<string, string> = {};
   const require = createRequire(import.meta.url);
   const nodePolyfillsRoot = path.dirname(
@@ -170,7 +203,7 @@ export default defineConfig(async ({ mode }) => {
     include: ["buffer", "process"],
     globals: { global: true, process: true, Buffer: true },
     protocolImports: true,
-  }) as any;
+  }) as unknown as PluginOption;
   if (Array.isArray(polyfills)) {
     plugins.push(...polyfills);
   } else {
@@ -190,144 +223,187 @@ export default defineConfig(async ({ mode }) => {
     "public",
     "live",
   );
+  const configuredHlsRoot = process.env.VITE_HLS_ROOT?.trim();
   const useLocalAppHlsFallback =
     (process.env.VITE_ALLOW_LOCAL_HLS_FALLBACK || "").trim().toLowerCase() ===
     "true";
-  const hlsRoots = useLocalAppHlsFallback
-    ? [serverHlsRoot, localAppHlsRoot]
-    : [serverHlsRoot];
+  const hlsRoots = configuredHlsRoot
+    ? [path.resolve(configuredHlsRoot)]
+    : useLocalAppHlsFallback
+      ? [serverHlsRoot, localAppHlsRoot]
+      : [serverHlsRoot];
+  const configureHlsMiddleware = (server: ViteDevServer | PreviewServer) => {
+    server.middlewares.use("/live", (req, res, _next) => {
+      let requestPath: string;
+      try {
+        const parsed = new URL(req.url || "/", "http://localhost");
+        requestPath = decodeURIComponent(parsed.pathname || "/");
+      } catch {
+        requestPath = "/";
+      }
+
+      const relativePath =
+        requestPath === "/" ? "stream.m3u8" : requestPath.replace(/^\/+/, "");
+      const resolveFromRoots = () => {
+        for (const root of hlsRoots) {
+          const candidate = path.resolve(root, relativePath);
+          if (!candidate.startsWith(`${root}${path.sep}`)) {
+            continue;
+          }
+          if (fs.existsSync(candidate)) {
+            return candidate;
+          }
+        }
+        return null;
+      };
+
+      const filePath = resolveFromRoots();
+      if (!filePath) {
+        res.statusCode = 503;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.end("HLS stream unavailable");
+        return;
+      }
+      const ext = path.extname(filePath);
+      const contentType =
+        ext === ".m3u8"
+          ? "application/vnd.apple.mpegurl"
+          : ext === ".ts"
+            ? "video/mp2t"
+            : ext === ".m4s"
+              ? "video/iso.segment"
+              : ext === ".mp4"
+                ? "video/mp4"
+                : "application/octet-stream";
+
+      const stat = fs.statSync(filePath);
+      const rangeHeader = req.headers?.range as string | undefined;
+
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Timing-Allow-Origin", "*");
+      res.setHeader("Accept-Ranges", "bytes");
+
+      // Manifest should be revalidated; segments are immutable and CDN-cacheable.
+      if (ext === ".m3u8") {
+        res.setHeader(
+          "Cache-Control",
+          "no-store, no-cache, must-revalidate, proxy-revalidate",
+        );
+        res.setHeader("Pragma", "no-cache");
+        res.setHeader("Expires", "0");
+        res.setHeader("Surrogate-Control", "no-store");
+      } else {
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      }
+
+      if (rangeHeader) {
+        const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+        if (match) {
+          const start = match[1] ? Number.parseInt(match[1], 10) : 0;
+          const end = match[2] ? Number.parseInt(match[2], 10) : stat.size - 1;
+
+          if (
+            Number.isFinite(start) &&
+            Number.isFinite(end) &&
+            start >= 0 &&
+            end >= start &&
+            end < stat.size
+          ) {
+            res.statusCode = 206;
+            res.setHeader(
+              "Content-Range",
+              `bytes ${start}-${end}/${stat.size}`,
+            );
+            res.setHeader("Content-Length", String(end - start + 1));
+            fs.createReadStream(filePath, { start, end }).pipe(res);
+            return;
+          }
+        }
+
+        res.statusCode = 416;
+        res.setHeader("Content-Range", `bytes */${stat.size}`);
+        res.end();
+        return;
+      }
+
+      res.setHeader("Content-Length", String(stat.size));
+      fs.createReadStream(filePath).pipe(res);
+    });
+  };
   const hlsPlugin = {
     name: "hls-live-serve",
-    configureServer(server: any) {
-      server.middlewares.use("/live", (req: any, res: any, next: any) => {
-        let requestPath = "/";
-        try {
-          const parsed = new URL(req.url || "/", "http://localhost");
-          requestPath = decodeURIComponent(parsed.pathname || "/");
-        } catch {
-          requestPath = "/";
-        }
-
-        const relativePath =
-          requestPath === "/" ? "stream.m3u8" : requestPath.replace(/^\/+/, "");
-        const resolveFromRoots = () => {
-          for (const root of hlsRoots) {
-            const candidate = path.resolve(root, relativePath);
-            if (!candidate.startsWith(`${root}${path.sep}`)) {
-              continue;
-            }
-            if (fs.existsSync(candidate)) {
-              return candidate;
-            }
-          }
-          return null;
-        };
-
-        const filePath = resolveFromRoots();
-        if (!filePath) {
-          res.statusCode = 503;
-          res.setHeader("Content-Type", "text/plain; charset=utf-8");
-          res.end("HLS stream unavailable");
-          return;
-        }
-        const ext = path.extname(filePath);
-        const contentType =
-          ext === ".m3u8"
-            ? "application/vnd.apple.mpegurl"
-            : ext === ".ts"
-              ? "video/mp2t"
-              : ext === ".m4s"
-                ? "video/iso.segment"
-                : ext === ".mp4"
-                  ? "video/mp4"
-                  : "application/octet-stream";
-
-        const stat = fs.statSync(filePath);
-        const rangeHeader = req.headers?.range as string | undefined;
-
-        res.setHeader("Content-Type", contentType);
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        res.setHeader("Accept-Ranges", "bytes");
-
-        // Manifest should be revalidated; segments are immutable and CDN-cacheable.
-        if (ext === ".m3u8") {
-          res.setHeader(
-            "Cache-Control",
-            "no-store, no-cache, must-revalidate, proxy-revalidate",
-          );
-          res.setHeader("Pragma", "no-cache");
-          res.setHeader("Expires", "0");
-          res.setHeader("Surrogate-Control", "no-store");
-        } else {
-          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-        }
-
-        if (rangeHeader) {
-          const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
-          if (match) {
-            const start = match[1] ? Number.parseInt(match[1], 10) : 0;
-            const end = match[2]
-              ? Number.parseInt(match[2], 10)
-              : stat.size - 1;
-
-            if (
-              Number.isFinite(start) &&
-              Number.isFinite(end) &&
-              start >= 0 &&
-              end >= start &&
-              end < stat.size
-            ) {
-              res.statusCode = 206;
-              res.setHeader(
-                "Content-Range",
-                `bytes ${start}-${end}/${stat.size}`,
-              );
-              res.setHeader("Content-Length", String(end - start + 1));
-              fs.createReadStream(filePath, { start, end }).pipe(res);
-              return;
-            }
-          }
-
-          res.statusCode = 416;
-          res.setHeader("Content-Range", `bytes */${stat.size}`);
-          res.end();
-          return;
-        }
-
-        res.setHeader("Content-Length", String(stat.size));
-        fs.createReadStream(filePath).pipe(res);
-      });
-    },
+    configureServer: configureHlsMiddleware,
+    configurePreviewServer: configureHlsMiddleware,
   };
   plugins.push(hlsPlugin);
 
+  let resolvedBuildOutput = "";
   const buildInfoPlugin = {
     name: "emit-build-info",
-    generateBundle(this: {
-      emitFile: (file: {
-        type: "asset";
-        fileName: string;
-        source: string;
-      }) => void;
-    }) {
+    apply: "build" as const,
+    configResolved(resolvedConfig: { build: { outDir: string } }) {
+      resolvedBuildOutput = path.resolve(
+        __dirname,
+        resolvedConfig.build.outDir,
+      );
+    },
+    closeBundle() {
+      if (!resolvedBuildOutput) {
+        throw new Error("[build] Pages output directory was not resolved");
+      }
       const commitHash =
-        env.CF_PAGES_COMMIT_SHA?.trim() ||
-        process.env.GITHUB_SHA?.trim() ||
+        completeEnvironment.CF_PAGES_COMMIT_SHA?.trim() ||
+        completeEnvironment.GITHUB_SHA?.trim() ||
         readGitRevision();
+      if (deploymentIdentity && !/^[0-9a-f]{40}$/i.test(commitHash ?? "")) {
+        throw new Error(
+          "[build] deployed Pages build requires a full commit SHA",
+        );
+      }
       const buildInfo = {
+        schemaVersion: 2,
         app: "hyperbet-solana",
         mode,
         commitHash: commitHash || null,
         builtAt: new Date().toISOString(),
+        deploymentIdentity,
+        bundle: resolveSolanaPagesBundleManifest(resolvedBuildOutput),
       };
-      this.emitFile({
-        type: "asset",
-        fileName: "build-info.json",
-        source: JSON.stringify(buildInfo, null, 2),
-      });
+      const buildInfoPath = path.join(resolvedBuildOutput, "build-info.json");
+      const temporaryPath = path.join(
+        resolvedBuildOutput,
+        `.build-info.${process.pid}.tmp`,
+      );
+      try {
+        fs.writeFileSync(temporaryPath, JSON.stringify(buildInfo, null, 2), {
+          encoding: "utf8",
+          flag: "wx",
+          mode: 0o600,
+        });
+        fs.renameSync(temporaryPath, buildInfoPath);
+      } finally {
+        fs.rmSync(temporaryPath, { force: true });
+      }
     },
   };
   plugins.push(buildInfoPlugin);
+
+  const bundleBudgetPlugin = {
+    name: "enforce-solana-app-bundle-budget",
+    apply: "build" as const,
+    configResolved(resolvedConfig: { build: { outDir: string } }) {
+      resolvedBuildOutput = path.resolve(
+        __dirname,
+        resolvedConfig.build.outDir,
+      );
+    },
+    closeBundle() {
+      const report = verifyBundleDirectory(resolvedBuildOutput);
+      console.info(formatBundleBudgetReport(report));
+    },
+  };
+  plugins.push(bundleBudgetPlugin);
 
   const solanaRpcTarget = env.VITE_SOLANA_RPC_URL?.trim();
   const solanaWsTarget = env.VITE_SOLANA_WS_URL?.trim();

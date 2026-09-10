@@ -7,6 +7,7 @@ export type SolanaManagedOrderSnapshot = {
   id: bigint;
   side: 1 | 2;
   price: number;
+  orderBehavior: 0 | 1 | 2;
   maker: string;
   amount: bigint;
   filled: bigint;
@@ -45,6 +46,45 @@ export type SolanaManagedPriceLevelSnapshot = {
   totalOpen: bigint;
 };
 
+export type SolanaUserBalanceSnapshot = {
+  aShares: bigint;
+  bShares: bigint;
+  aLockedLamports: bigint;
+  bLockedLamports: bigint;
+  tradeTreasuryFeeLamports: bigint;
+  tradeMarketMakerFeeLamports: bigint;
+};
+
+export function selectPresentableSolanaManagedOrders(input: {
+  orders: readonly SolanaManagedOrderPlan[];
+  lifecycleStatus: string;
+  primarySettlementRequired: boolean;
+}): SolanaManagedOrderPlan[] {
+  const lifecycleStatus = input.lifecycleStatus.trim().toUpperCase();
+  const terminal =
+    lifecycleStatus === "RESOLVED" || lifecycleStatus === "CANCELLED";
+  return input.orders.filter(
+    (order) =>
+      order.action !== "CLOSE_FILLED" ||
+      (terminal && !input.primarySettlementRequired),
+  );
+}
+
+export function shouldCloseEmptySolanaUserBalance(input: {
+  marketStatus: string;
+  balance: SolanaUserBalanceSnapshot;
+}): boolean {
+  const status = input.marketStatus.trim().toLowerCase();
+  if (!["locked", "resolved", "cancelled"].includes(status)) {
+    return false;
+  }
+  const values = Object.values(input.balance);
+  if (values.some((value) => typeof value !== "bigint" || value < 0n)) {
+    throw new Error("User balance contains an invalid custody value");
+  }
+  return values.every((value) => value === 0n);
+}
+
 function canonicalAddress(value: string, label: string): string {
   const normalized = value.trim();
   if (!normalized || normalized !== value) {
@@ -70,8 +110,8 @@ export function buildSolanaManagedOrderPlan(input: {
   if (maker !== wallet) {
     throw new Error("Only the order maker can manage this order");
   }
-  if (input.order.id < 0n) {
-    throw new Error("Order ID cannot be negative");
+  if (input.order.id <= 0n) {
+    throw new Error("Order ID must be positive");
   }
   if (input.orderAccountLamports <= 0n) {
     throw new Error("Order account rent must be a positive lamport amount");
@@ -86,6 +126,9 @@ export function buildSolanaManagedOrderPlan(input: {
   ) {
     throw new Error("Order price must be an integer from 1 to 999");
   }
+  if (input.order.orderBehavior !== 0 && input.order.orderBehavior !== 2) {
+    throw new Error("Managed order is not a resting GTC or post-only order");
+  }
   if (
     input.order.amount <= 0n ||
     input.order.filled < 0n ||
@@ -93,9 +136,17 @@ export function buildSolanaManagedOrderPlan(input: {
   ) {
     throw new Error("Order contains an invalid filled amount");
   }
+  if (
+    input.order.amount % 1_000n !== 0n ||
+    input.order.filled % 1_000n !== 0n
+  ) {
+    throw new Error("Order amounts must use exact 1,000-unit lots");
+  }
   if (input.order.previousOrderId < 0n || input.order.nextOrderId < 0n) {
     throw new Error("Linked order IDs cannot be negative");
   }
+  // A capped-match continuation may join a level after newer global IDs.
+  // Reciprocal links and PriceLevel boundaries—not numeric ID order—define FIFO.
   if (
     input.order.previousOrderId === input.order.id ||
     input.order.nextOrderId === input.order.id ||
@@ -103,6 +154,12 @@ export function buildSolanaManagedOrderPlan(input: {
       input.order.previousOrderId === input.order.nextOrderId)
   ) {
     throw new Error("Order contains an invalid linked-list reference");
+  }
+  if (input.order.continuationPending && input.order.orderBehavior !== 0) {
+    throw new Error("Continuation-pending order must be GTC");
+  }
+  if (input.order.continuationPending && input.order.filled !== 0n) {
+    throw new Error("Continuation-pending order cannot retain a filled amount");
   }
   if (
     input.order.continuationPending &&
@@ -198,6 +255,60 @@ export function buildSolanaManagedOrderPlan(input: {
   };
 }
 
+export function normalizeSolanaManagedOrderPlanForPriceLevel(input: {
+  plan: SolanaManagedOrderPlan;
+  priceLevel: SolanaManagedPriceLevelSnapshot;
+}): SolanaManagedOrderPlan {
+  const { plan, priceLevel } = input;
+  if (plan.action === "CLOSE_FILLED" || plan.continuationPending) {
+    return plan;
+  }
+  if (
+    priceLevel.marketState !== plan.marketState ||
+    priceLevel.side !== plan.side ||
+    priceLevel.price !== plan.programPriceMillis
+  ) {
+    throw new Error("Price level no longer matches the selected order");
+  }
+  if (priceLevel.headOrderId !== plan.orderId) {
+    return plan;
+  }
+  if (plan.previousOrderId === 0n) {
+    return plan;
+  }
+
+  return {
+    ...plan,
+    previousOrderId: 0n,
+    adjacentOrderIds: plan.nextOrderId === 0n ? [] : [plan.nextOrderId],
+  };
+}
+
+export function resolveSolanaManagedPriceLevelForClosure(input: {
+  plan: SolanaManagedOrderPlan;
+  priceLevel: SolanaManagedPriceLevelSnapshot | null;
+}): SolanaManagedPriceLevelSnapshot {
+  if (input.priceLevel) {
+    return input.priceLevel;
+  }
+  if (!input.plan.continuationPending) {
+    throw new Error("The selected price level no longer exists");
+  }
+
+  // A match-capped GTC order is deliberately unlinked until continuation.
+  // Its exact same-side PriceLevel may already have been closed. The program
+  // accepts that absent PDA without requiring the bettor to front replacement
+  // rent, while every resting order still requires its live shared level.
+  return {
+    marketState: input.plan.marketState,
+    side: input.plan.side,
+    price: input.plan.programPriceMillis,
+    headOrderId: 0n,
+    tailOrderId: 0n,
+    totalOpen: 0n,
+  };
+}
+
 export function sameSolanaManagedOrderQuote(
   left: SolanaManagedOrderPlan,
   right: SolanaManagedOrderPlan,
@@ -247,6 +358,9 @@ export function assertSolanaManagedOrderBookLinks(input: {
   ) {
     throw new Error("Price level contains an invalid negative value");
   }
+  if (priceLevel.totalOpen % 1_000n !== 0n) {
+    throw new Error("Price-level total must use exact 1,000-unit lots");
+  }
   if (plan.continuationPending) {
     if (adjacentOrders.length !== 0) {
       throw new Error(
@@ -255,8 +369,26 @@ export function assertSolanaManagedOrderBookLinks(input: {
     }
     return;
   }
-  if (priceLevel.totalOpen < plan.remainingUnits) {
-    throw new Error("Price level no longer contains the selected order amount");
+  if (
+    priceLevel.totalOpen === 0n ||
+    priceLevel.headOrderId === 0n ||
+    priceLevel.tailOrderId === 0n
+  ) {
+    throw new Error("Resting price level is partially empty");
+  }
+  if (priceLevel.headOrderId === priceLevel.tailOrderId) {
+    if (
+      priceLevel.headOrderId !== plan.orderId ||
+      priceLevel.totalOpen !== plan.remainingUnits
+    ) {
+      throw new Error(
+        "Single-order price level does not conserve the selected remainder",
+      );
+    }
+  } else if (priceLevel.totalOpen <= plan.remainingUnits) {
+    throw new Error(
+      "Multi-order price level does not conserve the selected remainder",
+    );
   }
   if (adjacentOrders.length !== plan.adjacentOrderIds.length) {
     throw new Error("Linked order account count changed");
@@ -276,6 +408,12 @@ export function assertSolanaManagedOrderBookLinks(input: {
       order.id !== expectedOrderId ||
       order.side !== plan.side ||
       order.price !== plan.programPriceMillis ||
+      (order.orderBehavior !== 0 && order.orderBehavior !== 2) ||
+      order.amount <= order.filled ||
+      order.amount % 1_000n !== 0n ||
+      order.filled % 1_000n !== 0n ||
+      order.previousOrderId === order.id ||
+      order.nextOrderId === order.id ||
       !order.active ||
       order.continuationPending
     ) {

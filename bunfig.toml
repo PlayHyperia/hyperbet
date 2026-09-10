@@ -11,3 +11,9 @@ exclude = [
   "solana-clob-ui.spec.ts",
   "market-flows.spec.ts",
 ]
+
+[install]
+# Every runtime/build peer used by the launch workspaces is declared directly.
+# Do not auto-install optional peer trees such as Storybook test tooling or
+# React Native/Metro packages that are not part of the web release.
+peer = false

@@ -57,6 +57,7 @@ const meta = {
     testId: "storybook-transaction-feedback",
     signatureTestId: "storybook-transaction-signature",
     signatureLabel: "Transaction signature",
+    detailsLabel: "Transaction proof",
     receiptLabel: "View transaction",
     reviewLabel: "Review latest quote",
     checkStatusLabel: "Check transaction status",

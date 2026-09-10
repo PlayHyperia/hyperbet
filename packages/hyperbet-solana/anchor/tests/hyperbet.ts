@@ -30,6 +30,10 @@ import { configureAnchorTests } from "./test-anchor";
 import { FightOracle } from "../target/types/fight_oracle";
 import { DuelMarket } from "../target/types/duel_market";
 
+const LOCALNET_ORDER_SETUP_HEADROOM_SECONDS = 30;
+const LOCALNET_CHAIN_TIME_WAIT_TIMEOUT_MS =
+  (LOCALNET_ORDER_SETUP_HEADROOM_SECONDS + 15) * 1_000;
+
 describe("hyperbet-solana", () => {
   const provider = configureAnchorTests();
   anchor.setProvider(provider);
@@ -119,16 +123,16 @@ describe("hyperbet-solana", () => {
     const marketMaker = Keypair.generate();
     const maker = Keypair.generate();
     const taker = Keypair.generate();
-    const now = Math.floor(Date.now() / 1000);
-    const betOpenTs = now - 120;
-    const betCloseTs = now + 15;
-    const duelStartTs = betCloseTs;
     await Promise.all([
       airdrop(provider.connection, treasury.publicKey, 2),
       airdrop(provider.connection, marketMaker.publicKey, 2),
       airdrop(provider.connection, maker.publicKey, 5),
       airdrop(provider.connection, taker.publicKey, 5),
     ]);
+    const now = Math.floor(Date.now() / 1000);
+    const betOpenTs = now - 120;
+    const betCloseTs = now + LOCALNET_ORDER_SETUP_HEADROOM_SECONDS;
+    const duelStartTs = betCloseTs;
 
     const market = await createOpenMarketFixture(
       fightProgram,
@@ -176,7 +180,11 @@ describe("hyperbet-solana", () => {
         writableAccount(makerAsk.userBalance),
       ],
     });
-    await waitForChainUnixTimestamp(provider.connection, betCloseTs + 1);
+    await waitForChainUnixTimestamp(
+      provider.connection,
+      betCloseTs + 1,
+      LOCALNET_CHAIN_TIME_WAIT_TIMEOUT_MS,
+    );
     await upsertDuel(fightProgram, authority, market.duelKey, {
       status: duelStatusLocked(),
       betOpenTs,
@@ -325,14 +333,14 @@ describe("hyperbet-solana", () => {
   it("keeps disputed proposals fail-closed and rejects settlement", async () => {
     const maker = Keypair.generate();
     const taker = Keypair.generate();
-    const now = Math.floor(Date.now() / 1000);
-    const betOpenTs = now - 120;
-    const betCloseTs = now + 15;
-    const duelStartTs = betCloseTs;
     await Promise.all([
       airdrop(provider.connection, maker.publicKey, 5),
       airdrop(provider.connection, taker.publicKey, 5),
     ]);
+    const now = Math.floor(Date.now() / 1000);
+    const betOpenTs = now - 120;
+    const betCloseTs = now + LOCALNET_ORDER_SETUP_HEADROOM_SECONDS;
+    const duelStartTs = betCloseTs;
 
     const market = await createOpenMarketFixture(
       fightProgram,
@@ -344,15 +352,6 @@ describe("hyperbet-solana", () => {
         betCloseTs,
         duelStartTs,
       },
-    );
-
-    await ensureOracleReady(
-      fightProgram,
-      authority,
-      authority.publicKey,
-      authority.publicKey,
-      authority.publicKey,
-      60,
     );
 
     const makerAsk = await placeClobOrder(clobProgram, {
@@ -387,7 +386,11 @@ describe("hyperbet-solana", () => {
         writableAccount(makerAsk.userBalance),
       ],
     });
-    await waitForChainUnixTimestamp(provider.connection, betCloseTs + 1);
+    await waitForChainUnixTimestamp(
+      provider.connection,
+      betCloseTs + 1,
+      LOCALNET_CHAIN_TIME_WAIT_TIMEOUT_MS,
+    );
     await upsertDuel(fightProgram, authority, market.duelKey, {
       status: duelStatusLocked(),
       betOpenTs,

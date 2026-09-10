@@ -37,15 +37,10 @@ export type OracleCancellationDisposition =
   | "fail_closed";
 
 export type OracleLockDisposition =
-  | "lock"
-  | "already_locked"
-  | "terminal"
-  | "fail_closed";
+  "lock" | "already_locked" | "terminal" | "fail_closed";
 
 export type OracleFinalizeErrorDisposition =
-  | "not_mature"
-  | "state_race"
-  | "fatal";
+  "not_mature" | "state_race" | "fatal";
 
 export function classifyDuelTerminal(input: {
   outcome: CanonicalDuelOutcome;
@@ -195,6 +190,7 @@ export function classifyOracleFinalizeError(
 export function buildDuelLifecycleMetadata(input: {
   duelId: string;
   duelKey: string;
+  snapshotVersion: number;
   snapshotDigest: string;
   maxBytes?: number;
 }): string {
@@ -211,16 +207,113 @@ export function buildDuelLifecycleMetadata(input: {
   if (!/^[0-9a-f]{64}$/.test(snapshotDigest)) {
     throw new Error("Duel metadata requires a 32-byte snapshot digest");
   }
-  const identity = JSON.stringify({ duelId, duelKeyHex });
-  if (Buffer.byteLength(identity, "utf8") > maxBytes) {
+  if (
+    !Number.isSafeInteger(input.snapshotVersion) ||
+    input.snapshotVersion <= 0 ||
+    input.snapshotVersion > 0xffff_ffff
+  ) {
     throw new Error(
-      `Canonical duel identity exceeds ${maxBytes} metadata bytes`,
+      "Duel metadata requires a positive unsigned 32-bit snapshot version",
     );
   }
-  const correlated = JSON.stringify({ duelId, duelKeyHex, snapshotDigest });
-  return Buffer.byteLength(correlated, "utf8") <= maxBytes
-    ? correlated
-    : identity;
+  const correlated = JSON.stringify({
+    duelId,
+    duelKeyHex,
+    competitiveSnapshotVersion: input.snapshotVersion,
+    snapshotDigest,
+  });
+  if (Buffer.byteLength(correlated, "utf8") <= maxBytes) return correlated;
+
+  const compact = JSON.stringify({
+    v: 2,
+    d: duelId,
+    k: Buffer.from(duelKeyHex, "hex").toString("base64url"),
+    s: input.snapshotVersion,
+    h: Buffer.from(snapshotDigest, "hex").toString("base64url"),
+  });
+  if (Buffer.byteLength(compact, "utf8") > maxBytes) {
+    throw new Error(
+      `Exact duel lifecycle metadata exceeds ${maxBytes} metadata bytes`,
+    );
+  }
+  return compact;
+}
+
+export type ParsedDuelLifecycleMetadata = {
+  duelId: string;
+  duelKeyHex: string;
+  snapshotVersion: number;
+  snapshotDigest: string;
+};
+
+export function parseDuelLifecycleMetadata(
+  metadata: unknown,
+): ParsedDuelLifecycleMetadata | null {
+  if (typeof metadata !== "string" || !metadata.trim()) return null;
+  try {
+    const parsed = JSON.parse(metadata) as Record<string, unknown>;
+    const compact = parsed.v === 2;
+    const duelIdValue = compact ? parsed.d : parsed.duelId;
+    const keyValue = compact ? parsed.k : parsed.duelKeyHex;
+    const snapshotVersionValue = compact
+      ? parsed.s
+      : parsed.competitiveSnapshotVersion;
+    const snapshotDigestValue = compact ? parsed.h : parsed.snapshotDigest;
+    const duelId = typeof duelIdValue === "string" ? duelIdValue.trim() : "";
+    let duelKeyHex = "";
+    let snapshotDigest = "";
+
+    if (compact) {
+      if (
+        typeof keyValue !== "string" ||
+        !/^[A-Za-z0-9_-]{43}$/.test(keyValue) ||
+        typeof snapshotDigestValue !== "string" ||
+        !/^[A-Za-z0-9_-]{43}$/.test(snapshotDigestValue)
+      ) {
+        return null;
+      }
+      const keyBytes = Buffer.from(keyValue, "base64url");
+      const digestBytes = Buffer.from(snapshotDigestValue, "base64url");
+      if (
+        keyBytes.length !== 32 ||
+        keyBytes.toString("base64url") !== keyValue ||
+        digestBytes.length !== 32 ||
+        digestBytes.toString("base64url") !== snapshotDigestValue
+      ) {
+        return null;
+      }
+      duelKeyHex = keyBytes.toString("hex");
+      snapshotDigest = digestBytes.toString("hex");
+    } else {
+      duelKeyHex =
+        typeof keyValue === "string"
+          ? keyValue.trim().replace(/^0x/i, "").toLowerCase()
+          : "";
+      snapshotDigest =
+        typeof snapshotDigestValue === "string"
+          ? snapshotDigestValue.trim().toLowerCase()
+          : "";
+    }
+
+    if (
+      !duelId ||
+      !/^[0-9a-f]{64}$/.test(duelKeyHex) ||
+      !Number.isSafeInteger(snapshotVersionValue) ||
+      Number(snapshotVersionValue) <= 0 ||
+      Number(snapshotVersionValue) > 0xffff_ffff ||
+      !/^[0-9a-f]{64}$/.test(snapshotDigest)
+    ) {
+      return null;
+    }
+    return {
+      duelId,
+      duelKeyHex,
+      snapshotVersion: Number(snapshotVersionValue),
+      snapshotDigest,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function buildDuelCancellationMetadata(input: {

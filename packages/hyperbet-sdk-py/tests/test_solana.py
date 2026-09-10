@@ -25,17 +25,17 @@ from hyperbet_sdk.types import (
 )
 
 DUEL_KEY = "1f1e1d1c1b1a19181716151413121110f1e2d3c4b5a697887766554433221100"
-ORACLE_PROGRAM = Pubkey.from_string("GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM")
-MARKET_PROGRAM = Pubkey.from_string("3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy")
+ORACLE_PROGRAM = Pubkey.from_string("FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu")
+MARKET_PROGRAM = Pubkey.from_string("7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG")
 
 
 def test_canonical_market_kind_and_pdas():
     assert MARKET_KIND_DUEL_WINNER == 1
     duel = find_duel_state_pda(ORACLE_PROGRAM, duel_key_hex_to_bytes(DUEL_KEY))
-    assert str(duel) == "GmerjoLcRoN5hW9f7KPNgyq6Wty6RABUGsSfZtfZNXoR"
+    assert str(duel) == "g1qh9B6wiBujNncuDRHJuKQcRmsAYUYRdpcp3VNXKh6"
     assert (
         str(find_market_state_pda(MARKET_PROGRAM, duel))
-        == "3e8TxCCftPmKCML7rHZJM21ebFkzohnSEP7Z8mb7Cvzv"
+        == "GQfzUQRCDWdiUgP2bCdkhDpdGGp9hhD1ERab6PTX7HAp"
     )
 
 

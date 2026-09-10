@@ -1,4 +1,5 @@
 import { resolveSolanaV1Deployment } from "../../../deployments/v1";
+import { resolveSolanaTransactionAuthority } from "./realValueLaunchPolicy";
 import { buildSolanaRpcProxyUrl } from "./runtimeUrls";
 
 export type SolanaCluster = "localnet" | "devnet" | "testnet" | "mainnet-beta";
@@ -180,7 +181,7 @@ const baseConfig: Partial<EnvConfig> = {
   gameApiUrl: DEFAULT_GAME_API_URL,
   gameWsUrl: `${DEFAULT_GAME_API_URL.replace(/^http/, "ws")}/ws`,
   streamUrl: DEFAULT_STREAM_URL,
-  transactionsEnabled: true,
+  transactionsEnabled: false,
   refreshIntervalMs: 5000,
   jupiterBaseUrl: "https://lite-api.jup.ag",
 
@@ -346,10 +347,13 @@ export const CONFIG: EnvConfig = {
   gameApiUrl: resolvedGameApiUrl,
   gameWsUrl: resolvedGameWsUrl,
   streamUrl: resolvedStreamUrl,
-  transactionsEnabled: readEnvBoolean(
-    "VITE_TRANSACTIONS_ENABLED",
-    baseEnvConfig.transactionsEnabled,
-  ),
+  transactionsEnabled: resolveSolanaTransactionAuthority({
+    cluster: baseEnvConfig.cluster,
+    requested: readEnvBoolean(
+      "VITE_TRANSACTIONS_ENABLED",
+      baseEnvConfig.transactionsEnabled,
+    ),
+  }).enabled,
   uiSyncDelayMs: readEnvNumber(
     "VITE_UI_SYNC_DELAY_MS",
     baseEnvConfig.uiSyncDelayMs,

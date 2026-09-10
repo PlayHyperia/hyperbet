@@ -2,7 +2,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { buildTestCompetitiveSnapshot } from "../../../keeper/src/testCompetitiveSnapshot";
+import {
+  buildSyntheticDuelCommitment,
+  buildSyntheticPublicAgent,
+  buildSyntheticRendererHealth,
+  E2E_AGENT_A_IDENTITY,
+  E2E_AGENT_B_IDENTITY,
+  E2E_INITIAL_CYCLE_ID,
+} from "./syntheticDuelFixture";
 
 type E2eState = {
   solanaTraderPublicKey?: string;
@@ -56,7 +63,7 @@ async function main(): Promise<void> {
     state.solanaTraderPublicKey,
     "solanaTraderPublicKey",
   );
-  const agentCharacterId = "e2e-solana-agent-a";
+  const agentCharacterId = E2E_AGENT_A_IDENTITY.id;
   const currentDuelId = requireString(state.currentDuelId, "currentDuelId");
   const currentDuelKeyHex = requireString(
     state.currentDuelKeyHex,
@@ -66,29 +73,18 @@ async function main(): Promise<void> {
     process.env.E2E_DUEL_SOURCE?.trim().toLowerCase() ||
     state.currentDuelSource ||
     "synthetic_publish";
-  const agentName = "Agent A";
+  const agentName = E2E_AGENT_A_IDENTITY.name;
   const now = Date.now();
   const betOpenTime = state.currentBetOpenTimeMs ?? now - 15_000;
   const betCloseTime = state.currentBetCloseTimeMs ?? now + 300_000;
   const fightStartTime = state.currentFightStartTimeMs ?? now + 360_000;
-  const competitiveSnapshot = buildTestCompetitiveSnapshot({
-    cycleId: "e2e-cycle-active",
+  const competitiveSnapshot = buildSyntheticDuelCommitment({
+    cycleId: E2E_INITIAL_CYCLE_ID,
     duelId: currentDuelId,
-    duelKey: currentDuelKeyHex,
-    betOpenTime,
-    betCloseTime,
-    agent1: {
-      id: agentCharacterId,
-      name: agentName,
-      provider: "Hyperia",
-      model: "alpha-local",
-    },
-    agent2: {
-      id: "e2e-solana-agent-b",
-      name: "Agent B",
-      provider: "OpenRouter",
-      model: "beta-local",
-    },
+    duelKeyHex: currentDuelKeyHex,
+    betOpenTs: Math.floor(betOpenTime / 1_000),
+    betCloseTs: Math.floor(betCloseTime / 1_000),
+    duelStartTs: Math.floor(fightStartTime / 1_000),
   });
 
   const publishedState =
@@ -100,7 +96,7 @@ async function main(): Promise<void> {
             method: "POST",
             body: JSON.stringify({
               cycle: {
-                cycleId: "e2e-cycle-active",
+                cycleId: E2E_INITIAL_CYCLE_ID,
                 duelId: currentDuelId,
                 duelKeyHex: currentDuelKeyHex,
                 phase: "ANNOUNCEMENT",
@@ -111,85 +107,95 @@ async function main(): Promise<void> {
                 betCloseTime,
                 fightStartTime,
                 duelEndTime: null,
-                ...competitiveSnapshot,
+                competitiveSnapshotVersion:
+                  competitiveSnapshot.competitiveSnapshotVersion,
+                competitiveSnapshotDigest:
+                  competitiveSnapshot.competitiveSnapshotDigest,
+                competitiveSnapshot: competitiveSnapshot.competitiveSnapshot,
                 countdown: 300,
                 timeRemaining: 300_000,
                 winnerId: null,
                 winnerName: null,
                 winReason: null,
-                agent1: {
-                  id: agentCharacterId,
-                  name: agentName,
-                  provider: "Hyperia",
-                  model: "alpha-local",
-                  hp: 80,
-                  maxHp: 100,
-                  combatLevel: 88,
-                  wins: 12,
-                  losses: 4,
-                  damageDealtThisFight: 148,
-                  rank: 1,
-                  headToHeadWins: 3,
-                  headToHeadLosses: 2,
-                  inventory: [
-                    { slot: 0, itemId: "dragon_scimitar", quantity: 1 },
-                    { slot: 1, itemId: "shark", quantity: 2 },
-                  ],
-                  monologues: [
-                    {
-                      id: "mono-alpha-1",
-                      type: "thought",
-                      content:
-                        "Pressure the midpoint and deny the comeback window.",
-                      timestamp: now - 12_000,
-                    },
-                    {
-                      id: "mono-alpha-2",
-                      type: "action",
-                      content: "Heavy swing lands cleanly on the left flank.",
-                      timestamp: now - 7_000,
-                    },
-                  ],
-                },
-                agent2: {
-                  id: "e2e-solana-agent-b",
-                  name: "Agent B",
-                  provider: "OpenRouter",
-                  model: "beta-local",
-                  hp: 76,
-                  maxHp: 100,
-                  combatLevel: 84,
-                  wins: 10,
-                  losses: 5,
-                  damageDealtThisFight: 131,
-                  rank: 2,
-                  headToHeadWins: 2,
-                  headToHeadLosses: 3,
-                  inventory: [
-                    { slot: 0, itemId: "abyssal_whip", quantity: 1 },
-                    { slot: 1, itemId: "anglerfish", quantity: 1 },
-                  ],
-                  monologues: [
-                    {
-                      id: "mono-beta-1",
-                      type: "thought",
-                      content:
-                        "Need one clean punish to get back into price discovery.",
-                      timestamp: now - 10_000,
-                    },
-                    {
-                      id: "mono-beta-2",
-                      type: "action",
-                      content:
-                        "Retreating toward the pillar to reset the exchange.",
-                      timestamp: now - 4_000,
-                    },
-                  ],
-                },
+                agent1: buildSyntheticPublicAgent(
+                  {
+                    id: agentCharacterId,
+                    name: agentName,
+                    provider: "Hyperia",
+                    model: "alpha-local",
+                    hp: 80,
+                    maxHp: 100,
+                    combatLevel: 88,
+                    wins: 12,
+                    losses: 4,
+                    damageDealtThisFight: 148,
+                    rank: 1,
+                    headToHeadWins: 3,
+                    headToHeadLosses: 2,
+                    inventory: [
+                      { slot: 0, itemId: "dragon_scimitar", quantity: 1 },
+                      { slot: 1, itemId: "shark", quantity: 2 },
+                    ],
+                    monologues: [
+                      {
+                        id: "mono-alpha-1",
+                        type: "thought",
+                        content:
+                          "Pressure the midpoint and deny the comeback window.",
+                        timestamp: now - 12_000,
+                      },
+                      {
+                        id: "mono-alpha-2",
+                        type: "action",
+                        content: "Heavy swing lands cleanly on the left flank.",
+                        timestamp: now - 7_000,
+                      },
+                    ],
+                  },
+                  competitiveSnapshot.competitiveSnapshot,
+                  "agent1",
+                ),
+                agent2: buildSyntheticPublicAgent(
+                  {
+                    ...E2E_AGENT_B_IDENTITY,
+                    hp: 76,
+                    maxHp: 100,
+                    combatLevel: 84,
+                    wins: 10,
+                    losses: 5,
+                    damageDealtThisFight: 131,
+                    rank: 2,
+                    headToHeadWins: 2,
+                    headToHeadLosses: 3,
+                    inventory: [
+                      { slot: 0, itemId: "abyssal_whip", quantity: 1 },
+                      { slot: 1, itemId: "anglerfish", quantity: 1 },
+                    ],
+                    monologues: [
+                      {
+                        id: "mono-beta-1",
+                        type: "thought",
+                        content:
+                          "Need one clean punish to get back into price discovery.",
+                        timestamp: now - 10_000,
+                      },
+                      {
+                        id: "mono-beta-2",
+                        type: "action",
+                        content:
+                          "Retreating toward the pillar to reset the exchange.",
+                        timestamp: now - 4_000,
+                      },
+                    ],
+                  },
+                  competitiveSnapshot.competitiveSnapshot,
+                  "agent2",
+                ),
                 arenaPositions: {
                   agent1: [-1, 0, 0],
                   agent2: [1, 0, 0],
                 },
+                rendererHealth: buildSyntheticRendererHealth(now),
               },
               leaderboard: [
                 {

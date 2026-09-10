@@ -17,6 +17,69 @@ interface StreamPlayerProps {
 
 const DEFAULT_UNAVAILABLE_AFTER_MANIFEST_FAILURES = 3;
 const DEFAULT_MANIFEST_RETRY_DELAY_MS = 1_000;
+export const HLS_NETWORK_FAILURE_LIMIT = 3;
+const HLS_BUFFER_STALL_RECOVERY_GRACE_MS = 4_000;
+const HLS_BUFFER_STALL_MIN_ADVANCE_SECONDS = 0.05;
+const MAX_PROBED_HLS_VARIANTS = 8;
+
+export const HLS_LIVE_ABR_POLICY = Object.freeze({
+  // Preserve the fast estimator's three-second half-life for immediate
+  // downshifts, while expiring constrained samples quickly enough to put the
+  // upgraded rendition through the eight-second live buffer inside the
+  // browser's 45-second visible-recovery ceiling.
+  abrEwmaSlowLive: 4,
+  // Require 15% measured bandwidth headroom before moving up a rendition.
+  abrBandWidthUpFactor: 0.85,
+});
+
+export type HlsBufferStallRecoveryState = "pending" | "recovered" | "escalate";
+
+export type HlsManifestInspection =
+  | { kind: "invalid"; variantUris: [] }
+  | { kind: "media"; variantUris: [] }
+  | { kind: "master"; variantUris: string[] };
+
+export function inspectHlsManifest(manifest: string): HlsManifestInspection {
+  const lines = String(manifest)
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines[0] !== "#EXTM3U") return { kind: "invalid", variantUris: [] };
+
+  const nextUriAfter = (tagIndex: number): string => {
+    for (let index = tagIndex + 1; index < lines.length; index += 1) {
+      const candidate = lines[index] ?? "";
+      if (candidate && !candidate.startsWith("#")) return candidate;
+    }
+    return "";
+  };
+
+  let hasMediaSegment = false;
+  const variantUris: string[] = [];
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (line.startsWith("#EXTINF:")) {
+      const segmentUri = nextUriAfter(index);
+      if (segmentUri) hasMediaSegment = true;
+      continue;
+    }
+    if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
+
+    const attributes = line.slice("#EXT-X-STREAM-INF:".length);
+    const bandwidthMatch = attributes.match(/(?:^|,)BANDWIDTH=(\d+)(?:,|$)/);
+    const bandwidth = Number(bandwidthMatch?.[1] ?? 0);
+    const variantUri = nextUriAfter(index);
+    if (!Number.isSafeInteger(bandwidth) || bandwidth <= 0 || !variantUri) {
+      return { kind: "invalid", variantUris: [] };
+    }
+    if (!variantUris.includes(variantUri)) variantUris.push(variantUri);
+  }
+
+  if (hasMediaSegment) return { kind: "media", variantUris: [] };
+  if (variantUris.length > 0) return { kind: "master", variantUris };
+  return { kind: "invalid", variantUris: [] };
+}
 
 export function resolveStreamPlaybackMode(
   hlsJsSupported: boolean,
@@ -31,7 +94,33 @@ export function isExpectedNonFatalHlsRecovery(
   fatal: boolean,
   details: string,
 ): boolean {
-  return !fatal && details === Hls.ErrorDetails.BUFFER_SEEK_OVER_HOLE;
+  return (
+    !fatal &&
+    (details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
+      details === Hls.ErrorDetails.BUFFER_SEEK_OVER_HOLE ||
+      details === Hls.ErrorDetails.BUFFER_NUDGE_ON_STALL)
+  );
+}
+
+export function resolveHlsBufferStallRecoveryState(
+  detectedAtMs: number,
+  playbackTimeAtDetection: number,
+  observedAtMs: number,
+  currentPlaybackTime: number,
+  recoveryGraceMs = HLS_BUFFER_STALL_RECOVERY_GRACE_MS,
+  minimumAdvanceSeconds = HLS_BUFFER_STALL_MIN_ADVANCE_SECONDS,
+): HlsBufferStallRecoveryState {
+  const playbackAdvance = currentPlaybackTime - playbackTimeAtDetection;
+  if (
+    Number.isFinite(playbackAdvance) &&
+    playbackAdvance >= Math.max(0.001, minimumAdvanceSeconds)
+  ) {
+    return "recovered";
+  }
+  const elapsedMs = observedAtMs - detectedAtMs;
+  return Number.isFinite(elapsedMs) && elapsedMs >= Math.max(1, recoveryGraceMs)
+    ? "escalate"
+    : "pending";
 }
 
 export function isHlsStreamUrl(streamUrl: string): boolean {
@@ -46,6 +135,13 @@ export function shouldMarkStreamUnavailable(
     Math.max(0, Math.floor(consecutiveFailures)) >=
     Math.max(1, Math.floor(failureLimit))
   );
+}
+
+export function shouldFailOverAfterHlsNetworkFailures(
+  consecutiveFailures: number,
+  failureLimit = HLS_NETWORK_FAILURE_LIMIT,
+): boolean {
+  return shouldMarkStreamUnavailable(consecutiveFailures, failureLimit);
 }
 
 export const StreamPlayer: React.FC<StreamPlayerProps> = ({
@@ -111,11 +207,18 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     let retryTimeout: ReturnType<typeof setTimeout> | null = null;
     let healthWatchdog: ReturnType<typeof setInterval> | null = null;
     let lastPlaybackTime = 0;
+    let lastAdvancingPlaybackTime = 0;
     let lastPlaylistUpdateAt = Date.now();
     let stallCount = 0;
     let manifestFailureCount = 0;
+    let consecutiveHlsNetworkFailures = 0;
     let disposed = false;
     let lastReportedPlaybackDateMs: number | null = null;
+    let pendingBufferStall: {
+      detectedAtMs: number;
+      playbackTime: number;
+    } | null = null;
+    let recoveredBufferStallCount = 0;
 
     const readPlaybackDateMs = (): number | null => {
       const hlsDateMs = hls?.playingDate?.getTime();
@@ -164,13 +267,35 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     const sourceUrl = () =>
       `${streamUrl}${streamUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
 
+    const fetchManifest = async (url: string) => {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) return null;
+      return {
+        manifest: inspectHlsManifest(await response.text()),
+        responseUrl: response.url || url,
+      };
+    };
+
     const probeManifest = async () => {
       try {
-        const response = await fetch(sourceUrl(), { cache: "no-store" });
-        if (!response.ok) return false;
-        const text = await response.text();
-        // A valid live playlist should include media segments.
-        return /#EXTINF/i.test(text) && /\.(ts|m4s|mp4)\b/i.test(text);
+        const root = await fetchManifest(sourceUrl());
+        if (!root) return false;
+        if (root.manifest.kind === "media") return true;
+        if (root.manifest.kind !== "master") return false;
+
+        // A master playlist alone is not playback readiness. Resolve a bounded
+        // number of advertised renditions and require at least one live media
+        // playlist before hls.js can attach. This accepts production ABR while
+        // preserving the existing fail-closed startup contract.
+        for (const variantUri of root.manifest.variantUris.slice(
+          0,
+          MAX_PROBED_HLS_VARIANTS,
+        )) {
+          const variantUrl = new URL(variantUri, root.responseUrl).toString();
+          const variant = await fetchManifest(variantUrl);
+          if (variant?.manifest.kind === "media") return true;
+        }
+        return false;
       } catch {
         return false;
       }
@@ -202,6 +327,32 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
       }, delayMs);
     };
 
+    const observePendingBufferStall = (now = Date.now()): boolean => {
+      if (!pendingBufferStall) return false;
+      const recoveryState = resolveHlsBufferStallRecoveryState(
+        pendingBufferStall.detectedAtMs,
+        pendingBufferStall.playbackTime,
+        now,
+        video.currentTime,
+      );
+      if (recoveryState === "pending") return true;
+
+      if (recoveryState === "recovered") {
+        recoveredBufferStallCount += 1;
+        video.dataset.streamRecoveryCount = String(recoveredBufferStallCount);
+        console.debug("[StreamPlayer] Transient HLS buffer underrun recovered");
+      } else {
+        console.warn(
+          `[StreamPlayer] HLS buffer underrun did not recover within ${HLS_BUFFER_STALL_RECOVERY_GRACE_MS}ms`,
+        );
+        hls?.startLoad();
+        nudgeToLiveEdge();
+      }
+      pendingBufferStall = null;
+      delete video.dataset.streamRecoveryPending;
+      return true;
+    };
+
     const startHealthWatchdog = () => {
       if (healthWatchdog) clearInterval(healthWatchdog);
 
@@ -213,6 +364,12 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         if (!video) return;
 
         const now = Date.now();
+        if (observePendingBufferStall(now)) {
+          stallCount = 0;
+          lastPlaybackTime = video.currentTime;
+          reportPlaybackDate();
+          return;
+        }
         const playbackDelta = Math.abs(video.currentTime - lastPlaybackTime);
         const stalled =
           video.currentTime > 0 &&
@@ -308,6 +465,7 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
           liveBackBufferLength: 30,
           maxBufferLength: 30,
           maxMaxBufferLength: 60,
+          ...HLS_LIVE_ABR_POLICY,
           // Aggressive retries when manifests/fragments fail.
           manifestLoadingMaxRetry: 10,
           manifestLoadingRetryDelay: 800,
@@ -320,24 +478,69 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         hls.loadSource(sourceUrl());
         hls.attachMedia(video);
 
-        hls.on(Hls.Events.MANIFEST_LOADED, () => {
+        const recordHlsDeliverySuccess = () => {
           lastPlaylistUpdateAt = Date.now();
-        });
+          consecutiveHlsNetworkFailures = 0;
+          delete video.dataset.streamNetworkFailureCount;
+        };
 
-        hls.on(Hls.Events.LEVEL_LOADED, () => {
-          lastPlaylistUpdateAt = Date.now();
-        });
+        hls.on(Hls.Events.MANIFEST_LOADED, recordHlsDeliverySuccess);
 
-        hls.on(Hls.Events.FRAG_LOADED, () => {
-          lastPlaylistUpdateAt = Date.now();
-          markReady();
+        hls.on(Hls.Events.LEVEL_LOADED, recordHlsDeliverySuccess);
+
+        const recordAbrLevel = (levelIndex: number | null) => {
+          const levels = hls?.levels ?? [];
+          video.dataset.streamVariantCount = String(levels.length);
+          video.dataset.streamAbrMode =
+            levels.length > 1 ? "automatic" : "single";
+          video.dataset.streamAbrAuto = String(
+            levels.length > 1 && hls?.autoLevelEnabled === true,
+          );
+          const bandwidthEstimate = hls?.bandwidthEstimate;
+          if (
+            typeof bandwidthEstimate === "number" &&
+            Number.isFinite(bandwidthEstimate) &&
+            bandwidthEstimate > 0
+          ) {
+            video.dataset.streamBandwidthEstimate = String(
+              Math.round(bandwidthEstimate),
+            );
+          }
+          if (hls && Number.isSafeInteger(hls.nextAutoLevel)) {
+            video.dataset.streamNextAutoLevel = String(hls.nextAutoLevel);
+          }
+          if (levelIndex === null || levelIndex < 0) return;
+          const level = levels[levelIndex];
+          if (!level) return;
+          video.dataset.streamCurrentLevel = String(levelIndex);
+          if (Number.isFinite(level.bitrate) && level.bitrate > 0) {
+            video.dataset.streamCurrentBitrate = String(level.bitrate);
+          }
+          if (
+            Number.isFinite(level.width) &&
+            level.width > 0 &&
+            Number.isFinite(level.height) &&
+            level.height > 0
+          ) {
+            video.dataset.streamCurrentResolution = `${level.width}x${level.height}`;
+          }
+        };
+
+        hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+          recordHlsDeliverySuccess();
+          recordAbrLevel(data.frag.level);
           reportPlaybackDate();
         });
 
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+          video.dataset.streamVariantCount = String(data.levels.length);
+          recordAbrLevel(null);
           console.log("[StreamPlayer] Manifest parsed, starting playback");
-          markReady();
           void video.play().catch(() => {});
+        });
+
+        hls.on(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
+          recordAbrLevel(data.level);
         });
 
         hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -353,6 +556,20 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
             data.details,
             data.fatal,
           );
+
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            consecutiveHlsNetworkFailures += 1;
+            video.dataset.streamNetworkFailureCount = String(
+              consecutiveHlsNetworkFailures,
+            );
+            if (
+              shouldFailOverAfterHlsNetworkFailures(
+                consecutiveHlsNetworkFailures,
+              )
+            ) {
+              markUnavailable();
+            }
+          }
 
           if (data.fatal) {
             markUnavailable();
@@ -370,8 +587,14 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
                 scheduleRebuild("fatal HLS error", 2000);
                 break;
             }
+          } else if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
+            pendingBufferStall ??= {
+              detectedAtMs: Date.now(),
+              playbackTime: video.currentTime,
+            };
+            video.dataset.streamRecoveryPending = "buffer-underrun";
+            nudgeToLiveEdge();
           } else if (
-            data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
             data.details === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT ||
             data.details === Hls.ErrorDetails.LEVEL_LOAD_TIMEOUT ||
             data.details === Hls.ErrorDetails.BUFFER_APPEND_ERROR
@@ -398,10 +621,19 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
     const onWaiting = () => nudgeToLiveEdge();
     const onStalled = () => nudgeToLiveEdge();
     const onLoadedMetadata = () => {
-      markReady();
       reportPlaybackDate();
     };
-    const onTimeUpdate = () => reportPlaybackDate();
+    const onTimeUpdate = () => {
+      observePendingBufferStall();
+      if (
+        Number.isFinite(video.currentTime) &&
+        video.currentTime > lastAdvancingPlaybackTime + 0.01
+      ) {
+        lastAdvancingPlaybackTime = video.currentTime;
+        markReady();
+      }
+      reportPlaybackDate();
+    };
     const onVideoError = () => {
       markUnavailable();
       const mediaError = video.error;
@@ -437,6 +669,17 @@ export const StreamPlayer: React.FC<StreamPlayerProps> = ({
         hls = null;
       }
       delete video.dataset.streamPlaybackDateMs;
+      delete video.dataset.streamRecoveryPending;
+      delete video.dataset.streamRecoveryCount;
+      delete video.dataset.streamVariantCount;
+      delete video.dataset.streamAbrMode;
+      delete video.dataset.streamAbrAuto;
+      delete video.dataset.streamCurrentLevel;
+      delete video.dataset.streamCurrentBitrate;
+      delete video.dataset.streamCurrentResolution;
+      delete video.dataset.streamBandwidthEstimate;
+      delete video.dataset.streamNextAutoLevel;
+      delete video.dataset.streamNetworkFailureCount;
       onPlaybackDateChangeRef.current?.(null);
     };
   }, [

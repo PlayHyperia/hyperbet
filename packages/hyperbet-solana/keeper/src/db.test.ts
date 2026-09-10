@@ -5,6 +5,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { buildDuelCorrelationId } from "./duelCorrelation";
+
+const TEST_PROGRAM_ID = bs58.encode(Buffer.alloc(32, 61));
+
 function sleepMs(durationMs: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, durationMs);
 }
@@ -160,7 +164,21 @@ describe("keeper db persistence", () => {
     loadedModules.push(db);
 
     const state = db.loadAll();
-    expect(state.bets.map((bet) => bet.id).sort()).toEqual(["bet-1", "bet-3"]);
+    expect(state.bets).toEqual([]);
+    expect(db.auditKeeperDatabase()).toMatchObject({
+      compatible: false,
+      unverifiedBetCount: 2,
+    });
+    expect(db.auditKeeperDatabase()).toMatchObject({
+      compatible: false,
+      schemaVersion: 0,
+      retiredColumns: ["bets.source_amount"],
+      unverifiedBetCount: 2,
+    });
+    expect(db.checkDatabaseHealth()).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("Keeper database migration required"),
+    });
 
     const inspectDb = new Database(process.env.KEEPER_DB_PATH!);
     try {
@@ -191,6 +209,8 @@ describe("keeper db persistence", () => {
     expect(
       db.saveBet({
         id: "native-bet-1",
+        cluster: "devnet",
+        programId: TEST_PROGRAM_ID,
         bettorWallet: "wallet-1",
         chain: "SOLANA",
         sourceAsset: "SOL",
@@ -230,6 +250,36 @@ describe("keeper db persistence", () => {
     }
   });
 
+  test("rejects an incomplete duel identity before persisting a bet", async () => {
+    const db = (await import(
+      `./db.ts?case=${Date.now()}-incomplete-duel-identity`
+    )) as typeof import("./db.ts");
+    loadedModules.push(db);
+
+    expect(() =>
+      db.saveBet({
+        id: "incomplete-duel-bet",
+        cluster: "devnet",
+        programId: TEST_PROGRAM_ID,
+        bettorWallet: "wallet-1",
+        chain: "SOLANA",
+        sourceAsset: "SOL",
+        sourceAmountLamports: "60000",
+        feeAmountLamports: "0",
+        feeBps: 0,
+        txSignature: "incomplete-duel-tx",
+        marketPda: "market-1",
+        duelKey: "42".repeat(32),
+        duelId: null,
+        inviteCode: null,
+        externalBetRef: "solana:incomplete-duel-tx",
+        recordedAt: 1_700_000_000_000,
+      }),
+    ).toThrow("bet duel identity is incomplete");
+
+    expect(db.loadAll().bets).toEqual([]);
+  });
+
   test("atomically persists verified fill, collateral, fee, and reward accounting", async () => {
     const db = (await import(
       `./db.ts?case=${Date.now()}-bet-execution`
@@ -238,6 +288,8 @@ describe("keeper db persistence", () => {
 
     const bet = {
       id: "verified-bet-1",
+      cluster: "devnet",
+      programId: TEST_PROGRAM_ID,
       bettorWallet: "wallet-1",
       chain: "SOLANA" as const,
       sourceAsset: "SOL" as const,
@@ -314,6 +366,8 @@ describe("keeper db persistence", () => {
       db.saveBet(
         {
           id: "invalid-verified-bet",
+          cluster: "devnet",
+          programId: TEST_PROGRAM_ID,
           bettorWallet: "wallet-1",
           chain: "SOLANA",
           sourceAsset: "SOL",
@@ -446,6 +500,58 @@ describe("keeper db persistence", () => {
     }
   });
 
+  test("persists ordered duplicate instruction names without weakening exact replay", async () => {
+    const db = (await import(
+      `./db.ts?case=${Date.now()}-solana-duplicate-instruction-names`
+    )) as typeof import("./db.ts");
+    loadedModules.push(db);
+
+    const programId = bs58.encode(Buffer.alloc(32, 10));
+    const marketPda = bs58.encode(Buffer.alloc(32, 11));
+    const indexed = {
+      cluster: "mainnet-beta",
+      programId,
+      startSlot: 300,
+      signature: canonicalSignature(10),
+      slot: 301,
+      blockTime: 1_700_000_301,
+      succeeded: true,
+      instructionNames: ["syncMarketFromDuel", "syncMarketFromDuel"],
+      transactionDigest: "10".repeat(32),
+      facts: [
+        {
+          kind: "MARKET_SYNCED" as const,
+          marketPda,
+          status: "open" as const,
+          winner: "none" as const,
+        },
+        {
+          kind: "MARKET_SYNCED" as const,
+          marketPda,
+          status: "open" as const,
+          winner: "none" as const,
+        },
+      ],
+      indexedAt: 1_700_000_000_301,
+    };
+
+    expect(db.commitSolanaIndexedTransaction(indexed)).toBe(true);
+    expect(db.commitSolanaIndexedTransaction(indexed)).toBe(false);
+    expect(
+      db.loadSolanaLifecycleFacts({
+        cluster: "mainnet-beta",
+        programId,
+        marketPda,
+      }),
+    ).toHaveLength(2);
+    expect(() =>
+      db.commitSolanaIndexedTransaction({
+        ...indexed,
+        instructionNames: ["syncMarketFromDuel"],
+      }),
+    ).toThrow("conflicts with immutable persisted evidence");
+  });
+
   test("persists loser cleanup as audited non-payout lifecycle evidence", async () => {
     const db = (await import(
       `./db.ts?case=${Date.now()}-solana-loser-cleanup-index`
@@ -519,6 +625,211 @@ describe("keeper db persistence", () => {
     }
   });
 
+  test("materializes loser cleanup into durable wallet and bet history", async () => {
+    const db = (await import(
+      `./db.ts?case=${Date.now()}-solana-loser-cleanup-terminal`
+    )) as typeof import("./db.ts");
+    loadedModules.push(db);
+
+    const programId = bs58.encode(Buffer.alloc(32, 21));
+    const marketPda = bs58.encode(Buffer.alloc(32, 22));
+    const wallet = bs58.encode(Buffer.alloc(32, 23));
+    const counterparty = bs58.encode(Buffer.alloc(32, 24));
+    const placeSignature = canonicalSignature(21);
+    const counterpartySignature = canonicalSignature(22);
+    const cleanupSignature = canonicalSignature(23);
+    const bet = {
+      id: "loser-cleanup-bet",
+      cluster: "mainnet-beta",
+      programId,
+      bettorWallet: wallet,
+      chain: "SOLANA" as const,
+      sourceAsset: "SOL" as const,
+      sourceAmountLamports: "6000",
+      feeAmountLamports: "0",
+      feeBps: 0,
+      txSignature: placeSignature,
+      marketPda,
+      duelKey: "23".repeat(32),
+      duelId: "duel-loser-cleanup",
+      inviteCode: null,
+      externalBetRef: `solana:${placeSignature}`,
+      recordedAt: 1_700_000_100_000,
+    };
+    const commit = (
+      signature: string,
+      slot: number,
+      instructionNames: string[],
+      facts: import("./solanaLifecycleIndexer").SolanaLifecycleFact[],
+    ) =>
+      db.commitSolanaIndexedTransaction({
+        cluster: "mainnet-beta",
+        programId,
+        startSlot: 300,
+        signature,
+        slot,
+        blockTime: 1_700_000_000 + slot,
+        succeeded: true,
+        instructionNames,
+        transactionDigest: slot.toString(16).padStart(64, "0"),
+        facts,
+        indexedAt: 1_700_000_100_000 + slot,
+      });
+
+    expect(
+      commit(
+        placeSignature,
+        301,
+        ["placeOrder"],
+        [
+          {
+            kind: "ORDER_PLACED",
+            marketPda,
+            orderId: "1",
+            wallet,
+            side: 2,
+            price: 400,
+            orderBehavior: 0,
+            amountUnits: "10000",
+          },
+        ],
+      ),
+    ).toBe(true);
+    expect(
+      db.saveBet(bet, {
+        orderId: "1",
+        side: 2,
+        limitPrice: 400,
+        orderBehavior: 0,
+        orderAmountUnits: "10000",
+        matchedAmountUnits: "0",
+        restingAmountUnits: "10000",
+        releasedAmountUnits: "0",
+        collateralLamports: "6000",
+        executedCostLamports: "0",
+        tradeTreasuryFeeLamports: "0",
+        tradeMarketMakerFeeLamports: "0",
+        rewardEligibleLamports: "0",
+        verifiedAt: 1_700_000_100_301,
+      }),
+    ).toBe(true);
+    expect(
+      commit(
+        counterpartySignature,
+        302,
+        ["placeOrder"],
+        [
+          {
+            kind: "ORDER_PLACED",
+            marketPda,
+            orderId: "2",
+            wallet: counterparty,
+            side: 1,
+            price: 500,
+            orderBehavior: 0,
+            amountUnits: "10000",
+          },
+          {
+            kind: "ORDER_MATCHED",
+            marketPda,
+            makerOrderId: "1",
+            takerOrderId: "2",
+            price: 400,
+            amountUnits: "10000",
+          },
+          {
+            kind: "TAKER_EXECUTION",
+            marketPda,
+            orderId: "2",
+            wallet: counterparty,
+            side: 1,
+            price: 500,
+            amountUnits: "10000",
+            releasedAmountUnits: "0",
+            amountLamports: "4000",
+            feeLamports: "0",
+            refundLamports: "1000",
+            treasuryFeeLamports: "0",
+            marketMakerFeeLamports: "0",
+            selfTradeTriggered: false,
+          },
+        ],
+      ),
+    ).toBe(true);
+    expect(
+      commit(
+        cleanupSignature,
+        303,
+        ["closeLosingBalance"],
+        [
+          {
+            kind: "LOSING_BALANCE_CLOSED",
+            marketPda,
+            wallet,
+            side: 2,
+            amountUnits: "10000",
+            amountLamports: "6000",
+            status: "resolved",
+            winner: "a",
+          },
+          {
+            kind: "MARKET_SYNCED",
+            marketPda,
+            status: "resolved",
+            winner: "a",
+          },
+        ],
+      ),
+    ).toBe(true);
+
+    expect(
+      db.reconcileSolanaBetLifecycleAccounting({
+        cluster: "mainnet-beta",
+        programId,
+        throughSlot: 303,
+        throughSignature: cleanupSignature,
+        reconciledAt: 1_700_000_110_000,
+      }),
+    ).toMatchObject({
+      reconciledBets: 1,
+      pendingBets: 0,
+      terminalSettlements: 1,
+      settledBets: 1,
+    });
+    expect(db.loadSolanaBetTerminalSettlement(bet.id)).toMatchObject({
+      betId: bet.id,
+      claimSignature: cleanupSignature,
+      kind: "LOSER_CLEANUP",
+      status: "resolved",
+      winner: "a",
+      matchedAmountUnits: "10000",
+      grossEntitlementLamports: "0",
+      payoutLamports: "0",
+      feeLamports: "0",
+    });
+    expect(
+      db.loadSolanaWalletBetHistory({
+        cluster: "mainnet-beta",
+        programId,
+        wallet,
+        marketPda,
+        limit: 10,
+        offset: 0,
+      }).entries[0],
+    ).toMatchObject({
+      betId: bet.id,
+      orderState: "FILLED",
+      settlementState: "LOST",
+      terminalKind: "LOSER_CLEANUP",
+      terminalStatus: "resolved",
+      terminalWinner: "a",
+      claimSignature: cleanupSignature,
+      terminalGrossLamports: "0",
+      terminalPayoutLamports: "0",
+      terminalFeeLamports: "0",
+    });
+  });
+
   test("reconciles later fills and refunds into idempotent bettor and referral rewards", async () => {
     const db = (await import(
       `./db.ts?case=${Date.now()}-bet-lifecycle-reconciliation`
@@ -533,6 +844,8 @@ describe("keeper db persistence", () => {
     const referenceId = `solana:${placeSignature}`;
     const bet = {
       id: "reconciled-bet-1",
+      cluster: "mainnet-beta",
+      programId,
       bettorWallet: wallet,
       chain: "SOLANA" as const,
       sourceAsset: "SOL" as const,
@@ -595,6 +908,34 @@ describe("keeper db persistence", () => {
       referenceId,
       relatedWallet: wallet,
       createdAt: 1_700_000_000_000,
+    });
+
+    expect(
+      db.reconcileSolanaBetLifecycleAccounting({
+        cluster: "devnet",
+        programId,
+        throughSlot: 100,
+        throughSignature: canonicalSignature(8),
+        reconciledAt: 1_700_000_000_400,
+      }),
+    ).toMatchObject({
+      reconciledBets: 0,
+      pendingBets: 0,
+      oldestPendingBetRecordedAt: null,
+      changes: [],
+    });
+    expect(
+      db.reconcileSolanaBetLifecycleAccounting({
+        cluster: "mainnet-beta",
+        programId,
+        throughSlot: 100,
+        throughSignature: canonicalSignature(9),
+        reconciledAt: 1_700_000_000_500,
+      }),
+    ).toMatchObject({
+      reconciledBets: 0,
+      pendingBets: 1,
+      oldestPendingBetRecordedAt: bet.recordedAt,
     });
 
     const commit = (
@@ -733,6 +1074,7 @@ describe("keeper db persistence", () => {
     expect(first).toMatchObject({
       reconciledBets: 1,
       pendingBets: 0,
+      oldestPendingBetRecordedAt: null,
       changes: [
         {
           betId: bet.id,
@@ -807,6 +1149,8 @@ describe("keeper db persistence", () => {
     const claimSignature = canonicalSignature(53);
     const bet = {
       id: "terminal-settlement-bet",
+      cluster: "mainnet-beta",
+      programId,
       bettorWallet: wallet,
       chain: "SOLANA" as const,
       sourceAsset: "SOL" as const,
@@ -821,47 +1165,10 @@ describe("keeper db persistence", () => {
       externalBetRef: `solana:${placeSignature}`,
       recordedAt: 1_700_000_010_000,
     };
-    expect(
-      db.saveBet(bet, {
-        orderId: "1",
-        side: 1,
-        limitPrice: 600,
-        orderBehavior: 0,
-        orderAmountUnits: "10000",
-        matchedAmountUnits: "0",
-        restingAmountUnits: "10000",
-        releasedAmountUnits: "0",
-        collateralLamports: "6000",
-        executedCostLamports: "0",
-        tradeTreasuryFeeLamports: "0",
-        tradeMarketMakerFeeLamports: "0",
-        rewardEligibleLamports: "0",
-        verifiedAt: 1_700_000_010_001,
-      }),
-    ).toBe(true);
-    expect(
-      db.loadSolanaWalletBetHistory({
-        cluster: "mainnet-beta",
-        programId,
-        wallet,
-        marketPda,
-        limit: 10,
-        offset: 0,
-      }),
-    ).toMatchObject({
-      wallet,
-      total: 1,
-      entries: [
-        {
-          betId: bet.id,
-          orderState: "PENDING_INDEX",
-          settlementState: "NOT_READY",
-          matchedAmountUnits: "0",
-          restingAmountUnits: "10000",
-        },
-      ],
+    const correlationId = buildDuelCorrelationId({
+      duelId: bet.duelId,
+      duelKey: bet.duelKey,
     });
-
     const commit = (
       signature: string,
       slot: number,
@@ -900,6 +1207,71 @@ describe("keeper db persistence", () => {
         ],
       ),
     ).toBe(true);
+    expect(
+      db.saveBet(bet, {
+        orderId: "1",
+        side: 1,
+        limitPrice: 600,
+        orderBehavior: 0,
+        orderAmountUnits: "10000",
+        matchedAmountUnits: "0",
+        restingAmountUnits: "10000",
+        releasedAmountUnits: "0",
+        collateralLamports: "6000",
+        executedCostLamports: "0",
+        tradeTreasuryFeeLamports: "0",
+        tradeMarketMakerFeeLamports: "0",
+        rewardEligibleLamports: "0",
+        verifiedAt: 1_700_000_010_001,
+      }),
+    ).toBe(true);
+    expect(
+      db.loadSolanaWalletBetHistory({
+        cluster: "devnet",
+        programId,
+        wallet,
+        marketPda,
+        limit: 10,
+        offset: 0,
+      }),
+    ).toMatchObject({ total: 0, entries: [] });
+    expect(
+      db.loadSolanaWalletBetHistory({
+        cluster: "mainnet-beta",
+        programId: bs58.encode(Buffer.alloc(32, 55)),
+        wallet,
+        marketPda,
+        limit: 10,
+        offset: 0,
+      }),
+    ).toMatchObject({ total: 0, entries: [] });
+    expect(
+      db.loadSolanaWalletBetHistory({
+        cluster: "mainnet-beta",
+        programId,
+        wallet,
+        marketPda,
+        limit: 10,
+        offset: 0,
+      }),
+    ).toMatchObject({
+      wallet,
+      total: 1,
+      entries: [
+        {
+          betId: bet.id,
+          correlationId,
+          orderState: "PENDING_INDEX",
+          settlementState: "NOT_READY",
+          terminalKind: null,
+          terminalStatus: null,
+          terminalWinner: null,
+          matchedAmountUnits: "0",
+          restingAmountUnits: "10000",
+        },
+      ],
+    });
+
     expect(
       commit(
         counterpartySignature,
@@ -972,6 +1344,7 @@ describe("keeper db persistence", () => {
     expect(first).toMatchObject({
       reconciledBets: 1,
       pendingBets: 0,
+      oldestPendingBetRecordedAt: null,
       terminalSettlements: 1,
       settledBets: 1,
     });
@@ -1030,6 +1403,7 @@ describe("keeper db persistence", () => {
       entries: [
         {
           betId: bet.id,
+          correlationId,
           placeSignature,
           orderId: "1",
           side: 1,
@@ -1048,6 +1422,9 @@ describe("keeper db persistence", () => {
           winner: null,
           orderState: "FILLED",
           settlementState: "PAID",
+          terminalKind: "CLAIM_PAYOUT",
+          terminalStatus: "resolved",
+          terminalWinner: "a",
           claimSignature,
           terminalGrossLamports: "10000",
           terminalPayoutLamports: "9800",
@@ -1057,22 +1434,217 @@ describe("keeper db persistence", () => {
         },
       ],
     });
+    expect(commit(canonicalSignature(55), 204, [], [])).toBe(true);
     expect(
       db.reconcileSolanaBetLifecycleAccounting({
         cluster: "mainnet-beta",
         programId,
-        throughSlot: 203,
-        throughSignature: claimSignature,
+        throughSlot: 204,
+        throughSignature: canonicalSignature(55),
         reconciledAt: 1_700_000_030_000,
       }),
     ).toMatchObject({
-      reconciledBets: 0,
+      reconciledBets: 1,
       terminalSettlements: 0,
       settledBets: 0,
+    });
+    expect(
+      db.loadSolanaWalletBetHistory({
+        cluster: "mainnet-beta",
+        programId,
+        wallet,
+        marketPda,
+        limit: 10,
+        offset: 0,
+      }).entries[0],
+    ).toMatchObject({
+      reconciledAt: 1_700_000_030_000,
+      settledAt: 1_700_000_020_000,
+      settlementState: "PAID",
     });
 
     const inspectDb = new Database(process.env.KEEPER_DB_PATH!);
     try {
+      try {
+        inspectDb
+          .prepare("UPDATE bets SET tx_signature = ? WHERE id = ?")
+          .run("not-canonical", bet.id);
+        expect(() =>
+          db.loadSolanaWalletBetHistory({
+            cluster: "mainnet-beta",
+            programId,
+            wallet,
+            marketPda,
+            limit: 10,
+            offset: 0,
+          }),
+        ).toThrow("placement signature is invalid");
+      } finally {
+        inspectDb
+          .prepare("UPDATE bets SET tx_signature = ? WHERE id = ?")
+          .run(placeSignature, bet.id);
+      }
+      try {
+        inspectDb
+          .prepare(
+            "UPDATE bet_terminal_settlements SET claim_signature = ? WHERE bet_id = ?",
+          )
+          .run("not-canonical", bet.id);
+        expect(() =>
+          db.loadSolanaWalletBetHistory({
+            cluster: "mainnet-beta",
+            programId,
+            wallet,
+            marketPda,
+            limit: 10,
+            offset: 0,
+          }),
+        ).toThrow("terminal settlement is contradictory");
+      } finally {
+        inspectDb
+          .prepare(
+            "UPDATE bet_terminal_settlements SET claim_signature = ? WHERE bet_id = ?",
+          )
+          .run(claimSignature, bet.id);
+      }
+      try {
+        inspectDb
+          .prepare(
+            "UPDATE bet_terminal_settlements SET order_id = ? WHERE bet_id = ?",
+          )
+          .run("2", bet.id);
+        expect(() =>
+          db.loadSolanaWalletBetHistory({
+            cluster: "mainnet-beta",
+            programId,
+            wallet,
+            marketPda,
+            limit: 10,
+            offset: 0,
+          }),
+        ).toThrow("terminal settlement is contradictory");
+      } finally {
+        inspectDb
+          .prepare(
+            "UPDATE bet_terminal_settlements SET order_id = ? WHERE bet_id = ?",
+          )
+          .run("1", bet.id);
+      }
+      try {
+        inspectDb
+          .prepare(
+            "UPDATE bet_terminal_settlements SET matched_amount_units = ? WHERE bet_id = ?",
+          )
+          .run("9999", bet.id);
+        expect(() =>
+          db.loadSolanaWalletBetHistory({
+            cluster: "mainnet-beta",
+            programId,
+            wallet,
+            marketPda,
+            limit: 10,
+            offset: 0,
+          }),
+        ).toThrow("terminal settlement is contradictory");
+      } finally {
+        inspectDb
+          .prepare(
+            "UPDATE bet_terminal_settlements SET matched_amount_units = ? WHERE bet_id = ?",
+          )
+          .run("10000", bet.id);
+      }
+      try {
+        inspectDb
+          .prepare(
+            `UPDATE bet_terminal_settlements
+                SET kind = 'CANCELLATION_REFUND', status = 'cancelled', winner = 'none'
+              WHERE bet_id = ?`,
+          )
+          .run(bet.id);
+        expect(() =>
+          db.loadSolanaWalletBetHistory({
+            cluster: "mainnet-beta",
+            programId,
+            wallet,
+            marketPda,
+            limit: 10,
+            offset: 0,
+          }),
+        ).toThrow("refund settlement is contradictory");
+      } finally {
+        inspectDb
+          .prepare(
+            `UPDATE bet_terminal_settlements
+                SET kind = 'CLAIM_PAYOUT', status = 'resolved', winner = 'a'
+              WHERE bet_id = ?`,
+          )
+          .run(bet.id);
+      }
+      try {
+        inspectDb
+          .prepare("UPDATE bets SET duel_key = NULL WHERE id = ?")
+          .run(bet.id);
+        expect(() =>
+          db.loadSolanaWalletBetHistory({
+            cluster: "mainnet-beta",
+            programId,
+            wallet,
+            marketPda,
+            limit: 10,
+            offset: 0,
+          }),
+        ).toThrow("duel identity is incomplete");
+      } finally {
+        inspectDb
+          .prepare("UPDATE bets SET duel_key = ? WHERE id = ?")
+          .run(bet.duelKey, bet.id);
+      }
+      try {
+        inspectDb
+          .prepare(
+            "UPDATE bets SET source_amount_lamports = source_amount_lamports + 1 WHERE id = ?",
+          )
+          .run(bet.id);
+        expect(() =>
+          db.loadSolanaWalletBetHistory({
+            cluster: "mainnet-beta",
+            programId,
+            wallet,
+            marketPda,
+            limit: 10,
+            offset: 0,
+          }),
+        ).toThrow("persisted Solana bet history accounting is invalid");
+      } finally {
+        inspectDb
+          .prepare(
+            "UPDATE bets SET source_amount_lamports = source_amount_lamports - 1 WHERE id = ?",
+          )
+          .run(bet.id);
+      }
+      try {
+        inspectDb
+          .prepare(
+            "UPDATE bet_executions SET order_amount_units = ? WHERE bet_id = ?",
+          )
+          .run("18446744073709551616", bet.id);
+        expect(() =>
+          db.loadSolanaWalletBetHistory({
+            cluster: "mainnet-beta",
+            programId,
+            wallet,
+            marketPda,
+            limit: 10,
+            offset: 0,
+          }),
+        ).toThrow("persisted order amount is invalid");
+      } finally {
+        inspectDb
+          .prepare(
+            "UPDATE bet_executions SET order_amount_units = ? WHERE bet_id = ?",
+          )
+          .run("10000", bet.id);
+      }
       const aggregate = inspectDb
         .prepare(
           `SELECT
@@ -1107,5 +1679,10 @@ describe("keeper db persistence", () => {
     loadedModules.push(db);
 
     expect(db.checkDatabaseHealth()).toEqual({ ok: true, error: null });
+    expect(db.auditKeeperDatabase()).toMatchObject({
+      compatible: true,
+      schemaVersion: 2,
+      blockers: [],
+    });
   });
 });

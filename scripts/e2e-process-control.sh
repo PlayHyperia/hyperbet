@@ -35,8 +35,27 @@ health_url="$(read_service_field "healthUrl")"
 rpc_url="$(read_service_field "rpcUrl")"
 stream_state_url="$(read_service_field "streamStateUrl")"
 app_dir="$(jq -r '.appDir // empty' "$CONTROL_PATH")"
+launch_path="$(jq -r '.launchPath // empty' "$CONTROL_PATH")"
 start_command="$(read_service_field "startCommand")"
 restart_signal="$(read_service_field "restartSignal")"
+pid_strategy="$(read_service_field "pidStrategy")"
+pid_strategy="${pid_strategy:-listener}"
+
+if [[ -z "$launch_path" || "$launch_path" == *$'\n'* || ":$launch_path:" == *"::"* ]]; then
+  echo "control launchPath must be a non-empty colon-delimited path without empty entries" >&2
+  exit 1
+fi
+IFS=':' read -r -a launch_path_entries <<<"$launch_path"
+for launch_path_entry in "${launch_path_entries[@]}"; do
+  if [[ "$launch_path_entry" != /* ]]; then
+    echo "control launchPath entries must be absolute: $launch_path_entry" >&2
+    exit 1
+  fi
+done
+if [[ "$pid_strategy" != "root" && "$pid_strategy" != "listener" ]]; then
+  echo "service pidStrategy must be root or listener: $pid_strategy" >&2
+  exit 1
+fi
 
 require_file() {
   local label="$1"
@@ -79,7 +98,7 @@ listener_pids_for_port() {
 listener_pids_for_service() {
   local port=""
   case "$SERVICE" in
-    keeper|hyperia|hyperiaClient)
+    keeper|hyperia|hyperiaClient|hlsPrimaryOrigin|hlsBackupOrigin)
       port="$(port_from_url "$health_url")"
       ;;
     solanaProxy|anvil)
@@ -310,6 +329,22 @@ wait_for_hyperia_client() {
   wait_for_http_url "$health_url"
 }
 
+wait_for_hls_origin() {
+  local expected_label=""
+  case "$SERVICE" in
+    hlsPrimaryOrigin) expected_label="primary" ;;
+    hlsBackupOrigin) expected_label="backup" ;;
+  esac
+  for _ in {1..90}; do
+    if curl -fsS -I "$health_url" 2>/dev/null | tr -d '\r' | \
+      grep -qi "^x-hyperbet-e2e-hls-origin: ${expected_label}$"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 wait_for_service() {
   case "$SERVICE" in
     keeper)
@@ -329,6 +364,9 @@ wait_for_service() {
       ;;
     hyperiaClient)
       wait_for_hyperia_client
+      ;;
+    hlsPrimaryOrigin|hlsBackupOrigin)
+      wait_for_hls_origin
       ;;
     *)
       echo "unsupported service \"$SERVICE\"" >&2
@@ -350,18 +388,21 @@ start_shell_service() {
   if [[ -n "$cwd_path" ]]; then
     command_prefix="cd \"$cwd_path\" && "
   fi
-  nohup bash -lc "export PATH=\"/Users/mac/.bun/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\"; ${command_prefix}set -a; source \"$env_file\"; set +a; ${command_string}" \
+  /usr/bin/nohup /usr/bin/env PATH="$launch_path" /bin/bash -c "${command_prefix}set -a; source \"$env_file\"; set +a; ${command_string}" \
     >>"$log_path" 2>&1 < /dev/null &
-  printf '%s\n' "$!" >"$pid_file"
+  local launched_pid="$!"
+  printf '%s\n' "$launched_pid" >"$pid_file"
   if ! wait_for_service; then
     echo "$not_ready_message" >&2
     tail -n 80 "$log_path" || true
     exit 1
   fi
-  local listener_pid
-  listener_pid="$(listener_pids_for_service | head -n 1)"
-  if [[ -n "$listener_pid" ]]; then
-    printf '%s\n' "$listener_pid" >"$pid_file"
+  if [[ "$pid_strategy" == "listener" ]]; then
+    local listener_pid
+    listener_pid="$(listener_pids_for_service | head -n 1)"
+    if [[ -n "$listener_pid" ]]; then
+      printf '%s\n' "$listener_pid" >"$pid_file"
+    fi
   fi
 }
 
@@ -380,7 +421,7 @@ start_solana_proxy() {
     exit 1
   fi
   mkdir -p "$(dirname "$log_path")"
-  nohup bash -lc "set -a; source \"$env_file\"; set +a; node \"$app_dir/scripts/solana-rpc-proxy.mjs\"" \
+  /usr/bin/nohup /usr/bin/env PATH="$launch_path" /bin/bash -c "set -a; source \"$env_file\"; set +a; node \"$app_dir/scripts/solana-rpc-proxy.mjs\"" \
     >>"$log_path" 2>&1 < /dev/null &
   printf '%s\n' "$!" >"$pid_file"
   if ! wait_for_solana_proxy; then
@@ -398,7 +439,7 @@ start_solana_proxy() {
 start_anvil() {
   require_file "anvil env file" "$env_file"
   mkdir -p "$(dirname "$log_path")"
-  nohup bash -lc "set -a; source \"$env_file\"; set +a; anvil --silent --host 127.0.0.1 --port \"\$ANVIL_PORT\" --chain-id \"\$EVM_CHAIN_ID\" --state \"\$ANVIL_STATE_PATH\" --state-interval \"\${ANVIL_STATE_INTERVAL:-1}\"" \
+  /usr/bin/nohup /usr/bin/env PATH="$launch_path" /bin/bash -c "set -a; source \"$env_file\"; set +a; anvil --silent --host 127.0.0.1 --port \"\$ANVIL_PORT\" --chain-id \"\$EVM_CHAIN_ID\" --state \"\$ANVIL_STATE_PATH\" --state-interval \"\${ANVIL_STATE_INTERVAL:-1}\"" \
     >>"$log_path" 2>&1 < /dev/null &
   printf '%s\n' "$!" >"$pid_file"
   if ! wait_for_anvil; then
@@ -421,6 +462,10 @@ start_hyperia_client() {
   start_shell_service "hyperia client env file" "hyperia client did not become ready after restart"
 }
 
+start_hls_origin() {
+  start_shell_service "HLS origin env file" "$SERVICE did not become ready after restart"
+}
+
 start_service() {
   case "$SERVICE" in
     keeper)
@@ -440,6 +485,9 @@ start_service() {
       ;;
     hyperiaClient)
       start_hyperia_client
+      ;;
+    hlsPrimaryOrigin|hlsBackupOrigin)
+      start_hls_origin
       ;;
     *)
       echo "unsupported service \"$SERVICE\"" >&2

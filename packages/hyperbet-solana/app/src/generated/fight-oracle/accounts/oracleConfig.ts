@@ -6,24 +6,24 @@
  * @see https://github.com/codama-idl/codama
  */
 
-import { assertAccountExists, assertAccountsExist, combineCodec, decodeAccount, fetchEncodedAccount, fetchEncodedAccounts, fixDecoderSize, fixEncoderSize, getAddressDecoder, getAddressEncoder, getBooleanDecoder, getBooleanEncoder, getBytesDecoder, getBytesEncoder, getI64Decoder, getI64Encoder, getStructDecoder, getStructEncoder, getU8Decoder, getU8Encoder, transformEncoder, type Account, type Address, type EncodedAccount, type FetchAccountConfig, type FetchAccountsConfig, type FixedSizeCodec, type FixedSizeDecoder, type FixedSizeEncoder, type MaybeAccount, type MaybeEncodedAccount, type ReadonlyUint8Array } from '@solana/kit';
+import { assertAccountExists, assertAccountsExist, combineCodec, decodeAccount, fetchEncodedAccount, fetchEncodedAccounts, fixDecoderSize, fixEncoderSize, getAddressDecoder, getAddressEncoder, getBooleanDecoder, getBooleanEncoder, getBytesDecoder, getBytesEncoder, getI64Decoder, getI64Encoder, getStructDecoder, getStructEncoder, getU16Decoder, getU16Encoder, getU8Decoder, getU8Encoder, transformEncoder, type Account, type Address, type EncodedAccount, type FetchAccountConfig, type FetchAccountsConfig, type FixedSizeCodec, type FixedSizeDecoder, type FixedSizeEncoder, type MaybeAccount, type MaybeEncodedAccount, type ReadonlyUint8Array } from '@solana/kit';
 
 export const ORACLE_CONFIG_DISCRIMINATOR: ReadonlyUint8Array = new Uint8Array([133, 196, 152, 50, 27, 21, 145, 254]);
 
 export function getOracleConfigDiscriminatorBytes(): ReadonlyUint8Array { return fixEncoderSize(getBytesEncoder(), 8).encode(ORACLE_CONFIG_DISCRIMINATOR); }
 
-export type OracleConfig = { discriminator: ReadonlyUint8Array; authority: Address; reporter: Address; finalizer: Address; challenger: Address; disputeWindowSecs: bigint; paused: boolean; configFrozen: boolean; bump: number;  };
+export type OracleConfig = { discriminator: ReadonlyUint8Array; authority: Address; reporter: Address; finalizer: Address; challenger: Address; disputeWindowSecs: bigint; paused: boolean; configFrozen: boolean; bump: number; accountSchemaVersion: number;  };
 
-export type OracleConfigArgs = { authority: Address; reporter: Address; finalizer: Address; challenger: Address; disputeWindowSecs: number | bigint; paused: boolean; configFrozen: boolean; bump: number;  };
+export type OracleConfigArgs = { authority: Address; reporter: Address; finalizer: Address; challenger: Address; disputeWindowSecs: number | bigint; paused: boolean; configFrozen: boolean; bump: number; accountSchemaVersion: number;  };
 
 /** Gets the encoder for {@link OracleConfigArgs} account data. */
 export function getOracleConfigEncoder(): FixedSizeEncoder<OracleConfigArgs> {
-    return transformEncoder(getStructEncoder([['discriminator', fixEncoderSize(getBytesEncoder(), 8)], ['authority', getAddressEncoder()], ['reporter', getAddressEncoder()], ['finalizer', getAddressEncoder()], ['challenger', getAddressEncoder()], ['disputeWindowSecs', getI64Encoder()], ['paused', getBooleanEncoder()], ['configFrozen', getBooleanEncoder()], ['bump', getU8Encoder()]]), (value) => ({ ...value, discriminator: ORACLE_CONFIG_DISCRIMINATOR }));
+    return transformEncoder(getStructEncoder([['discriminator', fixEncoderSize(getBytesEncoder(), 8)], ['authority', getAddressEncoder()], ['reporter', getAddressEncoder()], ['finalizer', getAddressEncoder()], ['challenger', getAddressEncoder()], ['disputeWindowSecs', getI64Encoder()], ['paused', getBooleanEncoder()], ['configFrozen', getBooleanEncoder()], ['bump', getU8Encoder()], ['accountSchemaVersion', getU16Encoder()]]), (value) => ({ ...value, discriminator: ORACLE_CONFIG_DISCRIMINATOR }));
 }
 
 /** Gets the decoder for {@link OracleConfig} account data. */
 export function getOracleConfigDecoder(): FixedSizeDecoder<OracleConfig> {
-    return getStructDecoder([['discriminator', fixDecoderSize(getBytesDecoder(), 8)], ['authority', getAddressDecoder()], ['reporter', getAddressDecoder()], ['finalizer', getAddressDecoder()], ['challenger', getAddressDecoder()], ['disputeWindowSecs', getI64Decoder()], ['paused', getBooleanDecoder()], ['configFrozen', getBooleanDecoder()], ['bump', getU8Decoder()]]);
+    return getStructDecoder([['discriminator', fixDecoderSize(getBytesDecoder(), 8)], ['authority', getAddressDecoder()], ['reporter', getAddressDecoder()], ['finalizer', getAddressDecoder()], ['challenger', getAddressDecoder()], ['disputeWindowSecs', getI64Decoder()], ['paused', getBooleanDecoder()], ['configFrozen', getBooleanDecoder()], ['bump', getU8Decoder()], ['accountSchemaVersion', getU16Decoder()]]);
 }
 
 /** Gets the codec for {@link OracleConfig} account data. */

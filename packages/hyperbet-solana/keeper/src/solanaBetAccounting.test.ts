@@ -6,6 +6,9 @@ import bs58 from "bs58";
 import {
   classifySignatureFinality,
   decodePlaceOrderInstructionData,
+  exactPrimarySolanaTransactionSignature,
+  exactSolanaTransactionSignatures,
+  hasOnlyAllowedNativeTransferEdges,
   isCanonicalSolanaTransactionSignature,
   requiresFinalizedBetVerification,
   verifyIndexedPlaceOrderAccounting,
@@ -108,6 +111,36 @@ describe("Solana place-order decoding", () => {
   });
 });
 
+describe("native SOL instruction transfer edges", () => {
+  test("admits only positive transfers on an explicitly allowed edge", () => {
+    const allowedEdges = [{ source: vault, destination: wallet }];
+    expect(
+      hasOnlyAllowedNativeTransferEdges(
+        transfers([[vault, wallet, 1n]]),
+        allowedEdges,
+      ),
+    ).toBe(true);
+    expect(
+      hasOnlyAllowedNativeTransferEdges(
+        transfers([["attacker", wallet, 1n]]),
+        allowedEdges,
+      ),
+    ).toBe(false);
+    expect(
+      hasOnlyAllowedNativeTransferEdges(
+        transfers([[wallet, vault, 1n]]),
+        allowedEdges,
+      ),
+    ).toBe(false);
+    expect(
+      hasOnlyAllowedNativeTransferEdges(
+        transfers([[vault, wallet, 0n]]),
+        allowedEdges,
+      ),
+    ).toBe(false);
+  });
+});
+
 describe("recorded-bet verification policy", () => {
   test("accepts only canonical 64-byte Solana transaction signatures", () => {
     const signature = bs58.encode(Buffer.alloc(64, 7));
@@ -119,6 +152,35 @@ describe("recorded-bet verification policy", () => {
     expect(isCanonicalSolanaTransactionSignature("not-base58-0OIl")).toBe(
       false,
     );
+  });
+
+  test("binds finalized transaction identity to the first canonical signature", () => {
+    const primary = bs58.encode(Buffer.alloc(64, 7));
+    const secondary = bs58.encode(Buffer.alloc(64, 8));
+    expect(exactPrimarySolanaTransactionSignature([primary, secondary])).toBe(
+      primary,
+    );
+    expect(exactPrimarySolanaTransactionSignature([secondary, primary])).toBe(
+      secondary,
+    );
+    expect(exactSolanaTransactionSignatures([primary, secondary])).toEqual([
+      primary,
+      secondary,
+    ]);
+    expect(exactPrimarySolanaTransactionSignature([])).toBeNull();
+    expect(exactPrimarySolanaTransactionSignature(null)).toBeNull();
+    expect(
+      exactPrimarySolanaTransactionSignature([primary, ` ${secondary}`]),
+    ).toBeNull();
+    expect(
+      exactPrimarySolanaTransactionSignature(
+        new Proxy([primary], {
+          get: () => {
+            throw new Error("hostile signature list");
+          },
+        }),
+      ),
+    ).toBeNull();
   });
 
   test("distinguishes finalized, pending, and failed signatures", () => {
@@ -365,6 +427,14 @@ describe("authoritative Solana bet accounting", () => {
         transfers: transfers([
           [wallet, vault, 60_000n],
           [wallet, "unknown", 1n],
+        ]),
+      }),
+    ).toThrow("unexplained native transfer");
+    expect(() =>
+      verify({
+        transfers: transfers([
+          [wallet, vault, 60_000n],
+          ["attacker", wallet, 1n],
         ]),
       }),
     ).toThrow("unexplained native transfer");

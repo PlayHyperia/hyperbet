@@ -1,5 +1,6 @@
 import { PublicKey } from "@solana/web3.js";
 
+import { safeAccountInteger } from "./accountInteger";
 import {
   DUEL_WINNER_MARKET_KIND,
   findClobVaultPda,
@@ -7,6 +8,15 @@ import {
   findMarketPda,
   findOrderPda,
 } from "./launchCommon";
+import { parseDuelLifecycleMetadata } from "./duelTerminalPolicy";
+import { exactBytes32Hex as bytes32Hex } from "./exactBytes32";
+
+export {
+  planManagedOrderClosure,
+  resolveManagedOrderClosurePriceLevel,
+  type ManagedOrderClosurePlan,
+  type ManagedOrderClosurePriceLevel,
+} from "./managedOrderClosure";
 
 type AccountRecord = Record<string, unknown>;
 
@@ -76,53 +86,21 @@ export type DuelMarketRecoveryInput = {
   observedAt?: number;
 };
 
-export type ManagedOrderClosurePlan = {
-  instruction: "cancel" | "reclaim";
-  adjacentOrderIds: number[];
-};
-
-export function planManagedOrderClosure(input: {
-  marketIsOpen: boolean;
-  orderId: number;
-  previousOrderId: number;
-  nextOrderId: number;
-  continuationPending: boolean;
-}): ManagedOrderClosurePlan {
-  for (const [label, value] of [
-    ["order", input.orderId],
-    ["previous order", input.previousOrderId],
-    ["next order", input.nextOrderId],
-  ] as const) {
-    if (!Number.isSafeInteger(value) || value < 0) {
-      throw new Error(`${label} id is not a non-negative safe integer`);
-    }
-  }
-  if (input.orderId < 1) {
-    throw new Error("order id must be positive");
-  }
-  if (input.continuationPending) {
-    if (input.previousOrderId !== 0 || input.nextOrderId !== 0) {
-      throw new Error("continuation-pending order has unexpected book links");
-    }
-    return {
-      instruction: input.marketIsOpen ? "cancel" : "reclaim",
-      adjacentOrderIds: [],
-    };
-  }
-
-  const adjacentOrderIds = [input.previousOrderId, input.nextOrderId].filter(
-    (orderId) => orderId > 0,
-  );
-  if (
-    adjacentOrderIds.includes(input.orderId) ||
-    new Set(adjacentOrderIds).size !== adjacentOrderIds.length
-  ) {
-    throw new Error("resting order has invalid adjacent book links");
-  }
-  return {
-    instruction: input.marketIsOpen ? "cancel" : "reclaim",
-    adjacentOrderIds,
-  };
+/**
+ * Historical terminal markets remain discoverable on-chain and are
+ * intentionally rehydrated for validation. Their mere presence is not proof
+ * of a keeper restart. Only previously untracked live lifecycle work, or a
+ * terminal market that still has an active managed order to reclaim, needs
+ * restart reconciliation.
+ */
+export function requiresRestartMarketReconciliation(
+  market: RecoveredDuelMarket,
+  alreadyTracked: boolean,
+): boolean {
+  if (alreadyTracked) return false;
+  const terminal =
+    market.oracleStatus === "resolved" || market.oracleStatus === "cancelled";
+  return !terminal || market.managedOrders.length > 0;
 }
 
 type ValidDuel = {
@@ -133,21 +111,6 @@ type ValidDuel = {
   winner: RecoveredDuelMarket["winner"];
   createdAtMs: number;
 };
-
-function asSafeInteger(value: unknown): number | null {
-  if (typeof value === "number") {
-    return Number.isSafeInteger(value) ? value : null;
-  }
-  if (typeof value === "bigint") {
-    const converted = Number(value);
-    return Number.isSafeInteger(converted) ? converted : null;
-  }
-  if (value && typeof value === "object" && "toString" in value) {
-    const converted = Number((value as { toString(): string }).toString());
-    return Number.isSafeInteger(converted) ? converted : null;
-  }
-  return null;
-}
 
 function asPublicKey(value: unknown): PublicKey | null {
   try {
@@ -160,23 +123,6 @@ function asPublicKey(value: unknown): PublicKey | null {
     return null;
   }
   return null;
-}
-
-function bytes32Hex(value: unknown): string | null {
-  const bytes =
-    value instanceof Uint8Array
-      ? Array.from(value)
-      : Array.isArray(value)
-        ? value.map(Number)
-        : null;
-  if (
-    !bytes ||
-    bytes.length !== 32 ||
-    bytes.some((entry) => !Number.isInteger(entry) || entry < 0 || entry > 255)
-  ) {
-    return null;
-  }
-  return Buffer.from(bytes).toString("hex");
 }
 
 function enumKey(value: unknown): string | null {
@@ -220,24 +166,26 @@ function winner(value: unknown): RecoveredDuelMarket["winner"] | null {
   return null;
 }
 
-function duelIdFromMetadata(
+export function duelIdFromMetadata(
   metadata: unknown,
   duelKeyHex: string,
 ): string | null {
+  const lifecycle = parseDuelLifecycleMetadata(metadata);
+  if (lifecycle?.duelKeyHex === duelKeyHex) return lifecycle.duelId;
   if (typeof metadata !== "string" || !metadata.trim()) return null;
   try {
     const parsed = JSON.parse(metadata) as Record<string, unknown>;
     const duelId =
       typeof parsed.duelId === "string"
         ? parsed.duelId.trim()
-        : parsed.v === 1 && typeof parsed.d === "string"
+        : (parsed.v === 1 || parsed.v === 2) && typeof parsed.d === "string"
           ? parsed.d.trim()
           : "";
     let metadataKey: string | null = null;
     if (typeof parsed.duelKeyHex === "string") {
       metadataKey = parsed.duelKeyHex.trim().replace(/^0x/i, "").toLowerCase();
     } else if (
-      parsed.v === 1 &&
+      (parsed.v === 1 || parsed.v === 2) &&
       typeof parsed.k === "string" &&
       /^[A-Za-z0-9_-]{43}$/.test(parsed.k)
     ) {
@@ -287,7 +235,7 @@ export function discoverDuelMarketRecovery(
     const duelKeyHex = bytes32Hex(snapshot.account.duelKey);
     const status = oracleStatus(snapshot.account.status);
     const duelWinner = winner(snapshot.account.winner);
-    const betOpenTs = asSafeInteger(snapshot.account.betOpenTs);
+    const betOpenTs = safeAccountInteger(snapshot.account.betOpenTs);
     const betOpenMs = betOpenTs === null ? null : betOpenTs * 1_000;
     const winnerMatchesStatus =
       duelWinner !== null &&
@@ -342,7 +290,7 @@ export function discoverDuelMarketRecovery(
     const duelRef = duelState?.toBase58() ?? null;
     const duel = duelRef ? validDuels.get(duelRef) : null;
     const keyHex = bytes32Hex(snapshot.account.duelKey);
-    const kind = asSafeInteger(snapshot.account.marketKind);
+    const kind = safeAccountInteger(snapshot.account.marketKind);
     const status = marketStatus(snapshot.account.status);
     const authority = asPublicKey(snapshot.account.authority);
     const marketMaker = asPublicKey(snapshot.account.marketMaker);
@@ -352,11 +300,11 @@ export function discoverDuelMarketRecovery(
       ? findMarketPda(input.marketProgramId, duelState, DUEL_WINNER_MARKET_KIND)
       : null;
     const feesMatch =
-      asSafeInteger(snapshot.account.tradeTreasuryFeeBpsSnapshot) ===
+      safeAccountInteger(snapshot.account.tradeTreasuryFeeBpsSnapshot) ===
         input.expectedFees.tradeTreasuryFeeBps &&
-      asSafeInteger(snapshot.account.tradeMarketMakerFeeBpsSnapshot) ===
+      safeAccountInteger(snapshot.account.tradeMarketMakerFeeBpsSnapshot) ===
         input.expectedFees.tradeMarketMakerFeeBps &&
-      asSafeInteger(snapshot.account.winningsMarketMakerFeeBpsSnapshot) ===
+      safeAccountInteger(snapshot.account.winningsMarketMakerFeeBpsSnapshot) ===
         input.expectedFees.winningsMarketMakerFeeBps;
     const authorityAllowed =
       authority !== null &&
@@ -444,11 +392,11 @@ export function discoverDuelMarketRecovery(
     const maker = asPublicKey(snapshot.account.maker);
     const marketRef = marketState?.toBase58() ?? null;
     const recovered = marketRef ? recoveredByMarket.get(marketRef) : null;
-    const orderId = asSafeInteger(snapshot.account.id);
-    const side = asSafeInteger(snapshot.account.side);
-    const price = asSafeInteger(snapshot.account.price);
-    const amount = asSafeInteger(snapshot.account.amount);
-    const filled = asSafeInteger(snapshot.account.filled);
+    const orderId = safeAccountInteger(snapshot.account.id);
+    const side = safeAccountInteger(snapshot.account.side);
+    const price = safeAccountInteger(snapshot.account.price);
+    const amount = safeAccountInteger(snapshot.account.amount);
+    const filled = safeAccountInteger(snapshot.account.filled);
     const expectedOrder =
       marketState && orderId !== null && orderId >= 0
         ? findOrderPda(input.marketProgramId, marketState, BigInt(orderId))

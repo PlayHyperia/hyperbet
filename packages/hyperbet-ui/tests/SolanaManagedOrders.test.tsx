@@ -59,11 +59,13 @@ const filledOrder: SolanaManagedOrderPlan = {
 describe("SolanaManagedOrders", () => {
   it("shows exact cancel/reclaim amounts and reports the selected order", () => {
     let selected: SolanaManagedOrderPlan | null = null;
+    let actionTrigger: HTMLButtonElement | null = null;
     const { container } = render(
       <SolanaManagedOrders
         orders={[cancelOrder, reclaimOrder, filledOrder]}
-        onRequestAction={(order) => {
+        onRequestAction={(order, trigger) => {
           selected = order;
+          actionTrigger = trigger;
         }}
       />,
     );
@@ -81,8 +83,14 @@ describe("SolanaManagedOrders", () => {
     expect(container.textContent).toContain("Reclaim resting order");
     expect(container.textContent).toContain("Recover filled-order rent");
     expect(container.textContent).toContain("Fully filled · rent ready");
-    click(getByTestId(container, "solana-managed-order-action-9"));
+    const reclaimAction = getByTestId(
+      container,
+      "solana-managed-order-action-9",
+    ) as HTMLButtonElement;
+    expect(reclaimAction.style.minHeight).toBe("44px");
+    click(reclaimAction);
     expect((selected as SolanaManagedOrderPlan | null)?.orderId).toBe(9n);
+    expect(actionTrigger as HTMLButtonElement | null).toBe(reclaimAction);
   });
 
   it("localizes action copy and blocks every action during submission", () => {

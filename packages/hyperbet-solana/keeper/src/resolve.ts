@@ -5,10 +5,12 @@ import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import type { FightOracle } from "./idl/fight_oracle";
 
+import { exactBytes32Hex } from "./exactBytes32";
 import {
   createLaunchPrograms,
   duelKeyHexToBytes,
   enumIs,
+  FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION,
   findDuelStatePda,
   findOracleConfigPda,
   findProposalRecordPda,
@@ -19,6 +21,39 @@ import {
   validateKeeperRoleSeparation,
 } from "./keeperRoles";
 import { buildResultHash } from "./resultHash";
+
+function positiveU32(value: unknown, label: string): number {
+  let parsed: number;
+  if (typeof value === "number") {
+    parsed = value;
+  } else if (typeof value === "bigint") {
+    parsed = Number(value);
+  } else if (
+    value &&
+    typeof value === "object" &&
+    "toNumber" in value &&
+    typeof (value as { toNumber?: unknown }).toNumber === "function"
+  ) {
+    parsed = (value as { toNumber: () => number }).toNumber();
+  } else {
+    parsed = Number.NaN;
+  }
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > 0xffff_ffff) {
+    throw new Error(`${label} is not a positive unsigned 32-bit integer`);
+  }
+  return parsed;
+}
+
+function bytes32Hex(value: unknown, label: string): string {
+  const hex = exactBytes32Hex(value);
+  if (!hex) {
+    throw new Error(`${label} is not a 32-byte value`);
+  }
+  if (/^0{64}$/.test(hex)) {
+    throw new Error(`${label} cannot be zero`);
+  }
+  return hex;
+}
 
 const args = await yargs(hideBin(process.argv))
   .option("duel-key", {
@@ -89,6 +124,19 @@ const oracleConfigPda = findOracleConfigPda(fightOracle.programId);
 const duelState = await oracleAccounts["duelState"].fetch(duelPda);
 const oracleConfig =
   await oracleAccounts["oracleConfig"].fetch(oracleConfigPda);
+for (const [value, label] of [
+  [oracleConfig.accountSchemaVersion, "oracle config"],
+  [duelState.accountSchemaVersion, "duel state"],
+] as const) {
+  if (
+    positiveU32(value, `${label} account schema version`) !==
+    FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION
+  ) {
+    throw new Error(
+      `${label} uses an unsupported account schema; expected v${FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION}`,
+    );
+  }
+}
 const confirmedSlot = await connection.getSlot("confirmed");
 const confirmedChainTs = await connection.getBlockTime(confirmedSlot);
 if (!Number.isSafeInteger(confirmedChainTs) || Number(confirmedChainTs) <= 0) {
@@ -119,11 +167,21 @@ if (!enumIs(duelState.status, "resolved")) {
 
   if (enumIs(duelState.status, "locked")) {
     const replayHash = Array.from(Buffer.from(replayHashHex, "hex"));
+    const competitiveSnapshotVersion = positiveU32(
+      duelState.competitiveSnapshotVersion,
+      "on-chain competitive snapshot version",
+    );
+    const competitiveSnapshotDigest = bytes32Hex(
+      duelState.competitiveSnapshotDigest,
+      "on-chain competitive snapshot digest",
+    );
     const resultHash = buildResultHash(
       args["duel-key"],
       args.winner === "a" ? "A" : "B",
       args.seed,
       replayHashHex,
+      competitiveSnapshotVersion,
+      competitiveSnapshotDigest,
     );
     const proposalRecord = findProposalRecordPda(
       oracleProgram.programId,

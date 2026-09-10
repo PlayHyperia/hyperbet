@@ -2,9 +2,13 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 import { rootDir } from "./ci-lib";
+import {
+  findTrackedEnvPolicyErrors,
+  FORBIDDEN_NON_SOLANA_ENV,
+} from "./ci-env-audit-solana-v1-policy";
 
 type AuditTarget = "ci-shared" | "pages:solana" | "keeper:solana";
-type DeploymentMode = "production" | "staging";
+type DeploymentMode = "production" | "staging" | "preview";
 
 type Finding = {
   level: "error" | "warning";
@@ -17,23 +21,6 @@ const TRACKED_ENV_FILES = [
   "packages/hyperbet-solana/keeper/.env.example",
 ] as const;
 
-const SENSITIVE_VALUE_KEYS = [
-  "ARENA_EXTERNAL_BET_WRITE_KEY",
-  "STREAM_PUBLISH_KEY",
-  "STREAM_STATE_SOURCE_BEARER_TOKEN",
-  "HELIUS_API_KEY",
-  "RAILWAY_TOKEN",
-  "CLOUDFLARE_API_TOKEN",
-  "SOLANA_PRIVATE_KEY",
-  "SOLANA_KEEPER_FEE_PAYER_KEYPAIR",
-  "SOLANA_ORACLE_REPORTER_KEYPAIR",
-  "SOLANA_ORACLE_FINALIZER_KEYPAIR",
-  "SOLANA_CLOB_MARKET_OPERATOR_KEYPAIR",
-  "SOLANA_MARKET_MAKER_KEYPAIR",
-] as const;
-
-const FORBIDDEN_NON_SOLANA_ENV =
-  /^(?:VITE_)?(?:EVM|BSC|BASE|AVAX|AVALANCHE|GOLD|PERPS|AMM)(?:_|$)/i;
 const PROVIDER_SECRET_PATTERNS = [
   /[?&](?:api[-_]?key|token)=/i,
   /helius-rpc\.com/i,
@@ -68,7 +55,11 @@ function parseArgs(): {
       `unsupported SOL-only audit target: ${targetArg}; expected ci-shared, pages:solana, or keeper:solana`,
     );
   }
-  if (deploymentArg !== "production" && deploymentArg !== "staging") {
+  if (
+    deploymentArg !== "production" &&
+    deploymentArg !== "staging" &&
+    deploymentArg !== "preview"
+  ) {
     throw new Error(`unsupported deployment mode: ${deploymentArg}`);
   }
 
@@ -91,22 +82,6 @@ function parseEnvFile(filePath: string): Record<string, string> {
       .trim();
   }
   return parsed;
-}
-
-function isPlaceholder(value: string): boolean {
-  const normalized = value.trim().toLowerCase();
-  return (
-    normalized === "" ||
-    normalized === "changeme" ||
-    normalized === "<required>" ||
-    normalized === "<placeholder>" ||
-    normalized === "your-api-key" ||
-    normalized === "your-token" ||
-    normalized === "..." ||
-    normalized.includes("path/to/") ||
-    normalized.includes("~/.config/solana/") ||
-    normalized.endsWith("/id.json")
-  );
 }
 
 function requireEnv(findings: Finding[], key: string): string {
@@ -146,14 +121,8 @@ function requireHttpUrl(
 function auditTrackedEnvFiles(findings: Finding[]): void {
   for (const relativePath of TRACKED_ENV_FILES) {
     const env = parseEnvFile(path.join(rootDir, relativePath));
-    for (const key of SENSITIVE_VALUE_KEYS) {
-      const value = env[key];
-      if (value && !isPlaceholder(value)) {
-        findings.push({
-          level: "error",
-          message: `${relativePath} contains a non-placeholder value for ${key}`,
-        });
-      }
+    for (const message of findTrackedEnvPolicyErrors(relativePath, env)) {
+      findings.push({ level: "error", message });
     }
   }
 }
@@ -185,10 +154,12 @@ function auditPages(findings: Finding[]): void {
   requireHttpUrl(findings, "VITE_GAME_API_URL", ["https:"]);
   requireHttpUrl(findings, "VITE_GAME_WS_URL", ["wss:"]);
   const cluster = requireEnv(findings, "VITE_SOLANA_CLUSTER");
-  if (cluster && cluster !== "mainnet-beta") {
+  const expectedCluster =
+    deployment === "production" ? "mainnet-beta" : "devnet";
+  if (cluster && cluster !== expectedCluster) {
     findings.push({
       level: "error",
-      message: "pages:solana must build with VITE_SOLANA_CLUSTER=mainnet-beta",
+      message: `pages:solana ${deployment} must build with VITE_SOLANA_CLUSTER=${expectedCluster}`,
     });
   }
   if ((process.env.VITE_USE_GAME_RPC_PROXY ?? "").trim() !== "true") {
@@ -197,13 +168,90 @@ function auditPages(findings: Finding[]): void {
       message: "pages:solana must enable VITE_USE_GAME_RPC_PROXY=true",
     });
   }
+  const transactionsEnabled = requireEnv(findings, "VITE_TRANSACTIONS_ENABLED");
+  if (
+    transactionsEnabled &&
+    transactionsEnabled !== "true" &&
+    transactionsEnabled !== "false"
+  ) {
+    findings.push({
+      level: "error",
+      message: "VITE_TRANSACTIONS_ENABLED must be exactly true or false",
+    });
+  }
+  if (
+    (deployment === "preview" || deployment === "production") &&
+    transactionsEnabled !== "false"
+  ) {
+    findings.push({
+      level: "error",
+      message: `pages:solana ${deployment} must disable transaction authority`,
+    });
+  }
+
+  const rawStreamSources = requireEnv(findings, "VITE_STREAM_SOURCES");
+  const streamSources = rawStreamSources
+    .split(/[\n,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (streamSources.length > 3) {
+    findings.push({
+      level: "error",
+      message: "VITE_STREAM_SOURCES supports at most three reviewed sources",
+    });
+  }
+  const streamSourceIdentities: string[] = [];
+  for (const source of streamSources) {
+    try {
+      const url = new URL(source);
+      if (url.protocol !== "https:") {
+        findings.push({
+          level: "error",
+          message: "every VITE_STREAM_SOURCES entry must use https:",
+        });
+      }
+      if (url.username || url.password) {
+        findings.push({
+          level: "error",
+          message: "VITE_STREAM_SOURCES must not contain URL credentials",
+        });
+      }
+      if (!/\.m3u8$/i.test(url.pathname)) {
+        findings.push({
+          level: "error",
+          message: "every VITE_STREAM_SOURCES entry must be an HLS .m3u8 URL",
+        });
+      }
+      streamSourceIdentities.push(`${url.origin}${url.pathname}`);
+    } catch {
+      findings.push({
+        level: "error",
+        message: "every VITE_STREAM_SOURCES entry must be an absolute URL",
+      });
+    }
+  }
+  if (new Set(streamSourceIdentities).size !== streamSourceIdentities.length) {
+    findings.push({
+      level: "error",
+      message:
+        "VITE_STREAM_SOURCES must not contain duplicate origins and paths",
+    });
+  }
 }
 
 function auditKeeper(findings: Finding[]): void {
+  if (deployment === "production") {
+    findings.push({
+      level: "error",
+      message:
+        "keeper:solana production deployment is source-gated off until real-value controls are implemented and approved",
+    });
+  }
   requireHttpUrl(findings, "HYPERBET_KEEPER_URL", ["https:"]);
   requireEnv(findings, "RAILWAY_PROJECT_ID");
   requireEnv(findings, "RAILWAY_ENVIRONMENT_ID");
   requireEnv(findings, "RAILWAY_KEEPER_SERVICE_ID");
+  requireEnv(findings, "RAILWAY_DUEL_BOT_SERVICE_ID");
 
   if ((process.env.CI_AUDIT_REQUIRE_RUNTIME ?? "").trim() === "true") {
     requireHttpUrl(findings, "SOLANA_RPC_URL", ["https:"]);

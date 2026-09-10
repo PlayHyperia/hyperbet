@@ -9,6 +9,9 @@ import {
   TerminalOperationConflictError,
   type TerminalOperationInput,
 } from "./terminalLedger";
+import { buildDuelCorrelationId } from "./duelCorrelation";
+import type { StreamingCycle } from "./game-client";
+import { buildTestCompetitiveSnapshot } from "./testCompetitiveSnapshot";
 
 function terminalInput(
   overrides: Partial<TerminalOperationInput> = {},
@@ -27,6 +30,124 @@ function terminalInput(
     event: { schemaVersion: 3, duelId: "duel-1", outcome: "win" },
   };
   return { ...input, ...overrides };
+}
+
+function evidenceCycle(
+  overrides: Partial<StreamingCycle> = {},
+): StreamingCycle {
+  const identity = {
+    cycleId: "cycle-evidence-1",
+    duelId: "duel-evidence-1",
+    duelKeyHex: "31".repeat(32),
+    betOpenTime: 1_700_000_000_000,
+    betCloseTime: 1_700_000_060_000,
+  };
+  const snapshot = buildTestCompetitiveSnapshot({
+    cycleId: identity.cycleId,
+    duelId: identity.duelId,
+    duelKey: identity.duelKeyHex,
+    betOpenTime: identity.betOpenTime,
+    betCloseTime: identity.betCloseTime,
+  });
+  return {
+    sourceEpoch: 7,
+    seq: 1,
+    emittedAt: identity.betOpenTime,
+    phaseVersion: 1,
+    cycleId: identity.cycleId,
+    phase: "ANNOUNCEMENT",
+    duelId: identity.duelId,
+    duelKeyHex: identity.duelKeyHex,
+    competitiveSnapshotVersion: snapshot.competitiveSnapshotVersion,
+    competitiveSnapshotDigest: snapshot.competitiveSnapshotDigest,
+    competitiveSnapshot: snapshot.competitiveSnapshot,
+    betOpenTime: identity.betOpenTime,
+    betCloseTime: identity.betCloseTime,
+    fightStartTime: null,
+    duelEndTime: null,
+    winnerId: null,
+    outcome: null,
+    cancellationReason: null,
+    winReason: null,
+    seed: null,
+    replayHash: null,
+    agent1: {
+      id: "agent-a",
+      name: "Agent A",
+      provider: "provider-a",
+      model: "model-a",
+      hp: 30,
+      maxHp: 30,
+      combatLevel: 42,
+      wins: 12,
+      losses: 4,
+      damageDealtThisFight: 0,
+      rank: 1,
+      headToHeadWins: 3,
+      headToHeadLosses: 2,
+      strategySummary: {
+        schemaVersion: 1,
+        approach: "balanced",
+        tacticalMacro: "pressure",
+        attackStyle: "aggressive",
+        prayer: "superhuman_strength",
+        preferredCombatRole: null,
+        foodThreshold: 40,
+        switchDefensiveAt: 30,
+        source: "deterministic",
+        policyVersion: "keeper-test-policy-v1",
+      },
+    },
+    agent2: {
+      id: "agent-b",
+      name: "Agent B",
+      provider: "provider-b",
+      model: "model-b",
+      hp: 30,
+      maxHp: 30,
+      combatLevel: 42,
+      wins: 10,
+      losses: 6,
+      damageDealtThisFight: 0,
+      rank: 2,
+      headToHeadWins: 2,
+      headToHeadLosses: 3,
+      strategySummary: {
+        schemaVersion: 1,
+        approach: "balanced",
+        tacticalMacro: "pressure",
+        attackStyle: "aggressive",
+        prayer: "superhuman_strength",
+        preferredCombatRole: null,
+        foodThreshold: 40,
+        switchDefensiveAt: 30,
+        source: "deterministic",
+        policyVersion: "keeper-test-policy-v1",
+      },
+    },
+    ...overrides,
+  };
+}
+
+function evidenceCheckpoint(
+  cycle: StreamingCycle,
+  terminalEventKey: string | null = null,
+) {
+  return {
+    sourceEpoch: cycle.sourceEpoch,
+    lastAppliedSeq: cycle.seq,
+    lastEmittedAt: cycle.emittedAt,
+    duelId: cycle.duelId,
+    competitiveSnapshotDigest: cycle.competitiveSnapshotDigest,
+    betOpenTime: cycle.betOpenTime,
+    betCloseTime: cycle.betCloseTime,
+    fightStartTime: cycle.fightStartTime,
+    duelEndTime: cycle.duelEndTime,
+    phase: cycle.phase,
+    terminal: cycle.outcome !== null,
+    terminalEventKey,
+    updatedAt: cycle.emittedAt,
+  };
 }
 
 describe("persistent terminal operation ledger", () => {
@@ -51,6 +172,14 @@ describe("persistent terminal operation ledger", () => {
     return ledger;
   }
 
+  test("rejects an absent all-zero winning replay commitment", () => {
+    const ledger = openLedger();
+    expect(() =>
+      ledger.enqueue(terminalInput({ replayHash: "00".repeat(32) }), 1_000),
+    ).toThrow("require seed and replayHash");
+    expect(ledger.getSummary().PENDING).toBe(0);
+  });
+
   test("enqueues idempotently and persists across reopen", () => {
     const firstLedger = openLedger();
     const first = firstLedger.enqueue(terminalInput(), 1_000);
@@ -62,11 +191,18 @@ describe("persistent terminal operation ledger", () => {
 
     const reopened = openLedger();
     expect(reopened.getByDuelId("duel-1")).toMatchObject({
+      correlationId: buildDuelCorrelationId({
+        duelId: "duel-1",
+        duelKey: "11".repeat(32),
+      }),
       status: "PENDING",
       attempts: 0,
       outcome: "WIN",
       winnerSide: "A",
     });
+    expect(reopened.listOperationCorrelations(["PENDING"])).toEqual([
+      { status: "PENDING", correlationId: first.correlationId },
+    ]);
   });
 
   test("quarantines contradictory terminal truth for manual review", () => {
@@ -230,6 +366,44 @@ describe("persistent terminal operation ledger", () => {
       PENDING: 1,
       MANUAL_REVIEW: 1,
     });
+  });
+
+  test("reports exact actionable age authority and recent completion durations", () => {
+    const ledger = openLedger();
+    const succeeded = ledger.enqueue(terminalInput(), 1_000);
+    ledger.claimByDuelId({
+      duelId: succeeded.duelId,
+      ownerId: "worker",
+      now: 1_100,
+    });
+    ledger.markSucceeded(succeeded.id, "worker", 1_450);
+    ledger.enqueue(
+      terminalInput({ duelId: "duel-pending", duelKey: "22".repeat(32) }),
+      2_000,
+    );
+    const manual = ledger.enqueue(
+      terminalInput({ duelId: "duel-manual", duelKey: "33".repeat(32) }),
+      3_000,
+    );
+    ledger.claimByDuelId({
+      duelId: manual.duelId,
+      ownerId: "worker",
+      now: 3_100,
+    });
+    ledger.markManualReview(manual.id, "worker", "operator review", 3_200);
+
+    expect(ledger.getOperationsTelemetry()).toEqual({
+      summary: {
+        PENDING: 1,
+        PROCESSING: 0,
+        SUCCEEDED: 1,
+        MANUAL_REVIEW: 1,
+        DEAD_LETTER: 0,
+      },
+      oldestActionableCreatedAt: 2_000,
+      recentSucceededDurationsMs: [450],
+    });
+    expect(() => ledger.getOperationsTelemetry(101)).toThrow("record limit");
   });
 
   test("requires exact fingerprint confirmation and records an atomic requeue audit", () => {
@@ -410,9 +584,34 @@ describe("persistent terminal operation ledger", () => {
       updated_at INTEGER NOT NULL,
       completed_at INTEGER
     )`);
+    legacy.run(`CREATE TABLE betting_feed_checkpoint (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      source_epoch INTEGER NOT NULL,
+      last_applied_seq INTEGER NOT NULL,
+      last_emitted_at INTEGER NOT NULL,
+      duel_id TEXT,
+      competitive_snapshot_digest TEXT,
+      phase TEXT,
+      terminal INTEGER NOT NULL,
+      degraded_reason TEXT,
+      updated_at INTEGER NOT NULL
+    )`);
+    legacy.run(
+      `INSERT INTO betting_feed_checkpoint (
+        id, source_epoch, last_applied_seq, last_emitted_at, duel_id,
+        competitive_snapshot_digest, phase, terminal, degraded_reason,
+        updated_at
+      ) VALUES (1, 8, 13, 1700000000000, 'legacy-duel', ?, 'RESOLUTION', 1, NULL, 1700000000000)`,
+      ["88".repeat(32)],
+    );
     legacy.close(false);
 
     const ledger = openLedger();
+    expect(ledger.getBettingFeedCheckpoint()).toMatchObject({
+      duelId: "legacy-duel",
+      terminal: true,
+      terminalEventKey: null,
+    });
     expect(ledger.enqueue(terminalInput(), 1_000)).toMatchObject({
       requeueCount: 0,
       lastRequeuedAt: null,
@@ -444,18 +643,265 @@ describe("persistent terminal operation ledger", () => {
         lastEmittedAt: 1_700_000_000_000,
         duelId: "duel-9",
         competitiveSnapshotDigest: "99".repeat(32),
+        betOpenTime: 1_700_000_000_000,
+        betCloseTime: 1_700_000_060_000,
+        fightStartTime: 1_700_000_064_000,
+        duelEndTime: null,
         phase: "FIGHTING",
         terminal: false,
+        terminalEventKey: null,
         updatedAt: 2_000,
       }),
     ).toMatchObject({
       sourceEpoch: 100,
       lastAppliedSeq: 9,
       duelId: "duel-9",
+      betOpenTime: 1_700_000_000_000,
+      betCloseTime: 1_700_000_060_000,
+      fightStartTime: 1_700_000_064_000,
+      duelEndTime: null,
       phase: "FIGHTING",
       terminal: false,
       degradedReason: null,
       updatedAt: 2_000,
     });
+
+    const terminalEventKey = "aa".repeat(32);
+    expect(
+      ledger.saveBettingFeedCheckpoint({
+        sourceEpoch: 100,
+        lastAppliedSeq: 10,
+        lastEmittedAt: 1_700_000_001_000,
+        duelId: "duel-9",
+        competitiveSnapshotDigest: "99".repeat(32),
+        betOpenTime: 1_700_000_000_000,
+        betCloseTime: 1_700_000_060_000,
+        fightStartTime: 1_700_000_064_000,
+        duelEndTime: 1_700_000_120_000,
+        phase: "RESOLUTION",
+        terminal: true,
+        terminalEventKey,
+        updatedAt: 3_000,
+      }),
+    ).toMatchObject({
+      lastAppliedSeq: 10,
+      fightStartTime: 1_700_000_064_000,
+      duelEndTime: 1_700_000_120_000,
+      terminal: true,
+      terminalEventKey,
+      degradedReason: null,
+      updatedAt: 3_000,
+    });
+
+    expect(
+      ledger.saveBettingFeedCheckpoint({
+        sourceEpoch: 100,
+        lastAppliedSeq: 11,
+        lastEmittedAt: 1_700_000_122_000,
+        duelId: "duel-9",
+        competitiveSnapshotDigest: "99".repeat(32),
+        betOpenTime: 1_700_000_000_000,
+        betCloseTime: 1_700_000_060_000,
+        fightStartTime: 1_700_000_064_000,
+        duelEndTime: 1_700_000_120_000,
+        phase: "IDLE",
+        terminal: true,
+        terminalEventKey,
+        updatedAt: 3_500,
+      }),
+    ).toMatchObject({
+      lastAppliedSeq: 11,
+      duelId: "duel-9",
+      phase: "IDLE",
+      terminal: true,
+      terminalEventKey,
+    });
+    ledger.close();
+    ledgers.splice(ledgers.indexOf(ledger), 1);
+    const reopened = openLedger();
+    expect(reopened.getBettingFeedCheckpoint()).toMatchObject({
+      lastAppliedSeq: 11,
+      duelId: "duel-9",
+      duelEndTime: 1_700_000_120_000,
+      phase: "IDLE",
+      terminal: true,
+      terminalEventKey,
+      degradedReason: null,
+    });
+
+    expect(() =>
+      reopened.saveBettingFeedCheckpoint({
+        sourceEpoch: 100,
+        lastAppliedSeq: 12,
+        lastEmittedAt: 1_700_000_123_000,
+        duelId: "duel-9",
+        competitiveSnapshotDigest: "99".repeat(32),
+        phase: "RESOLUTION",
+        terminal: true,
+        terminalEventKey: null,
+        updatedAt: 4_000,
+      }),
+    ).toThrow("terminal event checkpoint is invalid");
+  });
+
+  test("atomically retains one compact material timeline and immutable snapshot per duel", () => {
+    const ledger = openLedger();
+    const announcement = evidenceCycle();
+    ledger.saveBettingFeedCheckpoint(
+      evidenceCheckpoint(announcement),
+      announcement,
+    );
+
+    const repeatedAnnouncement = evidenceCycle({
+      seq: 2,
+      emittedAt: announcement.emittedAt + 250,
+    });
+    ledger.saveBettingFeedCheckpoint(
+      evidenceCheckpoint(repeatedAnnouncement),
+      repeatedAnnouncement,
+    );
+
+    const fightStartTime = announcement.betCloseTime! + 4_000;
+    const fighting = evidenceCycle({
+      seq: 3,
+      emittedAt: fightStartTime + 3_000,
+      phase: "FIGHTING",
+      fightStartTime,
+      agent1: { ...announcement.agent1!, hp: 24, damageDealtThisFight: 4 },
+      agent2: { ...announcement.agent2!, hp: 26, damageDealtThisFight: 6 },
+    });
+    ledger.saveBettingFeedCheckpoint(evidenceCheckpoint(fighting), fighting);
+
+    const resolution = evidenceCycle({
+      seq: 4,
+      emittedAt: fightStartTime + 15_000,
+      phase: "RESOLUTION",
+      fightStartTime,
+      duelEndTime: fightStartTime + 15_000,
+      winnerId: "agent-a",
+      outcome: "win",
+      winReason: "kill",
+      seed: "42",
+      replayHash: "ab".repeat(32),
+      agent1: { ...announcement.agent1!, hp: 18, damageDealtThisFight: 30 },
+      agent2: { ...announcement.agent2!, hp: 0, damageDealtThisFight: 12 },
+    });
+    ledger.saveBettingFeedCheckpoint(
+      evidenceCheckpoint(resolution, "cd".repeat(32)),
+      resolution,
+    );
+
+    const evidence = ledger.getBettingFeedDuelEvidence("duel-evidence-1");
+    expect(evidence).toMatchObject({
+      schemaVersion: 1,
+      proof: "hyperia-schema-v3-material-duel-timeline",
+      duelId: "duel-evidence-1",
+      duelKey: "31".repeat(32),
+      competitiveSnapshotDigest: announcement.competitiveSnapshotDigest,
+      firstSeq: 1,
+      lastSeq: 4,
+    });
+    expect(evidence?.frames.map(({ seq, phase }) => ({ seq, phase }))).toEqual([
+      { seq: 1, phase: "ANNOUNCEMENT" },
+      { seq: 3, phase: "FIGHTING" },
+      { seq: 4, phase: "RESOLUTION" },
+    ]);
+    expect(evidence?.timelineDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(evidence?.competitiveSnapshot).toEqual(
+      announcement.competitiveSnapshot,
+    );
+
+    ledger.close();
+    ledgers.splice(ledgers.indexOf(ledger), 1);
+    expect(openLedger().getBettingFeedDuelEvidence("duel-evidence-1")).toEqual(
+      evidence,
+    );
+  });
+
+  test("opens retained custody evidence without mutating or locking the live writer", () => {
+    const writer = openLedger();
+    const announcement = evidenceCycle();
+    writer.saveBettingFeedCheckpoint(
+      evidenceCheckpoint(announcement),
+      announcement,
+    );
+    const reader = new TerminalLedger(dbPath, { readOnly: true });
+    ledgers.push(reader);
+    expect(reader.getBettingFeedDuelEvidence("duel-evidence-1")).toMatchObject({
+      duelId: "duel-evidence-1",
+      firstSeq: 1,
+      lastSeq: 1,
+    });
+
+    const repeated = evidenceCycle({
+      seq: 2,
+      emittedAt: announcement.emittedAt + 250,
+    });
+    expect(() =>
+      writer.saveBettingFeedCheckpoint(evidenceCheckpoint(repeated), repeated),
+    ).not.toThrow();
+    expect(reader.getBettingFeedCheckpoint()).toMatchObject({
+      lastAppliedSeq: 2,
+    });
+    expect(() =>
+      reader.saveBettingFeedCheckpoint(evidenceCheckpoint(repeated), repeated),
+    ).toThrow();
+  });
+
+  test("rejects a changed accepted sequence without advancing its checkpoint", () => {
+    const ledger = openLedger();
+    const first = evidenceCycle();
+    ledger.saveBettingFeedCheckpoint(evidenceCheckpoint(first), first);
+    const contradictory = evidenceCycle({
+      agent1: { ...first.agent1!, hp: 29 },
+    });
+    expect(() =>
+      ledger.saveBettingFeedCheckpoint(
+        {
+          ...evidenceCheckpoint(contradictory),
+          updatedAt: first.emittedAt + 500,
+        },
+        contradictory,
+      ),
+    ).toThrow("evidence sequence drifted");
+    expect(ledger.getBettingFeedCheckpoint()).toMatchObject({
+      lastAppliedSeq: 1,
+      updatedAt: first.emittedAt,
+    });
+    expect(
+      ledger.getBettingFeedDuelEvidence("duel-evidence-1")?.frames,
+    ).toHaveLength(1);
+  });
+
+  test("rejects a second competitive snapshot for one duel without partial evidence", () => {
+    const ledger = openLedger();
+    const first = evidenceCycle();
+    ledger.saveBettingFeedCheckpoint(evidenceCheckpoint(first), first);
+    const changedSnapshot = buildTestCompetitiveSnapshot({
+      cycleId: first.cycleId,
+      duelId: first.duelId!,
+      duelKey: first.duelKeyHex!,
+      betOpenTime: first.betOpenTime!,
+      betCloseTime: first.betCloseTime!,
+      agent1: { id: "agent-a", name: "Changed Agent A" },
+    });
+    const drifted = evidenceCycle({
+      seq: 2,
+      emittedAt: first.emittedAt + 250,
+      competitiveSnapshotVersion: changedSnapshot.competitiveSnapshotVersion,
+      competitiveSnapshotDigest: changedSnapshot.competitiveSnapshotDigest,
+      competitiveSnapshot: changedSnapshot.competitiveSnapshot,
+      agent1: { ...first.agent1!, name: "Changed Agent A" },
+    });
+    expect(() =>
+      ledger.saveBettingFeedCheckpoint(evidenceCheckpoint(drifted), drifted),
+    ).toThrow("competitive snapshot evidence drifted");
+    expect(ledger.getBettingFeedCheckpoint()).toMatchObject({
+      lastAppliedSeq: 1,
+      competitiveSnapshotDigest: first.competitiveSnapshotDigest,
+    });
+    expect(
+      ledger.getBettingFeedDuelEvidence("duel-evidence-1")?.frames,
+    ).toHaveLength(1);
   });
 });

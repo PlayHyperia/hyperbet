@@ -14,29 +14,88 @@ inputs:
     description: Install Anchor CLI
     required: false
     default: "false"
+  install-cargo-audit:
+    description: Install the pinned RustSec cargo-audit CLI
+    required: false
+    default: "false"
   bun-version:
     description: Bun version to install
     required: false
     default: "1.3.6"
+  rust-version:
+    description: Rust toolchain version to install
+    required: false
+    default: "1.93.1"
   solana-version:
     description: Solana CLI version to install
     required: false
     default: "2.3.0"
+  solana-revision:
+    description: Signed Agave release commit expected after installation
+    required: false
+    default: "a2e21dda295b18dd09ac06542834c5e9b1b2dc84"
   anchor-version:
     description: Anchor CLI version to install
     required: false
     default: "0.32.1"
+  anchor-revision:
+    description: Signed Anchor release commit to build
+    required: false
+    default: "1ebbe58158d089a2a40b5e35ebead5a10db9090d"
+  cargo-audit-version:
+    description: cargo-audit version to install
+    required: false
+    default: "0.22.2"
 
 runs:
   using: composite
   steps:
+    - name: Verify GitHub-hosted runner generation
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${RUNNER_OS:-}" != "Linux" ]]; then
+          echo "The reviewed workflow runner must be Linux X64" >&2
+          exit 1
+        fi
+        if [[ "${RUNNER_ARCH:-}" != "X64" ]]; then
+          echo "The reviewed workflow runner must be Linux X64" >&2
+          exit 1
+        fi
+        if [[ "${ImageOS:-}" != "ubuntu24" ]]; then
+          echo "The reviewed workflow runner must resolve to the Ubuntu 24 image generation" >&2
+          exit 1
+        fi
+        if [[ ! "${ImageVersion:-}" =~ ^[0-9]{8}\.[0-9]+\.[0-9]+$ ]]; then
+          echo "The GitHub-hosted runner image version is missing or malformed" >&2
+          exit 1
+        fi
+        printf 'GitHub-hosted runner image: %s (%s/%s)\n' \
+          "$ImageVersion" \
+          "$RUNNER_OS" \
+          "$RUNNER_ARCH"
+
     - name: Setup Bun
-      uses: oven-sh/setup-bun@v2
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       with:
         bun-version: ${{ inputs.bun-version }}
+        no-cache: true
+        token: ""
+
+    - name: Verify Bun toolchain
+      shell: bash
+      env:
+        EXPECTED_BUN_VERSION: ${{ inputs.bun-version }}
+      run: |
+        set -euo pipefail
+        installed_version="$(bun --version)"
+        if [[ "$installed_version" != "$EXPECTED_BUN_VERSION" ]]; then
+          echo "Expected Bun ${EXPECTED_BUN_VERSION}, received ${installed_version}" >&2
+          exit 1
+        fi
 
     - name: Cache Bun store
-      uses: actions/cache@v5.0.4
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: ~/.bun/install/cache
         key: ${{ runner.os }}-bun-${{ inputs.bun-version }}-${{ hashFiles('bun.lock', 'package.json', 'packages/*/package.json') }}
@@ -44,8 +103,28 @@ runs:
           ${{ runner.os }}-bun-${{ inputs.bun-version }}-
 
     - name: Setup Rust
-      if: ${{ inputs.install-rust == 'true' || inputs.install-anchor == 'true' }}
-      uses: dtolnay/rust-toolchain@stable
+      if: ${{ inputs.install-rust == 'true' || inputs.install-anchor == 'true' || inputs.install-cargo-audit == 'true' }}
+      uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      with:
+        toolchain: ${{ inputs.rust-version }}
+
+    - name: Verify Rust toolchain
+      if: ${{ inputs.install-rust == 'true' || inputs.install-anchor == 'true' || inputs.install-cargo-audit == 'true' }}
+      shell: bash
+      env:
+        EXPECTED_RUST_VERSION: ${{ inputs.rust-version }}
+      run: |
+        set -euo pipefail
+        rustc_version="$(rustc --version | awk '{print $2}')"
+        cargo_version="$(cargo --version | awk '{print $2}')"
+        if [[ "$rustc_version" != "$EXPECTED_RUST_VERSION" ]]; then
+          echo "Expected rustc ${EXPECTED_RUST_VERSION}, received ${rustc_version}" >&2
+          exit 1
+        fi
+        if [[ "$cargo_version" != "$EXPECTED_RUST_VERSION" ]]; then
+          echo "Expected cargo ${EXPECTED_RUST_VERSION}, received ${cargo_version}" >&2
+          exit 1
+        fi
 
     - name: Install Linux system packages for Anchor
       if: ${{ inputs.install-anchor == 'true' && runner.os == 'Linux' }}
@@ -56,39 +135,136 @@ runs:
         sudo apt-get install -y libssl-dev libudev-dev pkg-config
 
     - name: Cache Cargo registry
-      if: ${{ inputs.install-rust == 'true' || inputs.install-anchor == 'true' }}
-      uses: actions/cache@v5.0.4
+      if: ${{ inputs.install-rust == 'true' || inputs.install-anchor == 'true' || inputs.install-cargo-audit == 'true' }}
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
       with:
         path: |
-          ~/.cargo/bin
           ~/.cargo/registry
           ~/.cargo/git
-        key: ${{ runner.os }}-cargo-${{ inputs.anchor-version }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
-
-    - name: Cache Solana CLI
-      if: ${{ inputs.install-solana == 'true' }}
-      uses: actions/cache@v5.0.4
-      with:
-        path: ~/.local/share/solana
-        key: ${{ runner.os }}-solana-${{ inputs.solana-version }}
-        restore-keys: |
-          ${{ runner.os }}-solana-
+        key: ${{ runner.os }}-rust-${{ inputs.rust-version }}-cargo-${{ inputs.anchor-version }}-audit-${{ inputs.cargo-audit-version }}
 
     - name: Setup Solana CLI
       if: ${{ inputs.install-solana == 'true' }}
       shell: bash
+      env:
+        EXPECTED_SOLANA_REVISION: ${{ inputs.solana-revision }}
+        EXPECTED_SOLANA_VERSION: ${{ inputs.solana-version }}
       run: |
         set -euo pipefail
-        if ! command -v solana >/dev/null 2>&1; then
-          sh -c "$(curl -sSfL https://release.anza.xyz/v${{ inputs.solana-version }}/install)"
+        if [[ ! "$EXPECTED_SOLANA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "Solana version must be an exact semantic version" >&2
+          exit 1
+        fi
+        if [[ ! "$EXPECTED_SOLANA_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "Solana revision must be a full lowercase commit" >&2
+          exit 1
+        fi
+        if [[ "${RUNNER_OS:-}" != "Linux" || "${RUNNER_ARCH:-}" != "X64" ]]; then
+          echo "The reviewed Solana installer supports only Linux X64 runners" >&2
+          exit 1
+        fi
+        if [[ -z "${RUNNER_TEMP:-}" || "$RUNNER_TEMP" != /* || ! -d "$RUNNER_TEMP" || -L "$RUNNER_TEMP" ]]; then
+          echo "RUNNER_TEMP must be an existing absolute non-symlink directory" >&2
+          exit 1
+        fi
+
+        solana_bin="${HOME}/.local/share/solana/install/active_release/bin/solana"
+        if [[ ! -x "$solana_bin" ]]; then
+          umask 077
+          installer_path="$(mktemp "${RUNNER_TEMP%/}/hyperbet-agave-installer.XXXXXX")"
+          cleanup_installer() {
+            rm -f -- "$installer_path"
+          }
+          trap cleanup_installer EXIT
+          curl \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --max-time 120 \
+            --max-filesize 1048576 \
+            --output "$installer_path" \
+            "https://release.anza.xyz/v${EXPECTED_SOLANA_VERSION}/install"
+          installer_size="$(wc -c < "$installer_path" | tr -d '[:space:]')"
+          if [[ ! "$installer_size" =~ ^[0-9]+$ || "$installer_size" -lt 1 || "$installer_size" -gt 1048576 ]]; then
+            echo "Agave installer size is outside the reviewed bound" >&2
+            exit 1
+          fi
+          bash "$installer_path"
+          cleanup_installer
+          trap - EXIT
+        fi
+
+        installed_version="$($solana_bin --version | awk '{print $2}')"
+        if [[ "$installed_version" != "$EXPECTED_SOLANA_VERSION" ]]; then
+          echo "Expected Solana ${EXPECTED_SOLANA_VERSION}, received ${installed_version}" >&2
+          exit 1
+        fi
+        version_manifest="${HOME}/.local/share/solana/install/active_release/version.yml"
+        if [[ ! -f "$version_manifest" || -L "$version_manifest" ]]; then
+          echo "Solana release manifest is missing or unsafe" >&2
+          exit 1
+        fi
+        expected_manifest="$(printf 'channel: v%s\ncommit: %s\ntarget: x86_64-unknown-linux-gnu' "$EXPECTED_SOLANA_VERSION" "$EXPECTED_SOLANA_REVISION")"
+        installed_manifest="$(cat "$version_manifest")"
+        if [[ "$installed_manifest" != "$expected_manifest" ]]; then
+          echo "Solana release manifest does not match the reviewed version, revision, and target" >&2
+          exit 1
         fi
         echo "${HOME}/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
 
     - name: Setup Anchor CLI
       if: ${{ inputs.install-anchor == 'true' }}
       shell: bash
+      env:
+        EXPECTED_ANCHOR_REVISION: ${{ inputs.anchor-revision }}
+        EXPECTED_ANCHOR_VERSION: ${{ inputs.anchor-version }}
       run: |
         set -euo pipefail
-        cargo install --git https://github.com/coral-xyz/anchor anchor-cli --tag "v${{ inputs.anchor-version }}" --locked --force
+        if [[ ! "$EXPECTED_ANCHOR_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "Anchor version must be an exact semantic version" >&2
+          exit 1
+        fi
+        if [[ ! "$EXPECTED_ANCHOR_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "Anchor revision must be a full lowercase commit" >&2
+          exit 1
+        fi
+        cargo install \
+          --git https://github.com/otter-sec/anchor \
+          --rev "$EXPECTED_ANCHOR_REVISION" \
+          --locked \
+          --force \
+          anchor-cli
+        installed_version="$(anchor --version | awk '{print $2}')"
+        if [[ "$installed_version" != "$EXPECTED_ANCHOR_VERSION" ]]; then
+          echo "Expected Anchor ${EXPECTED_ANCHOR_VERSION}, received ${installed_version}" >&2
+          exit 1
+        fi
+
+    - name: Setup cargo-audit CLI
+      if: ${{ inputs.install-cargo-audit == 'true' }}
+      shell: bash
+      env:
+        EXPECTED_CARGO_AUDIT_VERSION: ${{ inputs.cargo-audit-version }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$EXPECTED_CARGO_AUDIT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "cargo-audit version must be an exact semantic version" >&2
+          exit 1
+        fi
+        installed_version="$(cargo audit --version 2>/dev/null | awk '{print $NF}' || true)"
+        if [[ "$installed_version" != "$EXPECTED_CARGO_AUDIT_VERSION" ]]; then
+          cargo install \
+            cargo-audit \
+            --version "=${EXPECTED_CARGO_AUDIT_VERSION}" \
+            --locked \
+            --force
+        fi
+        installed_version="$(cargo audit --version | awk '{print $NF}')"
+        if [[ "$installed_version" != "$EXPECTED_CARGO_AUDIT_VERSION" ]]; then
+          echo "Expected cargo-audit ${EXPECTED_CARGO_AUDIT_VERSION}, received ${installed_version}" >&2
+          exit 1
+        fi

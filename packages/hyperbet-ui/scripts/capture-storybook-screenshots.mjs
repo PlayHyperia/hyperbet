@@ -12,10 +12,13 @@ const EXPECTED_COMPONENTS = [
   "RecentTrades",
   "ResizeHandle",
   "SolanaClobPanel",
+  "SolanaLimitPriceField",
   "SolanaManagedOrderConfirmationDialog",
   "SolanaManagedOrders",
+  "SolanaOrderQuoteNotice",
   "SolanaPointsDisplay",
   "SolanaReferralPanel",
+  "SolanaSettlementActionCard",
   "SolanaSettlementHistory",
   "SolanaTransactionFeedbackCard",
   "StreamPlayer",
@@ -26,7 +29,8 @@ const EXPECTED_COMPONENTS = [
 // visual capture.
 const EXPECTED_FRAMES = [];
 
-const baseUrl = "http://127.0.0.1:6006";
+const baseUrl =
+  process.env.STORYBOOK_SCREENSHOT_BASE_URL ?? "http://127.0.0.1:6006";
 const outputDir = path.resolve(process.cwd(), "storybook-artifacts");
 
 function readPngSize(buffer) {
@@ -112,6 +116,7 @@ for (const entry of allStories) {
   const profiles = [
     "Components/SolanaManagedOrderConfirmationDialog",
     "Components/SolanaManagedOrders",
+    "Components/SolanaSettlementHistory",
     "Components/SolanaTransactionFeedbackCard",
   ].includes(entry.title)
     ? [desktopProfile, mobileReducedMotionProfile]
@@ -179,6 +184,79 @@ for (const entry of allStories) {
       }
     }
 
+    if (
+      entry.title === "Components/SolanaSettlementHistory" &&
+      entry.name === "Connected Claimable"
+    ) {
+      if (
+        !bodyText.includes("YES · e35419…8485") ||
+        !bodyText.includes("Winnings ready to claim") ||
+        !bodyText.includes("Claim winnings") ||
+        bodyText.includes("Activity is temporarily unavailable")
+      ) {
+        throw new Error(
+          `Connected settlement-history fixture did not render verified claimable activity (${profile.label})`,
+        );
+      }
+      const identity = page.locator(
+        '[data-testid="solana-settlement-identity-storybook-bet-1"]',
+      );
+      if (
+        (await identity.getAttribute("title")) !==
+        "streaming-e354197c-6db9-43af-90d6-9ae5d9898485"
+      ) {
+        throw new Error(
+          `Connected settlement-history fixture lost its exact duel identity (${profile.label})`,
+        );
+      }
+      const history = page.getByTestId("solana-settlement-history");
+      const historyAccessibilityTree = await history.ariaSnapshot();
+      for (const controlName of [
+        "Refresh",
+        "Claim winnings",
+        "Recover order rent",
+      ]) {
+        if (!historyAccessibilityTree.includes(`button "${controlName}"`)) {
+          throw new Error(
+            `Connected settlement-history fixture lost the ${controlName} accessibility control (${profile.label})\n${historyAccessibilityTree}`,
+          );
+        }
+      }
+      const refresh = history.getByRole("button", { name: "Refresh" });
+      const claim = history.getByRole("button", { name: "Claim winnings" });
+      const recoverRent = history.getByRole("button", {
+        name: "Recover order rent",
+      });
+      await refresh.focus();
+      await page.keyboard.press("Tab");
+      if (!(await claim.evaluate((node) => node === document.activeElement))) {
+        throw new Error(
+          `Claim action did not follow refresh in keyboard order (${profile.label})`,
+        );
+      }
+      await page.keyboard.press("Tab");
+      if (
+        !(await recoverRent.evaluate((node) => node === document.activeElement))
+      ) {
+        throw new Error(
+          `Order-rent recovery did not follow claim in keyboard order (${profile.label})`,
+        );
+      }
+      for (const control of [refresh, claim, recoverRent]) {
+        const box = await control.boundingBox();
+        if (!box || box.height < 44) {
+          throw new Error(
+            `Settlement-history control is below the 44px touch target (${profile.label})`,
+          );
+        }
+      }
+      await page.evaluate(() => {
+        if (document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+        }
+      });
+    }
+
     if (profile.enforceNoHorizontalOverflow) {
       const layout = await page.evaluate(() => ({
         viewportWidth: window.innerWidth,
@@ -219,6 +297,62 @@ for (const entry of allStories) {
       ) {
         throw new Error(
           `Unexpected recovery-action count for ${entry.name} (${profile.label}): ${reviewButtons}`,
+        );
+      }
+      const details = feedback.getByTestId(
+        "storybook-transaction-feedback-details",
+      );
+      if (state === "confirmed") {
+        if ((await details.count()) !== 1) {
+          throw new Error(
+            `Confirmed transaction proof disclosure is missing (${profile.label})`,
+          );
+        }
+        const summary = details.locator("summary");
+        if (
+          !accessibilityTree.includes("group: Transaction proof") ||
+          (await details.getAttribute("open")) !== null
+        ) {
+          throw new Error(
+            `Confirmed transaction proof is not an accessible collapsed disclosure (${profile.label})\n${accessibilityTree}`,
+          );
+        }
+        await summary.focus();
+        if (
+          !(await summary.evaluate((node) => node === document.activeElement))
+        ) {
+          throw new Error(
+            `Transaction proof disclosure could not receive keyboard focus (${profile.label})`,
+          );
+        }
+        await page.keyboard.press("Enter");
+        if (
+          (await details.getAttribute("open")) === null ||
+          !(await feedback
+            .getByTestId("storybook-transaction-signature")
+            .isVisible()) ||
+          !(await feedback
+            .getByRole("link", { name: /View transaction/ })
+            .isVisible())
+        ) {
+          throw new Error(
+            `Keyboard activation did not reveal complete transaction proof (${profile.label})`,
+          );
+        }
+        await page.keyboard.press("Enter");
+        if ((await details.getAttribute("open")) !== null) {
+          throw new Error(
+            `Second keyboard activation did not collapse transaction proof (${profile.label})`,
+          );
+        }
+        await page.evaluate(() => {
+          if (document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur();
+          }
+        });
+      } else if ((await details.count()) !== 0) {
+        throw new Error(
+          `Non-confirmed transaction unexpectedly hid proof in a disclosure (${profile.label})`,
         );
       }
 

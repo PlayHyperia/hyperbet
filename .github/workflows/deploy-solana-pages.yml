@@ -1,102 +1,78 @@
 name: Deploy Hyperbet Solana Pages
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "packages/hyperbet-solana/app/**"
-      - "packages/hyperbet-ui/**"
-      - "packages/hyperbet-solana/deployments/**"
-      - "scripts/ci-env-audit-solana-v1.ts"
-      - "scripts/ci-solana-v1-scope.ts"
-      - "scripts/check-legacy-branding.mjs"
-      - ".github/actions/setup-hyperbet/**"
-      - ".github/workflows/deploy-solana-pages.yml"
-      - "docs/hyperbet-production-deploy.md"
-      - "package.json"
-      - "bun.lock"
   workflow_dispatch:
     inputs:
       environment:
         description: "Deployment target"
         required: true
-        default: production
+        default: staging
         type: choice
         options:
-          - production
           - staging
           - preview
+          - production
+      production_confirmation:
+        description: Type DEPLOY_SOL_PRODUCTION for a production deployment
+        required: false
+        default: ""
+        type: string
+      production_commit_sha:
+        description: Full main-branch commit SHA approved for production
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
-  CLOUDFLARE_ACCOUNT_ID: ${{ vars.HYPERBET_CLOUDFLARE_ACCOUNT_ID != '' && vars.HYPERBET_CLOUDFLARE_ACCOUNT_ID || '50ad2052bbc6ca528d6993a689b419a4' }}
+  WRANGLER_CLI_VERSION: "4.72.0"
 
 jobs:
   deploy:
     name: Deploy hyperbet-solana pages
-    runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging' && 'staging' || 'production' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment == 'production' && 'production' || 'staging' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify production promotion request
+        env:
+          REQUESTED_ENVIRONMENT: ${{ inputs.environment }}
+          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+          PRODUCTION_COMMIT_SHA: ${{ inputs.production_commit_sha }}
+        run: |
+          node packages/hyperbet-solana/scripts/verify-production-promotion.mjs \
+            --environment "$REQUESTED_ENVIRONMENT" \
+            --confirmation "$PRODUCTION_CONFIRMATION" \
+            --expected-sha "$PRODUCTION_COMMIT_SHA" \
+            --ref "$GITHUB_REF" \
+            --actual-sha "$GITHUB_SHA"
 
       - name: Resolve deployment target
-        run: |
-          deploy_target="production"
-          pages_project_name="${{ vars.HYPERBET_SOLANA_PAGES_PROJECT_NAME != '' && vars.HYPERBET_SOLANA_PAGES_PROJECT_NAME || 'hyperia-betting' }}"
-          pages_expected_url="${{ vars.HYPERBET_SOLANA_PAGES_PRODUCTION_URL != '' && vars.HYPERBET_SOLANA_PAGES_PRODUCTION_URL || 'https://hyperbet.win' }}"
-          api_url="${{ vars.HYPERBET_SOLANA_KEEPER_URL != '' && vars.HYPERBET_SOLANA_KEEPER_URL || 'https://api.hyperbet.win' }}"
-          ws_url="${{ vars.HYPERBET_SOLANA_KEEPER_WS_URL != '' && vars.HYPERBET_SOLANA_KEEPER_WS_URL || 'wss://api.hyperbet.win/ws' }}"
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.environment }}" = "staging" ]; then
-            deploy_target="staging"
-            pages_project_name="${{ vars.HYPERBET_SOLANA_PAGES_STAGING_PROJECT_NAME }}"
-            pages_expected_url="${{ vars.HYPERBET_SOLANA_PAGES_STAGING_URL }}"
-            api_url="${{ vars.HYPERBET_SOLANA_KEEPER_STAGING_URL }}"
-            ws_url="${{ vars.HYPERBET_SOLANA_KEEPER_STAGING_WS_URL }}"
-          fi
-
-          if [ -z "${pages_project_name}" ]; then
-            echo "Missing Solana Pages project name for ${deploy_target}" >&2
-            exit 1
-          fi
-
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ "${{ inputs.environment }}" != "preview" ]; then
-            if [ -z "${pages_expected_url}" ] || [ -z "${api_url}" ] || [ -z "${ws_url}" ]; then
-              echo "Missing Solana staging/prod URL configuration for ${deploy_target}" >&2
-              exit 1
-            fi
-          fi
-
-          echo "DEPLOY_TARGET=${deploy_target}" >> "${GITHUB_ENV}"
-          echo "PAGES_PROJECT_NAME=${pages_project_name}" >> "${GITHUB_ENV}"
-          echo "PAGES_EXPECTED_URL=${pages_expected_url}" >> "${GITHUB_ENV}"
-          echo "HYPERBET_API_URL=${api_url}" >> "${GITHUB_ENV}"
-          echo "HYPERBET_WS_URL=${ws_url}" >> "${GITHUB_ENV}"
-
-      - name: Configure Wrangler auth
+        run: node scripts/ci-solana-pages-deploy-target.mjs >> "$GITHUB_ENV"
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_WRANGLER_CONFIG_B64: ${{ secrets.CLOUDFLARE_WRANGLER_CONFIG_B64 }}
-        run: |
-          if [ -n "${CLOUDFLARE_API_TOKEN}" ]; then
-            echo "CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}" >> "${GITHUB_ENV}"
-            exit 0
-          fi
-
-          if [ -z "${CLOUDFLARE_WRANGLER_CONFIG_B64}" ]; then
-            echo "Missing Cloudflare deploy credentials" >&2
-            exit 1
-          fi
-
-          mkdir -p "${HOME}/.wrangler/config"
-          printf '%s' "${CLOUDFLARE_WRANGLER_CONFIG_B64}" | base64 --decode > "${HOME}/.wrangler/config/default.toml"
+          REQUESTED_ENVIRONMENT: ${{ inputs.environment }}
+          HYPERBET_CLOUDFLARE_ACCOUNT_ID: ${{ vars.HYPERBET_CLOUDFLARE_ACCOUNT_ID }}
+          HYPERBET_SOLANA_STREAM_SOURCES: ${{ vars.HYPERBET_SOLANA_STREAM_SOURCES }}
+          HYPERBET_SOLANA_PAGES_PROJECT_NAME: ${{ vars.HYPERBET_SOLANA_PAGES_PROJECT_NAME }}
+          HYPERBET_SOLANA_PAGES_PRODUCTION_URL: ${{ vars.HYPERBET_SOLANA_PAGES_PRODUCTION_URL }}
+          HYPERBET_SOLANA_KEEPER_URL: ${{ vars.HYPERBET_SOLANA_KEEPER_URL }}
+          HYPERBET_SOLANA_KEEPER_WS_URL: ${{ vars.HYPERBET_SOLANA_KEEPER_WS_URL }}
+          HYPERBET_SOLANA_STAGING_STREAM_SOURCES: ${{ vars.HYPERBET_SOLANA_STAGING_STREAM_SOURCES }}
+          HYPERBET_SOLANA_PAGES_STAGING_PROJECT_NAME: ${{ vars.HYPERBET_SOLANA_PAGES_STAGING_PROJECT_NAME }}
+          HYPERBET_SOLANA_PAGES_STAGING_URL: ${{ vars.HYPERBET_SOLANA_PAGES_STAGING_URL }}
+          HYPERBET_SOLANA_KEEPER_STAGING_URL: ${{ vars.HYPERBET_SOLANA_KEEPER_STAGING_URL }}
+          HYPERBET_SOLANA_KEEPER_STAGING_WS_URL: ${{ vars.HYPERBET_SOLANA_KEEPER_STAGING_WS_URL }}
 
       - name: Setup Hyperbet toolchain
         uses: ./.github/actions/setup-hyperbet
@@ -110,16 +86,20 @@ jobs:
         env:
           VITE_GAME_API_URL: ${{ env.HYPERBET_API_URL }}
           VITE_GAME_WS_URL: ${{ env.HYPERBET_WS_URL }}
-          VITE_SOLANA_CLUSTER: mainnet-beta
+          VITE_SOLANA_CLUSTER: ${{ env.DEPLOY_SOLANA_CLUSTER }}
+          VITE_STREAM_SOURCES: ${{ env.VITE_STREAM_SOURCES }}
+          VITE_TRANSACTIONS_ENABLED: ${{ env.VITE_TRANSACTIONS_ENABLED }}
           VITE_USE_GAME_RPC_PROXY: "true"
 
       - name: Build production app
-        run: bun run --cwd packages/hyperbet-solana/app build --mode mainnet-beta
+        run: bun run --cwd packages/hyperbet-solana/app build --mode "${DEPLOY_SOLANA_CLUSTER}"
         env:
           CF_PAGES_COMMIT_SHA: ${{ github.sha }}
           VITE_GAME_API_URL: ${{ env.HYPERBET_API_URL }}
           VITE_GAME_WS_URL: ${{ env.HYPERBET_WS_URL }}
-          VITE_SOLANA_CLUSTER: mainnet-beta
+          VITE_SOLANA_CLUSTER: ${{ env.DEPLOY_SOLANA_CLUSTER }}
+          VITE_STREAM_SOURCES: ${{ env.VITE_STREAM_SOURCES }}
+          VITE_TRANSACTIONS_ENABLED: ${{ env.VITE_TRANSACTIONS_ENABLED }}
           VITE_USE_GAME_RPC_PROXY: "true"
 
       - name: Verify SOL-only production bundle
@@ -128,6 +108,7 @@ jobs:
       - name: Verify dist hygiene
         run: |
           test -f packages/hyperbet-solana/app/dist/build-info.json
+          node scripts/verify-solana-pages-deployment.mjs --local-only
           if find packages/hyperbet-solana/app/dist -name '*.map' | grep -q .; then
             echo "Unexpected source maps in production dist"
             exit 1
@@ -137,11 +118,26 @@ jobs:
             exit 1
           fi
 
+      - name: Install pinned Wrangler CLI before exposing credentials
+        run: |
+          npm install --global "wrangler@${WRANGLER_CLI_VERSION}"
+          installed_wrangler_version="$(wrangler --version | tr -d '\r' | awk '{print $NF}')"
+          test "${installed_wrangler_version}" = "${WRANGLER_CLI_VERSION}"
+
       - name: Deploy to Cloudflare Pages
         working-directory: packages/hyperbet-solana/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_WRANGLER_CONFIG_B64: ${{ secrets.CLOUDFLARE_WRANGLER_CONFIG_B64 }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.environment }}" = "preview" ]; then
-            BRANCH="preview-${{ github.run_id }}"
+          if [ "${DEPLOY_TARGET}" = "preview" ]; then
+            case "${GITHUB_RUN_ID}" in
+              ''|*[!0-9]*)
+                echo "GITHUB_RUN_ID must be numeric" >&2
+                exit 1
+                ;;
+            esac
+            BRANCH="preview-${GITHUB_RUN_ID}"
           elif [ "${DEPLOY_TARGET}" = "staging" ]; then
             BRANCH="staging"
           else
@@ -150,7 +146,8 @@ jobs:
 
           COMMIT_MSG=$(git log -1 --pretty=%s | tr -d '"' | cut -c1-100)
 
-          npx wrangler@4.72.0 pages deploy dist \
+          bash ../../../scripts/run-wrangler-with-scoped-auth.sh \
+            wrangler pages deploy dist \
             --project-name="${PAGES_PROJECT_NAME}" \
             --branch="${BRANCH}" \
             --commit-hash="${GITHUB_SHA}" \
@@ -161,43 +158,24 @@ jobs:
       - name: Resolve deployed Pages URL
         id: deployment_url
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.environment != 'preview' }}
-        run: |
-          pages_environment="production"
-          if [ "${DEPLOY_TARGET}" != "production" ]; then
-            pages_environment="preview"
-          fi
-
-          deployed_url="$(npx wrangler@4.72.0 pages deployment list \
-            --project-name "${PAGES_PROJECT_NAME}" \
-            --environment "${pages_environment}" \
-            --json | jq -r --arg source "${GITHUB_SHA::7}" 'map(select(.Source == $source)) | .[0].Deployment // empty')"
-
-          if [ -z "${deployed_url}" ]; then
-            echo "Unable to resolve deployed Pages URL for ${PAGES_PROJECT_NAME}" >&2
-            exit 1
-          fi
-
-          echo "deployed_url=${deployed_url}" >> "${GITHUB_OUTPUT}"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_WRANGLER_CONFIG_B64: ${{ secrets.CLOUDFLARE_WRANGLER_CONFIG_B64 }}
+        run: bash scripts/resolve-pages-deployment-url-with-scoped-auth.sh
 
       - name: Verify production build metadata
+        id: verify_deployment
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.environment != 'preview' }}
-        run: |
-          deployed_url="${{ steps.deployment_url.outputs.deployed_url }}"
-          for attempt in $(seq 1 20); do
-            payload="$(curl -fsSL "${deployed_url}/build-info.json" || true)"
-            if [ -n "$payload" ] && echo "$payload" | jq -e --arg sha "$GITHUB_SHA" '.commitHash == $sha' >/dev/null; then
-              echo "build-info.json matches ${GITHUB_SHA} at ${deployed_url}"
-              break
-            fi
-            sleep 15
-          done
-          curl -fsSL "${deployed_url}/build-info.json" | jq -e --arg sha "$GITHUB_SHA" '.commitHash == $sha'
+        env:
+          DEPLOYED_URL: ${{ steps.deployment_url.outputs.deployed_url }}
+        run: node scripts/verify-solana-pages-deployment.mjs --output="${RUNNER_TEMP}/hyperbet-solana-pages-deployment-evidence.json"
 
-          if [ -n "${PAGES_EXPECTED_URL}" ] && [ "${PAGES_EXPECTED_URL}" != "${deployed_url}" ]; then
-            custom_payload="$(curl -fsSL "${PAGES_EXPECTED_URL}/build-info.json" || true)"
-            if [ -n "${custom_payload}" ] && echo "${custom_payload}" | jq -e --arg sha "$GITHUB_SHA" '.commitHash == $sha' >/dev/null; then
-              echo "custom domain build-info.json matches ${GITHUB_SHA}"
-            else
-              echo "warning: ${PAGES_EXPECTED_URL}/build-info.json is not serving ${GITHUB_SHA} yet" >&2
-            fi
-          fi
+      - name: Upload Pages deployment evidence
+        if: ${{ steps.verify_deployment.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hyperbet-solana-pages-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hyperbet-solana-pages-deployment-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

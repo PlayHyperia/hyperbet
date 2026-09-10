@@ -34,7 +34,7 @@ export function resolveExpectedUpgradeAuthority(input: {
   if (!value) {
     if (input.required) {
       throw new Error(
-        `${input.label} expected upgrade authority is required on mainnet`,
+        `${input.label} expected upgrade authority is required for this launch rail`,
       );
     }
     return undefined;
@@ -47,6 +47,28 @@ export function resolveExpectedUpgradeAuthority(input: {
     throw new Error(`${input.label} expected upgrade authority cannot be zero`);
   }
   return authority;
+}
+
+export function resolveClusterExpectedUpgradeAuthority(input: {
+  cluster: string;
+  value: string | undefined;
+  label: string;
+}): ExpectedUpgradeAuthority {
+  const cluster = input.cluster.trim().toLowerCase();
+  if (cluster === "localnet") {
+    return resolveExpectedUpgradeAuthority({ ...input, required: false });
+  }
+  if (
+    cluster !== "devnet" &&
+    cluster !== "testnet" &&
+    cluster !== "mainnet" &&
+    cluster !== "mainnet-beta"
+  ) {
+    throw new Error(
+      `Unsupported Solana program-identity cluster '${input.cluster}'`,
+    );
+  }
+  return resolveExpectedUpgradeAuthority({ ...input, required: true });
 }
 
 function parseProgramDataAddress(data: Buffer): PublicKey {

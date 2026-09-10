@@ -3,6 +3,12 @@ import { createHash } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 
 import { isCanonicalSolanaTransactionSignature } from "./solanaBetAccounting";
+import { validateClaimLifecycleFact } from "./solanaClaimAccounting";
+
+export {
+  verifyClaimLifecycleAccounting,
+  verifyClaimTransferEvidence,
+} from "./solanaClaimAccounting";
 
 export type FinalizedSignatureReference = {
   signature: string;
@@ -31,6 +37,7 @@ export type SolanaLifecycleFactKind =
   | "ORDER_CANCELLED"
   | "RESTING_ORDER_RECLAIMED"
   | "FILLED_ORDER_CLOSED"
+  | "EMPTY_USER_BALANCE_CLOSED"
   | "PRICE_LEVEL_CLOSED"
   | "CLAIM_PAYOUT"
   | "CANCELLATION_REFUND"
@@ -63,6 +70,14 @@ export type SolanaLifecycleFact = {
   winner?: "none" | "a" | "b";
 };
 
+const U64_MAX = (1n << 64n) - 1n;
+export const MAX_FINALIZED_SIGNATURE_HISTORY_ENTRIES = 100_000;
+export const MAX_FINALIZED_SIGNATURE_PAGE_SIZE = 1_000;
+export const MAX_FINALIZED_SIGNATURE_PAGES =
+  MAX_FINALIZED_SIGNATURE_HISTORY_ENTRIES / MAX_FINALIZED_SIGNATURE_PAGE_SIZE +
+  1;
+export const MAX_FINALIZED_TRANSACTION_RPC_BATCH_SIZE = 100;
+
 function canonicalPublicKey(value: unknown, label: string): string {
   if (typeof value !== "string" || value !== value.trim() || !value) {
     throw new Error(`${label} must be a canonical Solana public key`);
@@ -82,7 +97,11 @@ function unsignedInteger(value: unknown, label: string): string {
   if (typeof value !== "string" || !/^\d+$/.test(value)) {
     throw new Error(`${label} must be an unsigned integer string`);
   }
-  return BigInt(value).toString();
+  const parsed = BigInt(value);
+  if (parsed > U64_MAX) {
+    throw new Error(`${label} exceeds the on-chain u64 domain`);
+  }
+  return parsed.toString();
 }
 
 function positiveUnits(value: unknown, label: string): string {
@@ -100,7 +119,12 @@ function optionalWallet(value: unknown): string | undefined {
 }
 
 function optionalOrderId(value: unknown, label: string): string | undefined {
-  return value === undefined ? undefined : unsignedInteger(value, label);
+  if (value === undefined) return undefined;
+  const normalized = unsignedInteger(value, label);
+  if (BigInt(normalized) < 1n) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return normalized;
 }
 
 function assertExactFields(
@@ -303,6 +327,9 @@ export function normalizeLifecycleFact(
     case "FILLED_ORDER_CLOSED":
       assertExactFields(base, ["orderId", "wallet"], ["orderId", "wallet"]);
       break;
+    case "EMPTY_USER_BALANCE_CLOSED":
+      assertExactFields(base, ["wallet"], ["wallet"]);
+      break;
     case "PRICE_LEVEL_CLOSED":
       assertExactFields(
         base,
@@ -316,15 +343,12 @@ export function normalizeLifecycleFact(
         ["wallet", "amountLamports", "feeLamports", "status", "winner"],
         ["wallet", "amountLamports", "feeLamports", "status", "winner"],
       );
-      if (
-        base.status !== "resolved" ||
-        (base.winner !== "a" && base.winner !== "b") ||
-        BigInt(base.amountLamports!) <= 0n
-      ) {
-        throw new Error(
-          "CLAIM_PAYOUT must describe a positive resolved payout",
-        );
-      }
+      validateClaimLifecycleFact({
+        status: base.status!,
+        winner: base.winner!,
+        payoutLamports: BigInt(base.amountLamports!),
+        feeLamports: BigInt(base.feeLamports!),
+      });
       break;
     case "CANCELLATION_REFUND":
       assertExactFields(
@@ -470,41 +494,6 @@ export function unitsReleasedByVaultRefund(input: {
   return units;
 }
 
-export function verifyClaimLifecycleAccounting(input: {
-  status: "resolved" | "cancelled";
-  winner: "none" | "a" | "b";
-  payoutLamports: bigint;
-  feeLamports: bigint;
-  winningsFeeBps: number;
-}): "CLAIM_PAYOUT" | "CANCELLATION_REFUND" {
-  if (
-    input.payoutLamports <= 0n ||
-    input.feeLamports < 0n ||
-    !Number.isInteger(input.winningsFeeBps) ||
-    input.winningsFeeBps < 0 ||
-    input.winningsFeeBps > 10_000
-  ) {
-    throw new Error("claim transfer accounting input is invalid");
-  }
-  if (input.status === "cancelled") {
-    if (input.winner !== "none" || input.feeLamports !== 0n) {
-      throw new Error("cancelled market claims must be fee-free refunds");
-    }
-    return "CANCELLATION_REFUND";
-  }
-  if (input.winner !== "a" && input.winner !== "b") {
-    throw new Error("resolved market claim is missing a winner");
-  }
-  const gross = input.payoutLamports + input.feeLamports;
-  const expectedFee = (gross * BigInt(input.winningsFeeBps)) / BigInt(10_000);
-  if (input.feeLamports !== expectedFee) {
-    throw new Error(
-      "claim fee transfer does not match the market fee snapshot",
-    );
-  }
-  return "CLAIM_PAYOUT";
-}
-
 export function verifyLosingBalanceCleanupAccounting(input: {
   status: string | undefined;
   winner: string | undefined;
@@ -552,7 +541,7 @@ export function resolveLifecycleIndexStartSlot(input: {
   if (!value) {
     if (input.required) {
       throw new Error(
-        "SOLANA_LIFECYCLE_INDEX_START_SLOT is required for mainnet indexing",
+        "SOLANA_LIFECYCLE_INDEX_START_SLOT is required for this launch rail",
       );
     }
     return 0;
@@ -569,31 +558,218 @@ export function resolveLifecycleIndexStartSlot(input: {
   return slot;
 }
 
+export function resolveClusterLifecycleIndexStartSlot(input: {
+  cluster: string;
+  value: string | undefined;
+}): number {
+  const cluster = input.cluster.trim().toLowerCase();
+  if (cluster === "localnet") {
+    return resolveLifecycleIndexStartSlot({
+      value: input.value,
+      required: false,
+    });
+  }
+  if (
+    cluster !== "devnet" &&
+    cluster !== "testnet" &&
+    cluster !== "mainnet" &&
+    cluster !== "mainnet-beta"
+  ) {
+    throw new Error(
+      `Unsupported Solana lifecycle-index cluster '${input.cluster}'`,
+    );
+  }
+  const slot = resolveLifecycleIndexStartSlot({
+    value: input.value,
+    required: true,
+  });
+  if (slot === 0) {
+    throw new Error(
+      "SOLANA_LIFECYCLE_INDEX_START_SLOT must be the positive verified deployment slot on a non-local launch rail",
+    );
+  }
+  return slot;
+}
+
+function exactFinalizedBlockTime(
+  value: unknown,
+  source: string,
+): number | null {
+  if (value === null) return null;
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new Error(
+      `Solana ${source} contains an invalid block time in finalized evidence`,
+    );
+  }
+  return Number(value);
+}
+
+function exactPlainDataRecord<K extends string>(
+  value: unknown,
+  requiredFields: readonly K[],
+  errorMessage: string,
+): Record<K, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(errorMessage);
+  }
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error(errorMessage);
+    }
+    const result = Object.create(null) as Record<K, unknown>;
+    for (const field of requiredFields) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, field);
+      if (!descriptor || !("value" in descriptor)) {
+        throw new Error(errorMessage);
+      }
+      result[field] = descriptor.value;
+    }
+    return result;
+  } catch {
+    throw new Error(errorMessage);
+  }
+}
+
+export function exactFinalizedSignatureSucceeded(error: unknown): boolean {
+  if (error === null) return true;
+  if (typeof error === "string" && error.length > 0 && error === error.trim()) {
+    return false;
+  }
+  if (typeof error === "object" && error !== null && !Array.isArray(error)) {
+    const prototype = Object.getPrototypeOf(error);
+    if (prototype === Object.prototype || prototype === null) return false;
+  }
+  throw new Error(
+    "Solana finalized signature history contains an invalid transaction error",
+  );
+}
+
+export function exactFinalizedTransactionMetaSucceeded(meta: unknown): boolean {
+  const values = exactPlainDataRecord(
+    meta,
+    ["err"],
+    "Solana finalized transaction contains invalid execution metadata",
+  );
+  return exactFinalizedSignatureSucceeded(values.err);
+}
+
+export function hasExactSuccessfulFinalizedTransactionMeta(
+  meta: unknown,
+): meta is { err: null } {
+  try {
+    return exactFinalizedTransactionMetaSucceeded(meta) === true;
+  } catch {
+    return false;
+  }
+}
+
+export function digestFailedFinalizedTransaction(signature: unknown): string {
+  if (!isCanonicalSolanaTransactionSignature(signature)) {
+    throw new Error("Solana failed transaction signature is invalid");
+  }
+  return createHash("sha256").update(`failed:${signature}`).digest("hex");
+}
+
+function exactDenseDataArray(value: unknown, errorMessage: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(errorMessage);
+  try {
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (
+      !lengthDescriptor ||
+      !("value" in lengthDescriptor) ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) {
+      throw new Error(errorMessage);
+    }
+    const result: unknown[] = [];
+    for (let index = 0; index < lengthDescriptor.value; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !("value" in descriptor)) {
+        throw new Error(errorMessage);
+      }
+      result.push(descriptor.value);
+    }
+    return result;
+  } catch {
+    throw new Error(errorMessage);
+  }
+}
+
+export function requireExactFinalizedTransactionBatch<T = unknown>(input: {
+  requestedSignatures: unknown;
+  transactions: unknown;
+}): T[] {
+  const requestedSignatures = exactDenseDataArray(
+    input.requestedSignatures,
+    "Solana finalized transaction batch contains invalid request identities",
+  );
+  if (
+    requestedSignatures.length === 0 ||
+    requestedSignatures.length > MAX_FINALIZED_TRANSACTION_RPC_BATCH_SIZE ||
+    requestedSignatures.some(
+      (signature) => !isCanonicalSolanaTransactionSignature(signature),
+    ) ||
+    new Set(requestedSignatures).size !== requestedSignatures.length
+  ) {
+    throw new Error(
+      "Solana finalized transaction batch contains invalid request identities",
+    );
+  }
+  const transactions = exactDenseDataArray(
+    input.transactions,
+    "Solana finalized transaction batch response cardinality drifted",
+  );
+  if (transactions.length !== requestedSignatures.length) {
+    throw new Error(
+      "Solana finalized transaction batch response cardinality drifted",
+    );
+  }
+  return transactions as T[];
+}
+
+export function requireExactFinalizedBlockTimeParity(input: {
+  referenceBlockTime: number | null;
+  transactionBlockTime: unknown;
+}): number | null {
+  const referenceBlockTime = exactFinalizedBlockTime(
+    input.referenceBlockTime,
+    "signature history",
+  );
+  const transactionBlockTime = exactFinalizedBlockTime(
+    input.transactionBlockTime,
+    "transaction evidence",
+  );
+  if (referenceBlockTime !== transactionBlockTime) {
+    throw new Error("Solana finalized block time drifted across RPC views");
+  }
+  return transactionBlockTime;
+}
+
 function normalizeSignatureEntry(
   entry: SignaturePageEntry,
 ): FinalizedSignatureReference {
-  if (!isCanonicalSolanaTransactionSignature(entry.signature)) {
+  const values = exactPlainDataRecord(
+    entry,
+    ["signature", "slot", "blockTime", "err", "confirmationStatus"],
+    "Solana lifecycle history contains invalid entry metadata",
+  );
+  if (!isCanonicalSolanaTransactionSignature(values.signature)) {
     throw new Error("Solana lifecycle history contains an invalid signature");
   }
   if (
-    !Number.isSafeInteger(entry.slot) ||
-    Number(entry.slot) < 0 ||
-    (entry.confirmationStatus != null &&
-      entry.confirmationStatus !== "finalized")
+    !Number.isSafeInteger(values.slot) ||
+    Number(values.slot) < 0 ||
+    values.confirmationStatus !== "finalized"
   ) {
     throw new Error("Solana lifecycle history contains a non-finalized slot");
   }
-  if (
-    entry.blockTime != null &&
-    (!Number.isSafeInteger(entry.blockTime) || Number(entry.blockTime) < 0)
-  ) {
-    throw new Error("Solana lifecycle history contains an invalid block time");
-  }
   return {
-    signature: entry.signature,
-    slot: Number(entry.slot),
-    blockTime: entry.blockTime == null ? null : Number(entry.blockTime),
-    succeeded: entry.err == null,
+    signature: values.signature,
+    slot: Number(values.slot),
+    blockTime: exactFinalizedBlockTime(values.blockTime, "lifecycle history"),
+    succeeded: exactFinalizedSignatureSucceeded(values.err),
   };
 }
 
@@ -640,9 +816,10 @@ export async function collectFinalizedSignatureBackfill(input: {
   if (
     !Number.isSafeInteger(pageSize) ||
     pageSize < 1 ||
-    pageSize > 1_000 ||
+    pageSize > MAX_FINALIZED_SIGNATURE_PAGE_SIZE ||
     !Number.isSafeInteger(maxPages) ||
-    maxPages < 1
+    maxPages < 1 ||
+    maxPages > MAX_FINALIZED_SIGNATURE_PAGES
   ) {
     throw new Error("Solana lifecycle pagination bounds are invalid");
   }
@@ -654,12 +831,10 @@ export async function collectFinalizedSignatureBackfill(input: {
   let previousSlot = Number.POSITIVE_INFINITY;
 
   for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
-    const page = await input.fetchPage({ before, limit: pageSize });
-    if (!Array.isArray(page)) {
-      throw new Error(
-        "Solana lifecycle RPC returned an invalid signature page",
-      );
-    }
+    const page = exactDenseDataArray(
+      await input.fetchPage({ before, limit: pageSize }),
+      "Solana lifecycle RPC returned an invalid signature page",
+    ) as SignaturePageEntry[];
     if (page.length === 0) {
       if (input.checkpointSignature !== null && !foundBoundary) {
         throw new Error(
@@ -673,8 +848,10 @@ export async function collectFinalizedSignatureBackfill(input: {
       throw new Error("Solana lifecycle RPC exceeded the requested page size");
     }
 
+    let lastNormalizedSignature: string | null = null;
     for (const rawEntry of page) {
       const entry = normalizeSignatureEntry(rawEntry);
+      lastNormalizedSignature = entry.signature;
       if (seen.has(entry.signature)) {
         throw new Error("Solana lifecycle RPC returned a duplicate signature");
       }
@@ -698,14 +875,18 @@ export async function collectFinalizedSignatureBackfill(input: {
         break;
       }
       newestFirst.push(entry);
+      if (newestFirst.length > MAX_FINALIZED_SIGNATURE_HISTORY_ENTRIES) {
+        throw new Error(
+          "Solana lifecycle signature history exceeds its safety bound",
+        );
+      }
     }
     if (foundBoundary) break;
 
-    const last = page.at(-1);
-    if (!last || !isCanonicalSolanaTransactionSignature(last.signature)) {
+    if (lastNormalizedSignature === null) {
       throw new Error("Solana lifecycle RPC page has no pagination cursor");
     }
-    before = last.signature;
+    before = lastNormalizedSignature;
   }
 
   if (!foundBoundary) {

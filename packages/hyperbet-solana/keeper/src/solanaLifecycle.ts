@@ -130,3 +130,87 @@ export function resolveLifecycleFromSolanaMarketStatus(
       return "UNKNOWN";
   }
 }
+
+export function isCurrentSolanaLifecycleSnapshot(input: {
+  expectedDuelPda: string | null;
+  expectedMarketPda: string | null;
+  snapshotDuelPda: unknown;
+  snapshotMarketPda: unknown;
+}): boolean {
+  return (
+    input.expectedDuelPda !== null &&
+    input.expectedMarketPda !== null &&
+    input.snapshotDuelPda === input.expectedDuelPda &&
+    input.snapshotMarketPda === input.expectedMarketPda
+  );
+}
+
+export function resolveCurrentSolanaLifecycleAuthority(input: {
+  expectedDuelPda: string | null;
+  expectedMarketPda: string | null;
+  snapshotDuelPda: unknown;
+  snapshotMarketPda: unknown;
+  currentDuelAccountExists: unknown;
+  currentMarketAccountExists: unknown;
+  currentDuelStatus: unknown;
+  currentMarketStatus: unknown;
+  currentMarketWinner: unknown;
+  snapshotSyncedAt: number | null;
+}): {
+  snapshotMatchesCurrentDuel: boolean;
+  currentMarketObserved: boolean;
+  lifecycleStatus: PredictionMarketLifecycleStatus;
+  winner: PredictionMarketWinner;
+  syncedAt: number | null;
+} {
+  const snapshotMatchesCurrentDuel = isCurrentSolanaLifecycleSnapshot(input);
+  const currentMarketObserved =
+    snapshotMatchesCurrentDuel &&
+    input.currentDuelAccountExists === true &&
+    input.currentMarketAccountExists === true;
+  if (!currentMarketObserved) {
+    return {
+      snapshotMatchesCurrentDuel,
+      currentMarketObserved,
+      lifecycleStatus: "PENDING",
+      winner: "NONE",
+      syncedAt: snapshotMatchesCurrentDuel ? input.snapshotSyncedAt : null,
+    };
+  }
+
+  const duelStatus = resolveLifecycleFromSolanaDuelStatus(
+    typeof input.currentDuelStatus === "string"
+      ? input.currentDuelStatus
+      : null,
+  );
+  const marketStatus = resolveLifecycleFromSolanaMarketStatus(
+    typeof input.currentMarketStatus === "string"
+      ? input.currentMarketStatus
+      : null,
+  );
+  const lifecycleStatus = duelStatus !== "UNKNOWN" ? duelStatus : marketStatus;
+  const normalizedWinner =
+    typeof input.currentMarketWinner === "string"
+      ? input.currentMarketWinner.toUpperCase()
+      : null;
+  const winnerIsCanonical =
+    normalizedWinner === "NONE" ||
+    normalizedWinner === "A" ||
+    normalizedWinner === "B";
+  const winner: PredictionMarketWinner =
+    normalizedWinner === "A" || normalizedWinner === "B"
+      ? normalizedWinner
+      : "NONE";
+  const winnerIsCoherent =
+    winnerIsCanonical && lifecycleStatus === "RESOLVED"
+      ? winner !== "NONE"
+      : winnerIsCanonical && winner === "NONE";
+
+  return {
+    snapshotMatchesCurrentDuel,
+    currentMarketObserved,
+    lifecycleStatus: winnerIsCoherent ? lifecycleStatus : "UNKNOWN",
+    winner: winnerIsCoherent ? winner : "NONE",
+    syncedAt: input.snapshotSyncedAt,
+  };
+}

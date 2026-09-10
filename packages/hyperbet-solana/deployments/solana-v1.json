@@ -1,24 +1,28 @@
 {
+  "realValueProgramVerification": {
+    "status": "unverified",
+    "evidenceSha256": null
+  },
   "solana": {
     "localnet": {
       "cluster": "localnet",
-      "fightOracleProgramId": "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
-      "duelMarketProgramId": "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy"
+      "fightOracleProgramId": "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
+      "duelMarketProgramId": "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
     },
     "devnet": {
       "cluster": "devnet",
-      "fightOracleProgramId": "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
-      "duelMarketProgramId": "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy"
+      "fightOracleProgramId": "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
+      "duelMarketProgramId": "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
     },
     "testnet": {
       "cluster": "testnet",
-      "fightOracleProgramId": "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
-      "duelMarketProgramId": "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy"
+      "fightOracleProgramId": "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
+      "duelMarketProgramId": "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
     },
     "mainnet-beta": {
       "cluster": "mainnet-beta",
-      "fightOracleProgramId": "B5mRCRDJk9BrnH7regMWW5mpTQ8QG1CcCGSnDxMt8hmo",
-      "duelMarketProgramId": "DYtd7AoyTX2tbmZ8vpC3mxZgqTpyaDei4TFXZukWBJEf"
+      "fightOracleProgramId": "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
+      "duelMarketProgramId": "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
     }
   }
 }

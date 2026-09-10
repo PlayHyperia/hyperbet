@@ -27,6 +27,7 @@ function getLeaderboardCopy(locale: UiLocale) {
       prev: "上一页",
       next: "下一页",
       page: (page: number) => `第 ${page} 页`,
+      timeWindow: "排行榜时间范围",
       windows: {
         alltime: "总榜",
         daily: "今日",
@@ -47,6 +48,7 @@ function getLeaderboardCopy(locale: UiLocale) {
     prev: "Prev",
     next: "Next",
     page: (page: number) => `Page ${page}`,
+    timeWindow: "Leaderboard time window",
     windows: {
       alltime: "All Time",
       daily: "Today",
@@ -113,6 +115,7 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
 
   const filterBtnStyle = (isActive: boolean): React.CSSProperties => ({
     padding: "4px 10px",
+    minHeight: 44,
     borderRadius: 6,
     border: isActive
       ? "1px solid rgba(242,208,138,0.35)"
@@ -143,8 +146,9 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
           marginBottom: 4,
         }}
       >
-        <div
+        <h2
           style={{
+            margin: 0,
             fontSize: 13,
             fontWeight: 700,
             textTransform: "uppercase",
@@ -153,15 +157,20 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
           }}
         >
           {copy.title}
-        </div>
+        </h2>
       </div>
 
-      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+      <div
+        role="group"
+        aria-label={copy.timeWindow}
+        style={{ display: "flex", gap: 4, flexWrap: "wrap" }}
+      >
         {(["alltime", "daily", "weekly", "monthly"] as const).map((option) => (
           <button
             key={option}
             type="button"
             data-testid={`points-leaderboard-window-${option}`}
+            aria-pressed={timeWindow === option}
             onClick={() => setTimeWindow(option)}
             style={filterBtnStyle(timeWindow === option)}
           >
@@ -172,6 +181,7 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
 
       {loading && (
         <div
+          role="status"
           style={{
             fontSize: 12,
             color: "rgba(255,255,255,0.3)",
@@ -185,6 +195,7 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
 
       {!loading && leaderboard.length === 0 && (
         <div
+          role={error ? "alert" : "status"}
           style={{
             fontSize: 12,
             color: error ? "#fca5a5" : "rgba(255,255,255,0.3)",
@@ -210,83 +221,107 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
             WebkitOverflowScrolling: "touch",
           }}
         >
-          <div
-            style={{
-              display: "flex",
-              padding: "10px 16px",
-              fontSize: 10,
-              fontWeight: 700,
-              textTransform: "uppercase",
-              letterSpacing: 1,
-              color: "rgba(255,255,255,0.3)",
-              borderBottom: "1px solid rgba(255,255,255,0.06)",
-            }}
-          >
-            <div style={{ width: 36 }}>#</div>
-            <div style={{ flex: 1 }}>{copy.wallet}</div>
-            <div style={{ width: 100, textAlign: "right" }}>{copy.points}</div>
-          </div>
-
-          {leaderboard.map((entry) => (
-            <div
-              key={entry.wallet}
-              data-testid={`points-leaderboard-row-${entry.rank}`}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                padding: "10px 16px",
-                fontSize: 13,
-                borderBottom: "1px solid rgba(255,255,255,0.03)",
-                transition: "background 0.15s",
-              }}
-              onMouseEnter={(event) => {
-                event.currentTarget.style.background = "rgba(255,255,255,0.03)";
-              }}
-              onMouseLeave={(event) => {
-                event.currentTarget.style.background = "transparent";
-              }}
-            >
+          <div role="table" aria-label={copy.title}>
+            <div role="rowgroup">
               <div
+                role="row"
                 style={{
-                  width: 36,
-                  fontWeight: 800,
-                  color:
-                    entry.rank === 1
-                      ? "#eab308"
-                      : entry.rank === 2
-                        ? "#a3a3a3"
-                        : entry.rank === 3
-                          ? "#cd7f32"
-                          : "rgba(255,255,255,0.4)",
-                  fontSize: entry.rank <= 3 ? 15 : 13,
-                }}
-              >
-                {entry.rank <= 3
-                  ? ["🥇", "🥈", "🥉"][entry.rank - 1]
-                  : entry.rank}
-              </div>
-              <div
-                style={{
-                  flex: 1,
-                  fontFamily: "var(--hm-font-mono)",
-                  fontSize: 12,
-                  color: "rgba(255,255,255,0.7)",
-                }}
-              >
-                {truncateWallet(entry.wallet)}
-              </div>
-              <div
-                style={{
-                  width: 100,
-                  textAlign: "right",
+                  display: "flex",
+                  padding: "10px 16px",
+                  fontSize: 10,
                   fontWeight: 700,
-                  color: "#eab308",
+                  textTransform: "uppercase",
+                  letterSpacing: 1,
+                  color: "rgba(255,255,255,0.3)",
+                  borderBottom: "1px solid rgba(255,255,255,0.06)",
                 }}
               >
-                {entry.totalPoints.toLocaleString(getLocaleTag(resolvedLocale))}
+                <div role="columnheader" style={{ width: 36 }}>
+                  #
+                </div>
+                <div role="columnheader" style={{ flex: 1 }}>
+                  {copy.wallet}
+                </div>
+                <div
+                  role="columnheader"
+                  style={{ width: 100, textAlign: "right" }}
+                >
+                  {copy.points}
+                </div>
               </div>
             </div>
-          ))}
+
+            <div role="rowgroup">
+              {leaderboard.map((entry) => (
+                <div
+                  role="row"
+                  key={entry.wallet}
+                  data-testid={`points-leaderboard-row-${entry.rank}`}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    padding: "10px 16px",
+                    fontSize: 13,
+                    borderBottom: "1px solid rgba(255,255,255,0.03)",
+                    transition: "background 0.15s",
+                  }}
+                  onMouseEnter={(event) => {
+                    event.currentTarget.style.background =
+                      "rgba(255,255,255,0.03)";
+                  }}
+                  onMouseLeave={(event) => {
+                    event.currentTarget.style.background = "transparent";
+                  }}
+                >
+                  <div
+                    role="cell"
+                    aria-label={`Rank ${entry.rank}`}
+                    style={{
+                      width: 36,
+                      fontWeight: 800,
+                      color:
+                        entry.rank === 1
+                          ? "#eab308"
+                          : entry.rank === 2
+                            ? "#a3a3a3"
+                            : entry.rank === 3
+                              ? "#cd7f32"
+                              : "rgba(255,255,255,0.4)",
+                      fontSize: entry.rank <= 3 ? 15 : 13,
+                    }}
+                  >
+                    {entry.rank <= 3
+                      ? ["🥇", "🥈", "🥉"][entry.rank - 1]
+                      : entry.rank}
+                  </div>
+                  <div
+                    role="cell"
+                    style={{
+                      flex: 1,
+                      fontFamily: "var(--hm-font-mono)",
+                      fontSize: 12,
+                      color: "rgba(255,255,255,0.7)",
+                    }}
+                  >
+                    {truncateWallet(entry.wallet)}
+                  </div>
+                  <div
+                    role="cell"
+                    style={{
+                      width: 100,
+                      textAlign: "right",
+                      fontWeight: 700,
+                      color: "#eab308",
+                    }}
+                  >
+                    {entry.totalPoints.toLocaleString(
+                      getLocaleTag(resolvedLocale),
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
 
           <div
             style={{
@@ -302,6 +337,7 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
               onClick={() => setPage((current) => Math.max(0, current - 1))}
               disabled={page === 0}
               style={{
+                minHeight: 44,
                 padding: "6px 14px",
                 borderRadius: 6,
                 border: "1px solid rgba(255,255,255,0.1)",
@@ -318,7 +354,11 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
             >
               {copy.prev}
             </button>
-            <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
+            <span
+              role="status"
+              aria-live="polite"
+              style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}
+            >
               {copy.page(page + 1)}
             </span>
             <button
@@ -326,6 +366,7 @@ export function PointsLeaderboard({ locale }: { locale?: UiLocale } = {}) {
               onClick={() => setPage((current) => current + 1)}
               disabled={leaderboard.length < pageSize}
               style={{
+                minHeight: 44,
                 padding: "6px 14px",
                 borderRadius: 6,
                 border: "1px solid rgba(255,255,255,0.1)",

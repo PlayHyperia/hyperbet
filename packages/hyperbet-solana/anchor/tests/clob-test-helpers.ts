@@ -28,6 +28,7 @@ export const SIDE_ASK = 2;
 export const ORDER_BEHAVIOR_GTC = 0;
 export const ORDER_BEHAVIOR_IOC = 1;
 export const ORDER_BEHAVIOR_POST_ONLY = 2;
+export const RESULT_HASH_DOMAIN = "hyperia-duel-result-v2";
 const duelKeyCounters = new Map<string, number>();
 
 function bnLikeToNumber(value: unknown): number {
@@ -59,6 +60,35 @@ function u64Le(value: bigint | number): Buffer {
   const buffer = Buffer.alloc(8);
   buffer.writeBigUInt64LE(BigInt(value), 0);
   return buffer;
+}
+
+function u32Le(value: number): Buffer {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt32LE(value, 0);
+  return buffer;
+}
+
+export function buildCanonicalResultHash(input: {
+  duelKey: readonly number[];
+  winner: { a: Record<string, never> } | { b: Record<string, never> };
+  seed: bigint | number;
+  replayHash: readonly number[];
+  competitiveSnapshotVersion: number;
+  competitiveSnapshotDigest: readonly number[];
+}): number[] {
+  const winnerTag = "a" in input.winner ? 1 : 2;
+  return Array.from(
+    crypto
+      .createHash("sha256")
+      .update(RESULT_HASH_DOMAIN, "ascii")
+      .update(Buffer.from(input.duelKey))
+      .update(Buffer.from([winnerTag]))
+      .update(u64Le(input.seed))
+      .update(Buffer.from(input.replayHash))
+      .update(u32Le(input.competitiveSnapshotVersion))
+      .update(Buffer.from(input.competitiveSnapshotDigest))
+      .digest(),
+  );
 }
 
 export const sleep = (ms: number) =>
@@ -292,6 +322,7 @@ export async function ensureOracleReady(
   finalizer = authority.publicKey,
   challenger = authority.publicKey,
   disputeWindowSecs = 60,
+  freeze = true,
 ): Promise<PublicKey> {
   const oracleConfig = deriveOracleConfigPda(program.programId);
   const existingConfig =
@@ -314,29 +345,40 @@ export async function ensureOracleReady(
       })
       .signers([authority])
       .rpc();
-    return oracleConfig;
+  } else {
+    try {
+      await program.methods
+        .updateOracleConfig(
+          authority.publicKey,
+          reporter,
+          finalizer,
+          challenger,
+          new BN(disputeWindowSecs),
+        )
+        .accountsPartial({
+          authority: authority.publicKey,
+          oracleConfig,
+        })
+        .signers([authority])
+        .rpc();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/ConfigFrozen/i.test(message)) {
+        throw error;
+      }
+    }
   }
 
-  try {
+  const currentConfig = await program.account.oracleConfig.fetch(oracleConfig);
+  if (freeze && !currentConfig.configFrozen) {
     await program.methods
-      .updateOracleConfig(
-        authority.publicKey,
-        reporter,
-        finalizer,
-        challenger,
-        new BN(disputeWindowSecs),
-      )
+      .freezeOracleConfig()
       .accountsPartial({
         authority: authority.publicKey,
         oracleConfig,
       })
       .signers([authority])
       .rpc();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!/ConfigFrozen/i.test(message)) {
-      throw error;
-    }
   }
 
   return oracleConfig;
@@ -420,6 +462,8 @@ export async function upsertDuel(
     duelStartTs?: number;
     participantAHash?: readonly number[];
     participantBHash?: readonly number[];
+    competitiveSnapshotVersion?: number;
+    competitiveSnapshotDigest?: readonly number[];
     metadataUri?: string;
   },
 ): Promise<PublicKey> {
@@ -436,6 +480,11 @@ export async function upsertDuel(
       [
         ...(options.participantBHash ??
           hashLabel(`${Buffer.from(duelKey).toString("hex")}:b`)),
+      ],
+      options.competitiveSnapshotVersion ?? 3,
+      [
+        ...(options.competitiveSnapshotDigest ??
+          hashLabel(`${Buffer.from(duelKey).toString("hex")}:snapshot`)),
       ],
       toBn(options.betOpenTs),
       toBn(options.betCloseTs),
@@ -496,9 +545,20 @@ export async function proposeDuelResult(
     ...(options.replayHash ??
       hashLabel(`${Buffer.from(duelKey).toString("hex")}:replay`)),
   ];
+  const seed = options.seed ?? 42;
+  const duelStateAccount = await program.account.duelState.fetch(duelState);
   const resultHash = [
     ...(options.resultHash ??
-      hashLabel(`${Buffer.from(duelKey).toString("hex")}:result`)),
+      buildCanonicalResultHash({
+        duelKey,
+        winner: options.winner,
+        seed,
+        replayHash,
+        competitiveSnapshotVersion: bnLikeToNumber(
+          duelStateAccount.competitiveSnapshotVersion,
+        ),
+        competitiveSnapshotDigest: duelStateAccount.competitiveSnapshotDigest,
+      })),
   ];
   const proposalRecord = deriveProposalRecordPda(
     program.programId,
@@ -511,7 +571,7 @@ export async function proposeDuelResult(
     .proposeResult(
       [...duelKey],
       options.winner,
-      toBn(options.seed ?? 42),
+      toBn(seed),
       replayHash,
       resultHash,
       toBn(options.duelEndTs),
@@ -569,14 +629,28 @@ export async function reproposeDuelResult(
     duelEndTs: number;
     seed?: bigint | number;
     replayHash: readonly number[];
-    resultHash: readonly number[];
+    resultHash?: readonly number[];
     metadataUri?: string;
   },
 ): Promise<PublicKey> {
   const oracleConfig = deriveOracleConfigPda(program.programId);
   const duelState = deriveDuelStatePda(program.programId, duelKey);
   const replayHash = [...options.replayHash];
-  const resultHash = [...options.resultHash];
+  const seed = options.seed ?? 42;
+  const duelStateAccount = await program.account.duelState.fetch(duelState);
+  const resultHash = [
+    ...(options.resultHash ??
+      buildCanonicalResultHash({
+        duelKey,
+        winner: options.winner,
+        seed,
+        replayHash,
+        competitiveSnapshotVersion: bnLikeToNumber(
+          duelStateAccount.competitiveSnapshotVersion,
+        ),
+        competitiveSnapshotDigest: duelStateAccount.competitiveSnapshotDigest,
+      })),
+  ];
   const proposalRecord = deriveProposalRecordPda(
     program.programId,
     duelKey,
@@ -588,7 +662,7 @@ export async function reproposeDuelResult(
     .reproposeResult(
       [...duelKey],
       options.winner,
-      toBn(options.seed ?? 42),
+      toBn(seed),
       replayHash,
       resultHash,
       toBn(options.duelEndTs),
@@ -737,7 +811,7 @@ export async function ensureVaultRentExempt(
     return;
   }
 
-  await program.provider.sendAndConfirm(
+  await (program.provider as anchor.AnchorProvider).sendAndConfirm(
     new anchor.web3.Transaction().add(
       SystemProgram.transfer({
         fromPubkey: funder.publicKey,
@@ -901,7 +975,21 @@ export async function continueClobOrder(
     builder = builder.remainingAccounts(args.remainingAccounts);
   }
 
-  const signature = await builder.signers([args.user]).rpc();
+  const instruction = await builder.instruction();
+  const uniqueAccountCount = new Set(
+    instruction.keys.map((accountMeta) => accountMeta.pubkey.toBase58()),
+  ).size;
+  const signature =
+    uniqueAccountCount > 32 || instruction.keys.length > 64
+      ? await sendVersionedTransactionWithLookupTable(
+          program.provider as anchor.AnchorProvider,
+          [instruction],
+          [args.user],
+        )
+      : await (program.provider as anchor.AnchorProvider).sendAndConfirm(
+          new anchor.web3.Transaction().add(instruction),
+          [args.user],
+        );
   return { order, restingLevel, signature };
 }
 
@@ -976,6 +1064,32 @@ export async function closeFilledClobOrder(
     .rpc();
 
   return { order, signature };
+}
+
+export async function closeEmptyClobUserBalance(
+  program: Program<DuelMarket>,
+  args: {
+    marketState: PublicKey;
+    user: Keypair;
+  },
+): Promise<{ userBalance: PublicKey; signature: string }> {
+  const userBalance = deriveUserBalancePda(
+    program.programId,
+    args.marketState,
+    args.user.publicKey,
+  );
+
+  const signature = await program.methods
+    .closeEmptyUserBalance()
+    .accountsPartial({
+      marketState: args.marketState,
+      userBalance,
+      user: args.user.publicKey,
+    })
+    .signers([args.user])
+    .rpc();
+
+  return { userBalance, signature };
 }
 
 export async function closeEmptyClobPriceLevel(
@@ -1197,7 +1311,12 @@ export async function createOpenMarketFixture(
     duelStartTs?: number;
     participantAHash?: readonly number[];
     participantBHash?: readonly number[];
+    competitiveSnapshotVersion?: number;
+    competitiveSnapshotDigest?: readonly number[];
     metadataUri?: string;
+    tradeTreasuryFeeBps?: number;
+    tradeMarketMakerFeeBps?: number;
+    winningsMarketMakerFeeBps?: number;
   },
 ): Promise<{
   config: PublicKey;
@@ -1230,6 +1349,8 @@ export async function createOpenMarketFixture(
       options?.duelStartTs ?? (options?.betCloseTs ?? now + 3600) + 60,
     participantAHash: options?.participantAHash,
     participantBHash: options?.participantBHash,
+    competitiveSnapshotVersion: options?.competitiveSnapshotVersion,
+    competitiveSnapshotDigest: options?.competitiveSnapshotDigest,
     metadataUri: options?.metadataUri,
   });
   const { marketState, vault } = await initializeCanonicalMarket(

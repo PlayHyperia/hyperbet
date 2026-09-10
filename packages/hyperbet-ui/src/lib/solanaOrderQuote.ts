@@ -57,6 +57,23 @@ function assertBps(value: number, label: string): void {
   }
 }
 
+function mulDivFloorU64(
+  left: bigint,
+  right: bigint,
+  denominator: bigint,
+  label: string,
+): bigint {
+  assertU64(left, `${label} left operand`);
+  assertU64(right, `${label} right operand`);
+  assertU64(denominator, `${label} denominator`);
+  if (denominator <= 0n) {
+    throw new Error(`${label} denominator must be positive`);
+  }
+  const quotient = (left * right) / denominator;
+  assertU64(quotient, label);
+  return quotient;
+}
+
 export function parseSolAmountToLamports(value: string): bigint {
   const normalized = value.trim();
   const match = /^(0|[1-9]\d*)(?:\.(\d{1,6}))?$/.exec(normalized);
@@ -124,14 +141,14 @@ export function formatSolLamports(
 
 function quoteCost(amount: bigint, outcomePriceMillis: number): bigint {
   assertU64(amount, "Order amount");
-  const total = amount * BigInt(outcomePriceMillis);
+  const price = BigInt(outcomePriceMillis);
+  const total = amount * price;
   if (total % PRICE_SCALE !== 0n) {
     throw new Error(
       "Amount and limit probability violate the program's exact precision rule",
     );
   }
-  const cost = total / PRICE_SCALE;
-  assertU64(cost, "Order collateral");
+  const cost = mulDivFloorU64(amount, price, PRICE_SCALE, "Order collateral");
   if (cost <= 0n) {
     throw new Error("Order collateral is below one lamport");
   }
@@ -139,7 +156,7 @@ function quoteCost(amount: bigint, outcomePriceMillis: number): bigint {
 }
 
 function bpsFee(amount: bigint, bps: number): bigint {
-  return (amount * BigInt(bps)) / BPS_SCALE;
+  return mulDivFloorU64(amount, BigInt(bps), BPS_SCALE, "Fee");
 }
 
 export function buildSolanaOrderQuote(input: {

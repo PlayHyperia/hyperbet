@@ -7,9 +7,9 @@
  */
 
 import { assertIsInstructionWithAccounts, containsBytes, fixEncoderSize, getBytesEncoder, type Address, type Instruction, type InstructionWithData, type ReadonlyUint8Array } from '@solana/kit';
-import { parseCancelOrderInstruction, parseClaimInstruction, parseCloseEmptyPriceLevelInstruction, parseCloseFilledOrderInstruction, parseCloseLosingBalanceInstruction, parseContinueOrderInstruction, parseFreezeConfigInstruction, parseInitializeConfigInstruction, parseInitializeMarketInstruction, parsePlaceOrderInstruction, parseReclaimRestingOrderInstruction, parseSetMarketPausedInstruction, parseSyncMarketFromDuelInstruction, parseUpdateConfigInstruction, parseWithdrawResolvedTradeFeesInstruction, type ParsedCancelOrderInstruction, type ParsedClaimInstruction, type ParsedCloseEmptyPriceLevelInstruction, type ParsedCloseFilledOrderInstruction, type ParsedCloseLosingBalanceInstruction, type ParsedContinueOrderInstruction, type ParsedFreezeConfigInstruction, type ParsedInitializeConfigInstruction, type ParsedInitializeMarketInstruction, type ParsedPlaceOrderInstruction, type ParsedReclaimRestingOrderInstruction, type ParsedSetMarketPausedInstruction, type ParsedSyncMarketFromDuelInstruction, type ParsedUpdateConfigInstruction, type ParsedWithdrawResolvedTradeFeesInstruction } from '../instructions/index.js';
+import { parseCancelOrderInstruction, parseClaimInstruction, parseCloseEmptyPriceLevelInstruction, parseCloseEmptyUserBalanceInstruction, parseCloseFilledOrderInstruction, parseCloseLosingBalanceInstruction, parseContinueOrderInstruction, parseFreezeConfigInstruction, parseInitializeConfigInstruction, parseInitializeMarketInstruction, parsePlaceOrderInstruction, parseReclaimRestingOrderInstruction, parseSetMarketPausedInstruction, parseSyncMarketFromDuelInstruction, parseUpdateConfigInstruction, parseWithdrawResolvedTradeFeesInstruction, type ParsedCancelOrderInstruction, type ParsedClaimInstruction, type ParsedCloseEmptyPriceLevelInstruction, type ParsedCloseEmptyUserBalanceInstruction, type ParsedCloseFilledOrderInstruction, type ParsedCloseLosingBalanceInstruction, type ParsedContinueOrderInstruction, type ParsedFreezeConfigInstruction, type ParsedInitializeConfigInstruction, type ParsedInitializeMarketInstruction, type ParsedPlaceOrderInstruction, type ParsedReclaimRestingOrderInstruction, type ParsedSetMarketPausedInstruction, type ParsedSyncMarketFromDuelInstruction, type ParsedUpdateConfigInstruction, type ParsedWithdrawResolvedTradeFeesInstruction } from '../instructions/index.js';
 
-export const DUEL_MARKET_PROGRAM_ADDRESS = '3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy' as Address<'3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy'>;
+export const DUEL_MARKET_PROGRAM_ADDRESS = '7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG' as Address<'7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG'>;
 
 export enum DuelMarketAccount { DuelState, MarketConfig, MarketState, Order, PriceLevel, UserBalance }
 
@@ -24,13 +24,14 @@ if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Arr
 throw new Error("The provided account could not be identified as a duelMarket account.")
 }
 
-export enum DuelMarketInstruction { CancelOrder, Claim, CloseEmptyPriceLevel, CloseFilledOrder, CloseLosingBalance, ContinueOrder, FreezeConfig, InitializeConfig, InitializeMarket, PlaceOrder, ReclaimRestingOrder, SetMarketPaused, SyncMarketFromDuel, UpdateConfig, WithdrawResolvedTradeFees }
+export enum DuelMarketInstruction { CancelOrder, Claim, CloseEmptyPriceLevel, CloseEmptyUserBalance, CloseFilledOrder, CloseLosingBalance, ContinueOrder, FreezeConfig, InitializeConfig, InitializeMarket, PlaceOrder, ReclaimRestingOrder, SetMarketPaused, SyncMarketFromDuel, UpdateConfig, WithdrawResolvedTradeFees }
 
 export function identifyDuelMarketInstruction(instruction: { data: ReadonlyUint8Array } | ReadonlyUint8Array): DuelMarketInstruction {
 const data = 'data' in instruction ? instruction.data : instruction;
 if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Array([95, 129, 237, 240, 8, 49, 223, 132])), 0)) { return DuelMarketInstruction.CancelOrder; }
 if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Array([62, 198, 214, 193, 213, 159, 108, 210])), 0)) { return DuelMarketInstruction.Claim; }
 if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Array([177, 38, 155, 18, 148, 163, 151, 156])), 0)) { return DuelMarketInstruction.CloseEmptyPriceLevel; }
+if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Array([143, 212, 24, 6, 221, 46, 27, 56])), 0)) { return DuelMarketInstruction.CloseEmptyUserBalance; }
 if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Array([137, 142, 13, 180, 17, 12, 129, 122])), 0)) { return DuelMarketInstruction.CloseFilledOrder; }
 if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Array([86, 226, 44, 46, 219, 51, 73, 47])), 0)) { return DuelMarketInstruction.CloseLosingBalance; }
 if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Array([52, 137, 158, 152, 162, 246, 203, 104])), 0)) { return DuelMarketInstruction.ContinueOrder; }
@@ -46,10 +47,11 @@ if (containsBytes(data, fixEncoderSize(getBytesEncoder(), 8).encode(new Uint8Arr
 throw new Error("The provided instruction could not be identified as a duelMarket instruction.")
 }
 
-export type ParsedDuelMarketInstruction<TProgram extends string = '3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy'> =
+export type ParsedDuelMarketInstruction<TProgram extends string = '7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG'> =
 | { instructionType: DuelMarketInstruction.CancelOrder } & ParsedCancelOrderInstruction<TProgram>
 | { instructionType: DuelMarketInstruction.Claim } & ParsedClaimInstruction<TProgram>
 | { instructionType: DuelMarketInstruction.CloseEmptyPriceLevel } & ParsedCloseEmptyPriceLevelInstruction<TProgram>
+| { instructionType: DuelMarketInstruction.CloseEmptyUserBalance } & ParsedCloseEmptyUserBalanceInstruction<TProgram>
 | { instructionType: DuelMarketInstruction.CloseFilledOrder } & ParsedCloseFilledOrderInstruction<TProgram>
 | { instructionType: DuelMarketInstruction.CloseLosingBalance } & ParsedCloseLosingBalanceInstruction<TProgram>
 | { instructionType: DuelMarketInstruction.ContinueOrder } & ParsedContinueOrderInstruction<TProgram>
@@ -76,6 +78,8 @@ case DuelMarketInstruction.Claim: { assertIsInstructionWithAccounts(instruction)
 return { instructionType: DuelMarketInstruction.Claim, ...parseClaimInstruction(instruction) }; }
 case DuelMarketInstruction.CloseEmptyPriceLevel: { assertIsInstructionWithAccounts(instruction);
 return { instructionType: DuelMarketInstruction.CloseEmptyPriceLevel, ...parseCloseEmptyPriceLevelInstruction(instruction) }; }
+case DuelMarketInstruction.CloseEmptyUserBalance: { assertIsInstructionWithAccounts(instruction);
+return { instructionType: DuelMarketInstruction.CloseEmptyUserBalance, ...parseCloseEmptyUserBalanceInstruction(instruction) }; }
 case DuelMarketInstruction.CloseFilledOrder: { assertIsInstructionWithAccounts(instruction);
 return { instructionType: DuelMarketInstruction.CloseFilledOrder, ...parseCloseFilledOrderInstruction(instruction) }; }
 case DuelMarketInstruction.CloseLosingBalance: { assertIsInstructionWithAccounts(instruction);

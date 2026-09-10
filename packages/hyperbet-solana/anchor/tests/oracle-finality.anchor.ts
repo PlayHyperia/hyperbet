@@ -7,6 +7,7 @@ import {
   SIDE_ASK,
   SIDE_BID,
   airdrop,
+  buildCanonicalResultHash,
   cancelDuel,
   claimClobWinnings,
   createOpenMarketFixture,
@@ -161,6 +162,10 @@ describe("oracle finality truth (solana)", () => {
       authority.publicKey,
       60,
     );
+    const oracleConfig = await fightProgram.account.oracleConfig.fetch(
+      deriveOracleConfigPda(fightProgram.programId),
+    );
+    assert.strictEqual(Number(oracleConfig.accountSchemaVersion), 2);
     await proposeDuelResult(fightProgram, authority, market.duelKey, {
       winner: marketSideA(),
       duelEndTs: Math.max(
@@ -363,11 +368,8 @@ describe("oracle finality truth (solana)", () => {
     const duelKey = uniqueDuelKey("sol-proposal-history");
     const chainNow = await currentChainUnixTimestamp(provider.connection);
     const firstReplayHash = hashLabel("proposal-history:first:replay");
-    const firstResultHash = hashLabel("proposal-history:first:result");
     const secondReplayHash = hashLabel("proposal-history:second:replay");
-    const secondResultHash = hashLabel("proposal-history:second:result");
     const futureReplayHash = hashLabel("proposal-history:future:replay");
-    const futureResultHash = hashLabel("proposal-history:future:result");
 
     await ensureOracleReady(
       fightProgram,
@@ -383,6 +385,34 @@ describe("oracle finality truth (solana)", () => {
       betCloseTs: chainNow - 20,
       duelStartTs: chainNow - 10,
       metadataUri: "https://hyperia.gg/tests/proposal-history/locked",
+    });
+    const duelStateAccount =
+      await fightProgram.account.duelState.fetch(duelState);
+    const snapshotVersion = Number(duelStateAccount.competitiveSnapshotVersion);
+    const snapshotDigest = duelStateAccount.competitiveSnapshotDigest;
+    const firstResultHash = buildCanonicalResultHash({
+      duelKey,
+      winner: marketSideA(),
+      seed: 101,
+      replayHash: firstReplayHash,
+      competitiveSnapshotVersion: snapshotVersion,
+      competitiveSnapshotDigest: snapshotDigest,
+    });
+    const futureResultHash = buildCanonicalResultHash({
+      duelKey,
+      winner: marketSideB(),
+      seed: 102,
+      replayHash: futureReplayHash,
+      competitiveSnapshotVersion: snapshotVersion,
+      competitiveSnapshotDigest: snapshotDigest,
+    });
+    const secondResultHash = buildCanonicalResultHash({
+      duelKey,
+      winner: marketSideB(),
+      seed: 202,
+      replayHash: secondReplayHash,
+      competitiveSnapshotVersion: snapshotVersion,
+      competitiveSnapshotDigest: snapshotDigest,
     });
     const firstProposalRecord = deriveProposalRecordPda(
       fightProgram.programId,
@@ -450,8 +480,8 @@ describe("oracle finality truth (solana)", () => {
 
     try {
       await reproposeDuelResult(fightProgram, authority, duelKey, {
-        winner: marketSideB(),
-        seed: 102,
+        winner: marketSideA(),
+        seed: 101,
         replayHash: firstReplayHash,
         resultHash: firstResultHash,
         duelEndTs: await currentChainUnixTimestamp(provider.connection),
@@ -516,7 +546,7 @@ describe("oracle finality truth (solana)", () => {
     try {
       await reproposeDuelResult(fightProgram, authority, duelKey, {
         winner: marketSideA(),
-        seed: 303,
+        seed: 101,
         replayHash: firstReplayHash,
         resultHash: firstResultHash,
         duelEndTs: await currentChainUnixTimestamp(provider.connection),
@@ -536,6 +566,149 @@ describe("oracle finality truth (solana)", () => {
       Buffer.from(finalState.activeProposal),
       Buffer.from(secondRecord.proposalId),
     );
+  });
+
+  it("freezes the competitive snapshot and rejects a snapshot-tampered result hash", async () => {
+    const chainNow = await currentChainUnixTimestamp(provider.connection);
+    await ensureOracleReady(
+      fightProgram,
+      authority,
+      authority.publicKey,
+      authority.publicKey,
+      authority.publicKey,
+      60,
+    );
+
+    const invalidVersionKey = uniqueDuelKey("snapshot-invalid-version");
+    try {
+      await upsertDuel(fightProgram, authority, invalidVersionKey, {
+        status: duelStatusLocked(),
+        betOpenTs: chainNow - 60,
+        betCloseTs: chainNow - 20,
+        duelStartTs: chainNow - 10,
+        competitiveSnapshotVersion: 0,
+      });
+      assert.fail("zero competitive snapshot version was accepted");
+    } catch (error: unknown) {
+      assert.ok(
+        hasProgramError(error, "InvalidCompetitiveSnapshot"),
+        `expected InvalidCompetitiveSnapshot, got ${String(error)}`,
+      );
+    }
+    const invalidDigestKey = uniqueDuelKey("snapshot-invalid-digest");
+    try {
+      await upsertDuel(fightProgram, authority, invalidDigestKey, {
+        status: duelStatusLocked(),
+        betOpenTs: chainNow - 60,
+        betCloseTs: chainNow - 20,
+        duelStartTs: chainNow - 10,
+        competitiveSnapshotVersion: 3,
+        competitiveSnapshotDigest: new Array(32).fill(0),
+      });
+      assert.fail("zero competitive snapshot digest was accepted");
+    } catch (error: unknown) {
+      assert.ok(
+        hasProgramError(error, "InvalidCompetitiveSnapshot"),
+        `expected InvalidCompetitiveSnapshot, got ${String(error)}`,
+      );
+    }
+
+    const duelKey = uniqueDuelKey("snapshot-result-binding");
+    const snapshotDigest = hashLabel("snapshot-result-binding:digest");
+    const duelState = await upsertDuel(fightProgram, authority, duelKey, {
+      status: duelStatusLocked(),
+      betOpenTs: chainNow - 60,
+      betCloseTs: chainNow - 20,
+      duelStartTs: chainNow - 10,
+      competitiveSnapshotVersion: 3,
+      competitiveSnapshotDigest: snapshotDigest,
+    });
+    const stored = await fightProgram.account.duelState.fetch(duelState);
+    assert.strictEqual(Number(stored.accountSchemaVersion), 2);
+    assert.strictEqual(Number(stored.competitiveSnapshotVersion), 3);
+    assert.deepStrictEqual(
+      Buffer.from(stored.competitiveSnapshotDigest),
+      Buffer.from(snapshotDigest),
+    );
+
+    try {
+      await upsertDuel(fightProgram, authority, duelKey, {
+        status: duelStatusLocked(),
+        betOpenTs: chainNow - 60,
+        betCloseTs: chainNow - 20,
+        duelStartTs: chainNow - 10,
+        competitiveSnapshotVersion: 2,
+        competitiveSnapshotDigest: snapshotDigest,
+      });
+      assert.fail("competitive snapshot version changed after betting opened");
+    } catch (error: unknown) {
+      assert.ok(
+        hasProgramError(error, "CompetitiveSnapshotImmutable"),
+        `expected CompetitiveSnapshotImmutable, got ${String(error)}`,
+      );
+    }
+    try {
+      await upsertDuel(fightProgram, authority, duelKey, {
+        status: duelStatusLocked(),
+        betOpenTs: chainNow - 60,
+        betCloseTs: chainNow - 20,
+        duelStartTs: chainNow - 10,
+        competitiveSnapshotVersion: 3,
+        competitiveSnapshotDigest: hashLabel(
+          "snapshot-result-binding:replacement",
+        ),
+      });
+      assert.fail("competitive snapshot digest changed after betting opened");
+    } catch (error: unknown) {
+      assert.ok(
+        hasProgramError(error, "CompetitiveSnapshotImmutable"),
+        `expected CompetitiveSnapshotImmutable, got ${String(error)}`,
+      );
+    }
+
+    const replayHash = hashLabel("snapshot-result-binding:replay");
+    const tamperedResultHash = buildCanonicalResultHash({
+      duelKey,
+      winner: marketSideA(),
+      seed: 42,
+      replayHash,
+      competitiveSnapshotVersion: 3,
+      competitiveSnapshotDigest: hashLabel("snapshot-result-binding:tampered"),
+    });
+    const tamperedProposal = deriveProposalRecordPda(
+      fightProgram.programId,
+      duelKey,
+      tamperedResultHash,
+      replayHash,
+    );
+    try {
+      await proposeDuelResult(fightProgram, authority, duelKey, {
+        winner: marketSideA(),
+        seed: 42,
+        replayHash,
+        resultHash: tamperedResultHash,
+        duelEndTs: chainNow,
+      });
+      assert.fail("snapshot-tampered result hash was accepted");
+    } catch (error: unknown) {
+      assert.ok(
+        hasProgramError(error, "ResultHashMismatch"),
+        `expected ResultHashMismatch, got ${String(error)}`,
+      );
+    }
+    assert.strictEqual(
+      await provider.connection.getAccountInfo(tamperedProposal),
+      null,
+    );
+
+    await proposeDuelResult(fightProgram, authority, duelKey, {
+      winner: marketSideA(),
+      seed: 42,
+      replayHash,
+      duelEndTs: chainNow,
+    });
+    const proposed = await fightProgram.account.duelState.fetch(duelState);
+    assert.ok(proposed.status.proposed !== undefined);
   });
 
   it("refunds only cancelled outcomes and not open outcomes", async () => {

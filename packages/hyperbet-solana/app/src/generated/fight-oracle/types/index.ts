@@ -6,10 +6,5 @@
  * @see https://github.com/codama-idl/codama
  */
 
-export * from './duelCancelled.js';
-export * from './duelResolved.js';
 export * from './duelStatus.js';
-export * from './duelUpserted.js';
 export * from './marketSide.js';
-export * from './resultChallenged.js';
-export * from './resultProposed.js';

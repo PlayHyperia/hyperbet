@@ -2,7 +2,7 @@ import { spawnSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Keypair } from "@solana/web3.js";
@@ -41,6 +41,26 @@ const DEFAULT_ANCHOR_DIR = join(
   "hyperbet-solana",
   "anchor",
 );
+
+function configureSolanaToolPath(): void {
+  const activeReleaseBin =
+    process.env.SOLANA_ACTIVE_RELEASE_BIN?.trim() ||
+    join(
+      process.env.HOME ?? "",
+      ".local",
+      "share",
+      "solana",
+      "install",
+      "active_release",
+      "bin",
+    );
+  if (!existsSync(activeReleaseBin)) return;
+
+  const pathEntries = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  if (!pathEntries.includes(activeReleaseBin)) {
+    process.env.PATH = [activeReleaseBin, ...pathEntries].join(delimiter);
+  }
+}
 
 function commandExists(command: string): boolean {
   const result = spawnSync(command, ["--version"], { stdio: "ignore" });
@@ -428,6 +448,7 @@ async function startSolanaValidatorAttempt(): Promise<SolanaValidatorHandle> {
 }
 
 export async function startSolanaValidator(): Promise<SolanaValidatorHandle> {
+  configureSolanaToolPath();
   let lastError: unknown = null;
 
   for (

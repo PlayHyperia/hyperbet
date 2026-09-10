@@ -8,6 +8,7 @@ import {
   classifyOracleFinalizeError,
   classifyOracleLock,
   parseDuelCancellationMetadata,
+  parseDuelLifecycleMetadata,
   isOracleTimestampMature,
   resolveOracleDuelEndTimestamp,
 } from "./duelTerminalPolicy";
@@ -244,25 +245,31 @@ describe("canonical SOL duel terminal policy", () => {
     const metadata = buildDuelLifecycleMetadata({
       duelId: "duel-42",
       duelKey: `0x${"AB".repeat(32)}`,
+      snapshotVersion: 3,
       snapshotDigest: "CD".repeat(32),
     });
-    expect(JSON.parse(metadata)).toEqual({
+    expect(parseDuelLifecycleMetadata(metadata)).toEqual({
       duelId: "duel-42",
       duelKeyHex: "ab".repeat(32),
+      snapshotVersion: 3,
       snapshotDigest: "cd".repeat(32),
     });
     expect(Buffer.byteLength(metadata, "utf8")).toBeLessThanOrEqual(200);
 
-    const identityOnly = buildDuelLifecycleMetadata({
-      duelId: "x".repeat(90),
+    const compact = buildDuelLifecycleMetadata({
+      duelId: "x".repeat(70),
       duelKey: "ab".repeat(32),
+      snapshotVersion: 9,
       snapshotDigest: "cd".repeat(32),
     });
-    expect(JSON.parse(identityOnly)).toEqual({
-      duelId: "x".repeat(90),
+    expect(JSON.parse(compact).v).toBe(2);
+    expect(parseDuelLifecycleMetadata(compact)).toEqual({
+      duelId: "x".repeat(70),
       duelKeyHex: "ab".repeat(32),
+      snapshotVersion: 9,
+      snapshotDigest: "cd".repeat(32),
     });
-    expect(Buffer.byteLength(identityOnly, "utf8")).toBeLessThanOrEqual(200);
+    expect(Buffer.byteLength(compact, "utf8")).toBeLessThanOrEqual(200);
   });
 
   test("rejects lifecycle metadata that cannot preserve canonical identity", () => {
@@ -270,13 +277,15 @@ describe("canonical SOL duel terminal policy", () => {
       buildDuelLifecycleMetadata({
         duelId: "x".repeat(200),
         duelKey: "ab".repeat(32),
+        snapshotVersion: 1,
         snapshotDigest: "cd".repeat(32),
       }),
-    ).toThrow("Canonical duel identity exceeds 200 metadata bytes");
+    ).toThrow("Exact duel lifecycle metadata exceeds 200 metadata bytes");
     expect(() =>
       buildDuelLifecycleMetadata({
         duelId: "duel-42",
         duelKey: "invalid",
+        snapshotVersion: 1,
         snapshotDigest: "cd".repeat(32),
       }),
     ).toThrow("32-byte duel key");
@@ -284,9 +293,20 @@ describe("canonical SOL duel terminal policy", () => {
       buildDuelLifecycleMetadata({
         duelId: "duel-42",
         duelKey: "ab".repeat(32),
+        snapshotVersion: 1,
         snapshotDigest: "invalid",
       }),
     ).toThrow("32-byte snapshot digest");
+    for (const snapshotVersion of [0, -1, 1.5, Number.MAX_SAFE_INTEGER]) {
+      expect(() =>
+        buildDuelLifecycleMetadata({
+          duelId: "duel-42",
+          duelKey: "ab".repeat(32),
+          snapshotVersion,
+          snapshotDigest: "cd".repeat(32),
+        }),
+      ).toThrow("positive unsigned 32-bit snapshot version");
+    }
   });
 
   test("rejects cancellation metadata that cannot preserve canonical identity", () => {

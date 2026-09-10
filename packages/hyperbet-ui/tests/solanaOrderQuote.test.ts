@@ -212,4 +212,28 @@ describe("Solana order quote", () => {
       }),
     ).toThrow("Combined trade fee exceeds");
   });
+
+  test("matches the program's widened arithmetic across valid large u64 amounts", () => {
+    const largeExactAmount = 18_446_744_073_709_551_000n;
+    const quote = buildSolanaOrderQuote({
+      side: "YES",
+      amountLamports: largeExactAmount,
+      outcomePriceMillis: 999,
+      tradeTreasuryFeeBps: 1_001,
+      tradeMarketMakerFeeBps: 0,
+      winningsMarketMakerFeeBps: 9_999,
+      wallet: null,
+      restingOrders: [],
+    });
+
+    const expectedCollateral = (largeExactAmount * 999n) / 1_000n;
+    expect(quote.limitCollateralLamports).toBe(expectedCollateral);
+    expect(quote.visibleRestingCollateralLamports).toBe(expectedCollateral);
+    expect(quote.fullFillTreasuryFeeLamports).toBe(
+      (expectedCollateral * 1_001n) / 10_000n,
+    );
+    expect(quote.fullFillWinningsFeeLamports).toBe(
+      (largeExactAmount * 9_999n) / 10_000n,
+    );
+  });
 });

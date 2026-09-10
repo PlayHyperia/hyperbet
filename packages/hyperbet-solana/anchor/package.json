@@ -9,9 +9,12 @@
     "deploy:mainnet": "bash scripts/deploy-programs.sh mainnet-beta",
     "lint:rust": "cargo clippy --workspace --all-targets -- -D warnings -A clippy::manual-is-multiple-of",
     "test:rust": "cargo test --workspace",
-    "audit": "bash scripts/run-cargo-audit.sh",
-    "audit:strict": "ANCHOR_AUDIT_STRICT=1 bash scripts/run-cargo-audit.sh -D warnings",
-    "test": "bash scripts/run-localnet-tests.sh",
+    "typecheck": "tsc --noEmit -p tsconfig.tests.json",
+    "audit": "node --test scripts/check-cargo-audit.test.mjs && bash scripts/run-cargo-audit.sh",
+    "audit:strict": "node --test scripts/check-cargo-audit.test.mjs && bash scripts/run-cargo-audit.sh -D warnings",
+    "promote:generated-state-machine": "bun scripts/promote-generated-state-machine-failure.ts",
+    "test": "bash scripts/run-localnet-tests.sh && bash scripts/run-fork-rollback-test.sh",
+    "test:fork-rollback": "bash scripts/run-fork-rollback-test.sh",
     "test:anchor-cli": "if command -v anchor >/dev/null 2>&1; then anchor test; else echo 'Anchor CLI not found, skipping tests'; fi",
     "simulate:localnet": "node scripts/run-hyperia-simulation.mjs"
   },
@@ -19,13 +22,17 @@
     "@coral-xyz/anchor": "0.32.1",
     "@solana/spl-token": "0.4.14",
     "@solana/web3.js": "1.98.4",
-    "@types/bn.js": "^5.2.0",
+    "@types/bn.js": "5.2.0",
     "@types/chai": "5.2.3",
     "@types/mocha": "10.0.10",
-    "bn.js": "^5.2.3",
+    "@types/node": "22.20.1",
+    "bn.js": "5.2.3",
     "chai": "6.2.2",
     "mocha": "10.8.2",
     "ts-mocha": "10.0.0",
     "typescript": "5.9.3"
+  },
+  "overrides": {
+    "toml": "4.2.0"
   }
 }

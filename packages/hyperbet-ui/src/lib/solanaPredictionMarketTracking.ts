@@ -6,9 +6,9 @@ export interface RecordSolanaPredictionMarketTradeInput {
   sourceAmountLamports: bigint;
   feeBps: number;
   txSignature: string;
-  marketRef?: string | null;
-  duelKey?: string | null;
-  duelId?: string | null;
+  marketRef: string;
+  duelKey: string;
+  duelId: string;
 }
 
 function sanitizeNumber(value: number | null | undefined): number {
@@ -48,7 +48,17 @@ function wait(milliseconds: number): Promise<void> {
 export async function recordSolanaPredictionMarketTrade(
   input: RecordSolanaPredictionMarketTradeInput,
 ): Promise<boolean> {
-  if (!input.bettorWallet.trim() || !input.txSignature.trim()) {
+  const marketRef = input.marketRef.trim();
+  const duelKey = input.duelKey.trim().toLowerCase();
+  const duelId = input.duelId.trim();
+  if (
+    !input.bettorWallet.trim() ||
+    !input.txSignature.trim() ||
+    !marketRef ||
+    !/^[0-9a-f]{64}$/.test(duelKey) ||
+    !duelId ||
+    duelId.length > 256
+  ) {
     return false;
   }
 
@@ -63,10 +73,10 @@ export async function recordSolanaPredictionMarketTrade(
     sourceAmountLamports: sourceAmountLamports.toString(),
     feeBps: sanitizeNumber(input.feeBps),
     txSignature: signature,
-    marketPda: input.marketRef?.trim() || null,
-    marketRef: input.marketRef?.trim() || null,
-    duelKey: input.duelKey?.trim() || null,
-    duelId: input.duelId?.trim() || null,
+    marketPda: marketRef,
+    marketRef,
+    duelKey,
+    duelId,
     inviteCode: getStoredInviteCode(),
     externalBetRef: `solana:${signature}`,
   };

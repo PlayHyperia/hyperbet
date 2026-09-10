@@ -4,13 +4,20 @@ import { fileURLToPath } from "node:url";
 
 import { Database } from "bun:sqlite";
 
+import {
+  buildBettingFeedDuelEvidence,
+  canonicalEvidenceJson,
+  normalizeBettingFeedEvidenceFrame,
+  type BettingFeedCompetitiveSnapshotEvidence,
+  type BettingFeedDuelEvidence,
+  type BettingFeedEvidenceFrame,
+} from "./bettingFeedEvidence";
+import { buildDuelCorrelationId } from "./duelCorrelation";
+import type { StreamingCycle } from "./game-client";
+
 export type TerminalOperationOutcome = "WIN" | "DRAW" | "CANCELLED";
 export type TerminalOperationStatus =
-  | "PENDING"
-  | "PROCESSING"
-  | "SUCCEEDED"
-  | "MANUAL_REVIEW"
-  | "DEAD_LETTER";
+  "PENDING" | "PROCESSING" | "SUCCEEDED" | "MANUAL_REVIEW" | "DEAD_LETTER";
 
 export type TerminalOperationInput = {
   duelId: string;
@@ -28,6 +35,7 @@ export type TerminalOperationInput = {
 
 export type TerminalOperationRecord = TerminalOperationInput & {
   id: number;
+  correlationId: string;
   fingerprint: string;
   status: TerminalOperationStatus;
   attempts: number;
@@ -44,6 +52,17 @@ export type TerminalOperationRecord = TerminalOperationInput & {
 };
 
 export type TerminalLedgerSummary = Record<TerminalOperationStatus, number>;
+
+export type TerminalLedgerOperationsTelemetry = {
+  summary: TerminalLedgerSummary;
+  oldestActionableCreatedAt: number | null;
+  recentSucceededDurationsMs: number[];
+};
+
+export type TerminalOperationCorrelation = {
+  status: TerminalOperationStatus;
+  correlationId: string;
+};
 
 export type TerminalOperatorAuditEvent = {
   id: number;
@@ -65,6 +84,10 @@ export type TerminalOperatorRequeueResult = {
   auditEvent: TerminalOperatorAuditEvent;
 };
 
+export type TerminalLedgerOptions = {
+  readOnly?: boolean;
+};
+
 export type TerminalOperationConflictRecord = {
   id: number;
   operationId: number;
@@ -81,8 +104,13 @@ export type BettingFeedCheckpoint = {
   lastEmittedAt: number;
   duelId: string | null;
   competitiveSnapshotDigest: string | null;
+  betOpenTime?: number | null;
+  betCloseTime?: number | null;
+  fightStartTime?: number | null;
+  duelEndTime?: number | null;
   phase: string | null;
   terminal: boolean;
+  terminalEventKey: string | null;
   degradedReason: string | null;
   updatedAt: number;
 };
@@ -146,10 +174,31 @@ type BettingFeedCheckpointRow = {
   lastEmittedAt: number;
   duelId: string | null;
   competitiveSnapshotDigest: string | null;
+  betOpenTime: number | null;
+  betCloseTime: number | null;
+  fightStartTime: number | null;
+  duelEndTime: number | null;
   phase: string | null;
   terminal: number;
+  terminalEventKey: string | null;
   degradedReason: string | null;
   updatedAt: number;
+};
+
+type BettingFeedCompetitiveSnapshotRow = {
+  duelId: string;
+  duelKey: string;
+  competitiveSnapshotDigest: string;
+  competitiveSnapshotJson: string;
+  firstSourceEpoch: number;
+  firstSeq: number;
+  firstEmittedAt: number;
+};
+
+type BettingFeedEvidenceFrameRow = {
+  sourceEpoch: number;
+  seq: number;
+  frameJson: string;
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -189,7 +238,10 @@ function normalizeInput(input: TerminalOperationInput): TerminalOperationInput {
   const replayHash = input.replayHash?.trim().toLowerCase() || null;
   if (
     input.outcome === "WIN" &&
-    (!input.seed?.trim() || !replayHash || !/^[0-9a-f]{64}$/.test(replayHash))
+    (!input.seed?.trim() ||
+      !replayHash ||
+      !/^[0-9a-f]{64}$/.test(replayHash) ||
+      replayHash === "0".repeat(64))
   ) {
     throw new Error("WIN terminal operations require seed and replayHash");
   }
@@ -289,8 +341,12 @@ export class TerminalOperationConflictError extends Error {
 export class TerminalLedger {
   private readonly db: Database;
 
-  constructor(dbPath = defaultDbPath()) {
-    this.db = new Database(dbPath, { create: true });
+  constructor(dbPath = defaultDbPath(), options: TerminalLedgerOptions = {}) {
+    this.db = new Database(
+      dbPath,
+      options.readOnly ? { readonly: true } : { create: true },
+    );
+    if (options.readOnly) return;
     this.db.run("PRAGMA busy_timeout = 5000");
     this.db.run("PRAGMA journal_mode = WAL");
     this.db.run("PRAGMA synchronous = NORMAL");
@@ -385,8 +441,13 @@ export class TerminalLedger {
       last_emitted_at INTEGER NOT NULL CHECK (last_emitted_at >= 0),
       duel_id TEXT,
       competitive_snapshot_digest TEXT,
+      bet_open_time INTEGER CHECK (bet_open_time IS NULL OR bet_open_time >= 0),
+      bet_close_time INTEGER CHECK (bet_close_time IS NULL OR bet_close_time >= 0),
+      fight_start_time INTEGER CHECK (fight_start_time IS NULL OR fight_start_time >= 0),
+      duel_end_time INTEGER CHECK (duel_end_time IS NULL OR duel_end_time >= 0),
       phase TEXT,
       terminal INTEGER NOT NULL CHECK (terminal IN (0, 1)),
+      terminal_event_key TEXT,
       degraded_reason TEXT,
       updated_at INTEGER NOT NULL CHECK (updated_at >= 0)
     )`);
@@ -404,6 +465,51 @@ export class TerminalLedger {
         "ALTER TABLE betting_feed_checkpoint ADD COLUMN competitive_snapshot_digest TEXT",
       );
     }
+    if (!bettingFeedColumns.has("terminal_event_key")) {
+      this.db.run(
+        "ALTER TABLE betting_feed_checkpoint ADD COLUMN terminal_event_key TEXT",
+      );
+    }
+    for (const column of [
+      "bet_open_time",
+      "bet_close_time",
+      "fight_start_time",
+      "duel_end_time",
+    ]) {
+      if (!bettingFeedColumns.has(column)) {
+        this.db.run(
+          `ALTER TABLE betting_feed_checkpoint ADD COLUMN ${column} INTEGER`,
+        );
+      }
+    }
+    this.db.run(`CREATE TABLE IF NOT EXISTS betting_feed_competitive_snapshots (
+      competitive_snapshot_digest TEXT PRIMARY KEY,
+      duel_id TEXT NOT NULL UNIQUE,
+      duel_key TEXT NOT NULL UNIQUE,
+      competitive_snapshot_json TEXT NOT NULL,
+      first_source_epoch INTEGER NOT NULL CHECK (first_source_epoch >= 0),
+      first_seq INTEGER NOT NULL CHECK (first_seq >= 0),
+      first_emitted_at INTEGER NOT NULL CHECK (first_emitted_at > 0)
+    )`);
+    this.db.run(`CREATE TABLE IF NOT EXISTS betting_feed_evidence_frames (
+      source_epoch INTEGER NOT NULL CHECK (source_epoch >= 0),
+      seq INTEGER NOT NULL CHECK (seq >= 0),
+      emitted_at INTEGER NOT NULL CHECK (emitted_at > 0),
+      duel_id TEXT NOT NULL,
+      duel_key TEXT NOT NULL,
+      competitive_snapshot_digest TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      frame_digest TEXT NOT NULL,
+      material_digest TEXT NOT NULL,
+      frame_json TEXT NOT NULL,
+      recorded_at INTEGER NOT NULL CHECK (recorded_at > 0),
+      PRIMARY KEY (source_epoch, seq),
+      UNIQUE (duel_id, frame_digest),
+      FOREIGN KEY (competitive_snapshot_digest)
+        REFERENCES betting_feed_competitive_snapshots(competitive_snapshot_digest)
+    )`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_betting_feed_evidence_duel
+      ON betting_feed_evidence_frames (duel_id, source_epoch, seq)`);
   }
 
   close(): void {
@@ -415,6 +521,10 @@ export class TerminalLedger {
       id: row.id,
       duelId: row.duelId,
       duelKey: row.duelKey,
+      correlationId: buildDuelCorrelationId({
+        duelId: row.duelId,
+        duelKey: row.duelKey,
+      }),
       fingerprint: row.fingerprint,
       outcome: row.outcome,
       winnerSide: row.winnerSide,
@@ -877,6 +987,51 @@ export class TerminalLedger {
       .filter((record): record is TerminalOperationRecord => record !== null);
   }
 
+  listOperationCorrelations(
+    statuses: TerminalOperationStatus[],
+    limit = 64,
+  ): TerminalOperationCorrelation[] {
+    const allowedStatuses = new Set<TerminalOperationStatus>([
+      "PENDING",
+      "PROCESSING",
+      "SUCCEEDED",
+      "MANUAL_REVIEW",
+      "DEAD_LETTER",
+    ]);
+    const normalizedStatuses = [...new Set(statuses)];
+    if (
+      normalizedStatuses.length === 0 ||
+      normalizedStatuses.some((status) => !allowedStatuses.has(status))
+    ) {
+      throw new Error("invalid terminal correlation status filter");
+    }
+    const normalizedLimit = normalizeLimit(limit, 64);
+    const placeholders = normalizedStatuses.map(() => "?").join(", ");
+    const rows = this.db
+      .query(
+        `SELECT
+           duel_id AS duelId,
+           duel_key AS duelKey,
+           status
+         FROM terminal_operations
+         WHERE status IN (${placeholders})
+         ORDER BY updated_at DESC, id DESC
+         LIMIT ?`,
+      )
+      .all(...normalizedStatuses, normalizedLimit) as Array<{
+      duelId: string;
+      duelKey: string;
+      status: TerminalOperationStatus;
+    }>;
+    return rows.map((row) => ({
+      status: row.status,
+      correlationId: buildDuelCorrelationId({
+        duelId: row.duelId,
+        duelKey: row.duelKey,
+      }),
+    }));
+  }
+
   getOperatorAuditEvents(
     input: {
       operationId?: number;
@@ -953,6 +1108,185 @@ export class TerminalLedger {
     return rows.map((row) => this.fromConflictRow(row));
   }
 
+  private persistBettingFeedEvidenceFrame(cycle: StreamingCycle): void {
+    const normalized = normalizeBettingFeedEvidenceFrame(cycle);
+    if (!normalized) return;
+    const { frame, snapshot } = normalized;
+    const competitiveSnapshotJson = canonicalEvidenceJson(
+      snapshot.competitiveSnapshot,
+    );
+    const existingSnapshot = this.db
+      .query(
+        `SELECT
+          duel_id AS duelId,
+          duel_key AS duelKey,
+          competitive_snapshot_digest AS competitiveSnapshotDigest,
+          competitive_snapshot_json AS competitiveSnapshotJson,
+          first_source_epoch AS firstSourceEpoch,
+          first_seq AS firstSeq,
+          first_emitted_at AS firstEmittedAt
+         FROM betting_feed_competitive_snapshots
+         WHERE competitive_snapshot_digest = ?
+            OR duel_id = ?
+            OR duel_key = ?
+         LIMIT 1`,
+      )
+      .get(
+        snapshot.competitiveSnapshotDigest,
+        snapshot.duelId,
+        snapshot.duelKey,
+      ) as BettingFeedCompetitiveSnapshotRow | null;
+    if (existingSnapshot) {
+      if (
+        existingSnapshot.duelId !== snapshot.duelId ||
+        existingSnapshot.duelKey !== snapshot.duelKey ||
+        existingSnapshot.competitiveSnapshotDigest !==
+          snapshot.competitiveSnapshotDigest ||
+        existingSnapshot.competitiveSnapshotJson !== competitiveSnapshotJson
+      ) {
+        throw new Error("betting feed competitive snapshot evidence drifted");
+      }
+    } else {
+      this.db
+        .prepare(
+          `INSERT INTO betting_feed_competitive_snapshots (
+            competitive_snapshot_digest,
+            duel_id,
+            duel_key,
+            competitive_snapshot_json,
+            first_source_epoch,
+            first_seq,
+            first_emitted_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          snapshot.competitiveSnapshotDigest,
+          snapshot.duelId,
+          snapshot.duelKey,
+          competitiveSnapshotJson,
+          snapshot.firstSourceEpoch,
+          snapshot.firstSeq,
+          snapshot.firstEmittedAt,
+        );
+    }
+
+    const frameJson = canonicalEvidenceJson(frame);
+    const existingFrame = this.db
+      .query(
+        `SELECT
+          source_epoch AS sourceEpoch,
+          seq,
+          frame_json AS frameJson
+         FROM betting_feed_evidence_frames
+         WHERE source_epoch = ? AND seq = ?`,
+      )
+      .get(frame.sourceEpoch, frame.seq) as
+      (BettingFeedEvidenceFrameRow & { frameJson: string }) | null;
+    if (existingFrame) {
+      if (existingFrame.frameJson !== frameJson) {
+        throw new Error("betting feed evidence sequence drifted");
+      }
+      return;
+    }
+
+    const latestMaterial = this.db
+      .query(
+        `SELECT material_digest AS materialDigest
+           FROM betting_feed_evidence_frames
+          WHERE duel_id = ?
+          ORDER BY source_epoch DESC, seq DESC
+          LIMIT 1`,
+      )
+      .get(frame.duelId) as { materialDigest: string } | null;
+    if (latestMaterial?.materialDigest === frame.materialDigest) return;
+
+    this.db
+      .prepare(
+        `INSERT INTO betting_feed_evidence_frames (
+          source_epoch,
+          seq,
+          emitted_at,
+          duel_id,
+          duel_key,
+          competitive_snapshot_digest,
+          phase,
+          frame_digest,
+          material_digest,
+          frame_json,
+          recorded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        frame.sourceEpoch,
+        frame.seq,
+        frame.emittedAt,
+        frame.duelId,
+        frame.duelKey,
+        frame.competitiveSnapshotDigest,
+        frame.phase,
+        frame.frameDigest,
+        frame.materialDigest,
+        frameJson,
+        Date.now(),
+      );
+  }
+
+  getBettingFeedDuelEvidence(duelId: string): BettingFeedDuelEvidence | null {
+    const normalizedDuelId = duelId.trim();
+    if (!normalizedDuelId) {
+      throw new Error("betting feed duel evidence requires a duel ID");
+    }
+    const snapshotRow = this.db
+      .query(
+        `SELECT
+          duel_id AS duelId,
+          duel_key AS duelKey,
+          competitive_snapshot_digest AS competitiveSnapshotDigest,
+          competitive_snapshot_json AS competitiveSnapshotJson,
+          first_source_epoch AS firstSourceEpoch,
+          first_seq AS firstSeq,
+          first_emitted_at AS firstEmittedAt
+         FROM betting_feed_competitive_snapshots
+         WHERE duel_id = ?`,
+      )
+      .get(normalizedDuelId) as BettingFeedCompetitiveSnapshotRow | null;
+    if (!snapshotRow) return null;
+    const frameRows = this.db
+      .query(
+        `SELECT
+          source_epoch AS sourceEpoch,
+          seq,
+          frame_json AS frameJson
+         FROM betting_feed_evidence_frames
+         WHERE duel_id = ?
+         ORDER BY source_epoch ASC, seq ASC`,
+      )
+      .all(normalizedDuelId) as BettingFeedEvidenceFrameRow[];
+    let competitiveSnapshot: unknown;
+    const frames: BettingFeedEvidenceFrame[] = [];
+    try {
+      competitiveSnapshot = JSON.parse(snapshotRow.competitiveSnapshotJson);
+      for (const row of frameRows) {
+        frames.push(JSON.parse(row.frameJson) as BettingFeedEvidenceFrame);
+      }
+    } catch {
+      throw new Error("persisted betting feed duel evidence is invalid JSON");
+    }
+    return buildBettingFeedDuelEvidence({
+      snapshot: {
+        duelId: snapshotRow.duelId,
+        duelKey: snapshotRow.duelKey,
+        competitiveSnapshotDigest: snapshotRow.competitiveSnapshotDigest,
+        competitiveSnapshot:
+          competitiveSnapshot as BettingFeedCompetitiveSnapshotEvidence["competitiveSnapshot"],
+        firstSourceEpoch: snapshotRow.firstSourceEpoch,
+        firstSeq: snapshotRow.firstSeq,
+        firstEmittedAt: snapshotRow.firstEmittedAt,
+      },
+      frames,
+    });
+  }
+
   getBettingFeedCheckpoint(): BettingFeedCheckpoint | null {
     const row = this.db
       .query(
@@ -962,8 +1296,13 @@ export class TerminalLedger {
           last_emitted_at AS lastEmittedAt,
           duel_id AS duelId,
           competitive_snapshot_digest AS competitiveSnapshotDigest,
+          bet_open_time AS betOpenTime,
+          bet_close_time AS betCloseTime,
+          fight_start_time AS fightStartTime,
+          duel_end_time AS duelEndTime,
           phase,
           terminal,
+          terminal_event_key AS terminalEventKey,
           degraded_reason AS degradedReason,
           updated_at AS updatedAt
          FROM betting_feed_checkpoint
@@ -977,8 +1316,13 @@ export class TerminalLedger {
       lastEmittedAt: row.lastEmittedAt,
       duelId: row.duelId,
       competitiveSnapshotDigest: row.competitiveSnapshotDigest,
+      betOpenTime: row.betOpenTime,
+      betCloseTime: row.betCloseTime,
+      fightStartTime: row.fightStartTime,
+      duelEndTime: row.duelEndTime,
       phase: row.phase,
       terminal: row.terminal === 1,
+      terminalEventKey: row.terminalEventKey,
       degradedReason: row.degradedReason
         ? truncateError(row.degradedReason)
         : null,
@@ -990,6 +1334,18 @@ export class TerminalLedger {
     checkpoint: Omit<BettingFeedCheckpoint, "degradedReason" | "updatedAt"> & {
       updatedAt?: number;
     },
+    evidenceFrame?: StreamingCycle,
+  ): BettingFeedCheckpoint {
+    return this.db.transaction(() => {
+      if (evidenceFrame) this.persistBettingFeedEvidenceFrame(evidenceFrame);
+      return this.saveBettingFeedCheckpointTransaction(checkpoint);
+    })();
+  }
+
+  private saveBettingFeedCheckpointTransaction(
+    checkpoint: Omit<BettingFeedCheckpoint, "degradedReason" | "updatedAt"> & {
+      updatedAt?: number;
+    },
   ): BettingFeedCheckpoint {
     const sourceEpoch = normalizeTimestamp(checkpoint.sourceEpoch);
     const lastAppliedSeq = normalizeTimestamp(checkpoint.lastAppliedSeq);
@@ -997,6 +1353,15 @@ export class TerminalLedger {
     const duelId = checkpoint.duelId?.trim() || null;
     const competitiveSnapshotDigest =
       checkpoint.competitiveSnapshotDigest?.trim() || null;
+    const normalizeOptionalTimestamp = (
+      value: number | null | undefined,
+    ): number | null => (value == null ? null : normalizeTimestamp(value));
+    const betOpenTime = normalizeOptionalTimestamp(checkpoint.betOpenTime);
+    const betCloseTime = normalizeOptionalTimestamp(checkpoint.betCloseTime);
+    const fightStartTime = normalizeOptionalTimestamp(
+      checkpoint.fightStartTime,
+    );
+    const duelEndTime = normalizeOptionalTimestamp(checkpoint.duelEndTime);
     if (
       (duelId === null) !== (competitiveSnapshotDigest === null) ||
       (competitiveSnapshotDigest !== null &&
@@ -1007,6 +1372,15 @@ export class TerminalLedger {
       );
     }
     const phase = checkpoint.phase?.trim() || null;
+    const terminalEventKey = checkpoint.terminalEventKey?.trim() || null;
+    if (
+      (terminalEventKey !== null && !checkpoint.terminal) ||
+      (terminalEventKey !== null && !/^[0-9a-f]{64}$/.test(terminalEventKey)) ||
+      (duelId === null && terminalEventKey !== null) ||
+      (duelId !== null && checkpoint.terminal && terminalEventKey === null)
+    ) {
+      throw new Error("betting feed terminal event checkpoint is invalid");
+    }
     const updatedAt = normalizeTimestamp(checkpoint.updatedAt ?? Date.now());
     this.db
       .prepare(
@@ -1018,10 +1392,15 @@ export class TerminalLedger {
           duel_id,
           competitive_snapshot_digest,
           phase,
+          bet_open_time,
+          bet_close_time,
+          fight_start_time,
+          duel_end_time,
           terminal,
+          terminal_event_key,
           degraded_reason,
           updated_at
-        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(id) DO UPDATE SET
           source_epoch = excluded.source_epoch,
           last_applied_seq = excluded.last_applied_seq,
@@ -1029,7 +1408,12 @@ export class TerminalLedger {
           duel_id = excluded.duel_id,
           competitive_snapshot_digest = excluded.competitive_snapshot_digest,
           phase = excluded.phase,
+          bet_open_time = excluded.bet_open_time,
+          bet_close_time = excluded.bet_close_time,
+          fight_start_time = excluded.fight_start_time,
+          duel_end_time = excluded.duel_end_time,
           terminal = excluded.terminal,
+          terminal_event_key = excluded.terminal_event_key,
           degraded_reason = NULL,
           updated_at = excluded.updated_at`,
       )
@@ -1040,7 +1424,12 @@ export class TerminalLedger {
         duelId,
         competitiveSnapshotDigest,
         phase,
+        betOpenTime,
+        betCloseTime,
+        fightStartTime,
+        duelEndTime,
         checkpoint.terminal ? 1 : 0,
+        terminalEventKey,
         updatedAt,
       );
     const saved = this.getBettingFeedCheckpoint();
@@ -1062,9 +1451,10 @@ export class TerminalLedger {
           competitive_snapshot_digest,
           phase,
           terminal,
+          terminal_event_key,
           degraded_reason,
           updated_at
-        ) VALUES (1, 0, 0, 0, NULL, NULL, NULL, 1, ?, ?)
+        ) VALUES (1, 0, 0, 0, NULL, NULL, NULL, 1, NULL, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           degraded_reason = excluded.degraded_reason,
           updated_at = CASE
@@ -1219,6 +1609,36 @@ export class TerminalLedger {
       .all() as Array<{ status: TerminalOperationStatus; count: number }>;
     for (const row of rows) summary[row.status] = Number(row.count);
     return summary;
+  }
+
+  getOperationsTelemetry(
+    recentSuccessLimit = 100,
+  ): TerminalLedgerOperationsTelemetry {
+    const limit = normalizeLimit(recentSuccessLimit, 100);
+    const oldestActionable = this.db
+      .query(
+        `SELECT MIN(created_at) AS createdAt
+           FROM terminal_operations
+          WHERE status IN ('PENDING', 'PROCESSING', 'MANUAL_REVIEW', 'DEAD_LETTER')`,
+      )
+      .get() as { createdAt: number | null } | null;
+    const recentSucceeded = this.db
+      .query(
+        `SELECT created_at AS createdAt, completed_at AS completedAt
+           FROM terminal_operations
+          WHERE status = 'SUCCEEDED' AND completed_at IS NOT NULL
+          ORDER BY completed_at DESC, id DESC
+          LIMIT ?`,
+      )
+      .all(limit) as Array<{ createdAt: number; completedAt: number }>;
+
+    return {
+      summary: this.getSummary(),
+      oldestActionableCreatedAt: oldestActionable?.createdAt ?? null,
+      recentSucceededDurationsMs: recentSucceeded.map((record) =>
+        Math.max(0, Number(record.completedAt) - Number(record.createdAt)),
+      ),
+    };
   }
 
   getByDuelId(duelId: string): TerminalOperationRecord | null {

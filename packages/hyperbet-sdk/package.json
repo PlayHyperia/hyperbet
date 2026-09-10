@@ -18,23 +18,23 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "vitest run",
-    "test:coverage": "vitest run --coverage",
+    "test": "bun --bun vitest run",
+    "test:coverage": "bun --bun vitest run --coverage",
     "lint": "tsc --noEmit && prettier --check src tests *.ts *.json *.md",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.30.1",
-    "@solana/web3.js": "^1.95.4",
-    "bn.js": "^5.2.1",
-    "bs58": "^6.0.0"
+    "@coral-xyz/anchor": "0.30.1",
+    "@solana/web3.js": "1.98.4",
+    "bn.js": "5.2.3",
+    "bs58": "6.0.0"
   },
   "devDependencies": {
-    "@types/bn.js": "^5.2.0",
-    "@types/node": "^22.9.0",
-    "tsup": "^8.3.5",
-    "typescript": "^5.6.3",
-    "vitest": "^2.1.5"
+    "@types/bn.js": "5.2.0",
+    "@types/node": "22.20.1",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
   },
   "publishConfig": {
     "access": "public"

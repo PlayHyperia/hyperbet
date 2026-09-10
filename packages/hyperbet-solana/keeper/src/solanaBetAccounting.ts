@@ -52,6 +52,11 @@ export type NativeTransferEvidence = {
   lamports: bigint;
 };
 
+export type NativeTransferEdge = {
+  source: string;
+  destination: string;
+};
+
 export type VerifiedPlaceOrderAccounting = {
   orderId: string;
   side: 1 | 2;
@@ -99,6 +104,28 @@ export function isCanonicalSolanaTransactionSignature(
   } catch {
     return false;
   }
+}
+
+export function exactSolanaTransactionSignatures(
+  signatures: unknown,
+): string[] | null {
+  try {
+    if (!Array.isArray(signatures) || signatures.length === 0) return null;
+    const exactSignatures: string[] = [];
+    for (const signature of signatures) {
+      if (!isCanonicalSolanaTransactionSignature(signature)) return null;
+      exactSignatures.push(signature);
+    }
+    return exactSignatures;
+  } catch {
+    return null;
+  }
+}
+
+export function exactPrimarySolanaTransactionSignature(
+  signatures: unknown,
+): string | null {
+  return exactSolanaTransactionSignatures(signatures)?.[0] ?? null;
 }
 
 export function classifySignatureFinality(
@@ -209,6 +236,21 @@ function sumTransfers(
   );
 }
 
+export function hasOnlyAllowedNativeTransferEdges(
+  transfers: NativeTransferEvidence[],
+  allowedEdges: readonly NativeTransferEdge[],
+): boolean {
+  return transfers.every(
+    (transfer) =>
+      transfer.lamports > 0n &&
+      allowedEdges.some(
+        (edge) =>
+          transfer.source === edge.source &&
+          transfer.destination === edge.destination,
+      ),
+  );
+}
+
 export function verifyPlaceOrderAccounting(input: {
   order: DecodedPlaceOrder;
   wallet: string;
@@ -282,17 +324,13 @@ export function verifyPlaceOrderAccounting(input: {
     throw new Error("matched amount exceeds the signed order amount");
   }
 
-  for (const transfer of input.transfers) {
-    if (transfer.lamports <= 0n) {
-      throw new Error("transaction contains a non-positive native transfer");
-    }
-    const expectedWalletDestination =
-      transfer.source !== input.wallet || transfer.destination === input.vault;
-    const expectedVaultDestination =
-      transfer.source !== input.vault || transfer.destination === input.wallet;
-    if (!expectedWalletDestination || !expectedVaultDestination) {
-      throw new Error("transaction contains an unexplained native transfer");
-    }
+  if (
+    !hasOnlyAllowedNativeTransferEdges(input.transfers, [
+      { source: input.wallet, destination: input.vault },
+      { source: input.vault, destination: input.wallet },
+    ])
+  ) {
+    throw new Error("transaction contains an unexplained native transfer");
   }
 
   const signedLimitCost = quoteCostLamports(

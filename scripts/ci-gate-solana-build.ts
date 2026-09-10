@@ -1,4 +1,5 @@
-import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import {
@@ -19,22 +20,53 @@ const trackedArtifactPaths = [
   "packages/hyperbet-solana/keeper/src/idl",
   "packages/hyperbet-ui/src/idl",
   "packages/market-maker-bot/src/idl",
+  "packages/hyperbet-sdk/src/solana/idl",
+  "packages/hyperbet-sdk-py/hyperbet_sdk/solana/idl",
 ];
 
-function currentGitStatus(paths: string[]): string {
-  const result = spawnSync("git", ["status", "--short", "--", ...paths], {
-    cwd: rootDir,
-    encoding: "utf8",
-  });
+type ArtifactFingerprint = Map<string, string>;
 
-  if (result.status !== 0) {
-    throw new Error(
-      result.stderr?.trim() || "failed to inspect generated artifact status",
-    );
+function collectFiles(absolutePath: string): string[] {
+  const metadata = lstatSync(absolutePath);
+  if (metadata.isFile()) return [absolutePath];
+  if (!metadata.isDirectory()) {
+    throw new Error(`unsupported generated artifact path: ${absolutePath}`);
   }
-
-  return result.stdout.trim();
+  return readdirSync(absolutePath, { withFileTypes: true }).flatMap((entry) =>
+    collectFiles(path.join(absolutePath, entry.name)),
+  );
 }
+
+function fingerprintArtifacts(paths: readonly string[]): ArtifactFingerprint {
+  const fingerprint: ArtifactFingerprint = new Map();
+  for (const relativeRoot of paths) {
+    for (const absoluteFile of collectFiles(path.join(rootDir, relativeRoot))) {
+      const relativeFile = path.relative(rootDir, absoluteFile);
+      fingerprint.set(
+        relativeFile,
+        createHash("sha256").update(readFileSync(absoluteFile)).digest("hex"),
+      );
+    }
+  }
+  return fingerprint;
+}
+
+function describeFingerprintDrift(
+  before: ArtifactFingerprint,
+  after: ArtifactFingerprint,
+): string[] {
+  const files = new Set([...before.keys(), ...after.keys()]);
+  return [...files]
+    .sort((left, right) => left.localeCompare(right))
+    .filter((file) => before.get(file) !== after.get(file))
+    .map((file) => {
+      if (!before.has(file)) return `added ${file}`;
+      if (!after.has(file)) return `removed ${file}`;
+      return `changed ${file}`;
+    });
+}
+
+const artifactFingerprintBefore = fingerprintArtifacts(trackedArtifactPaths);
 
 try {
   await runCommand("bun", ["run", "--cwd", anchorRoot, "build"], {
@@ -42,13 +74,16 @@ try {
     stderrFile: buildLogPath,
   });
 
-  const artifactStatus = currentGitStatus(trackedArtifactPaths);
-  if (artifactStatus) {
+  const artifactDrift = describeFingerprintDrift(
+    artifactFingerprintBefore,
+    fingerprintArtifacts(trackedArtifactPaths),
+  );
+  if (artifactDrift.length > 0) {
     throw new Error(
       [
-        "Solana build generated tracked artifact drift.",
-        "Commit the updated Solana build artifacts before CI runtime gates consume them.",
-        artifactStatus,
+        "Solana build changed canonical generated artifacts.",
+        "Regenerate and review the artifacts, then rerun the gate from that stable state.",
+        ...artifactDrift,
       ].join("\n"),
     );
   }

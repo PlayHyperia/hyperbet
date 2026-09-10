@@ -1,5 +1,43 @@
 import type { PredictionMarketLifecycleStatus } from "./solanaLifecycle";
 
+export type ManagedLiquiditySubmissionDisposition = "replan" | "market-closed";
+
+function anchorErrorCode(error: unknown): string | null {
+  if (!error || typeof error !== "object") return null;
+  const candidate = error as {
+    errorCode?: { code?: unknown };
+    error?: { errorCode?: { code?: unknown } };
+  };
+  const code = candidate.error?.errorCode?.code ?? candidate.errorCode?.code;
+  return typeof code === "string" ? code : null;
+}
+
+export function classifyManagedLiquiditySubmissionError(
+  error: unknown,
+): ManagedLiquiditySubmissionDisposition | null {
+  const code = anchorErrorCode(error);
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (
+    code === "PostOnlyWouldCross" ||
+    code === "InvalidOrderId" ||
+    message.includes("PostOnlyWouldCross") ||
+    message.includes("InvalidOrderId")
+  ) {
+    return "replan";
+  }
+  if (
+    code === "MarketNotOpen" ||
+    code === "BettingClosed" ||
+    code === "MarketAlreadyResolved" ||
+    message.includes("MarketNotOpen") ||
+    message.includes("BettingClosed") ||
+    message.includes("MarketAlreadyResolved")
+  ) {
+    return "market-closed";
+  }
+  return null;
+}
+
 export interface MarketMakerConfig {
   targetSpreadBps: number;
   toxicSpreadMultiplier: number;
@@ -109,6 +147,22 @@ export interface QuoteDecision {
   reason: string | null;
 }
 
+export type ManagedMarketMakerSettlementAction =
+  "claim" | "close-losing-balance" | "close-empty-balance" | "none";
+
+export interface ManagedMarketMakerSettlementInput {
+  lifecycleStatus: "RESOLVED" | "CANCELLED";
+  winner: "A" | "B" | null;
+  balance: {
+    aShares: bigint;
+    bShares: bigint;
+    aLockedLamports: bigint;
+    bLockedLamports: bigint;
+    tradeTreasuryFeeLamports: bigint;
+    tradeMarketMakerFeeLamports: bigint;
+  } | null;
+}
+
 export const DEFAULT_MARKET_MAKER_CONFIG: MarketMakerConfig = {
   targetSpreadBps: 200,
   toxicSpreadMultiplier: 2,
@@ -131,6 +185,35 @@ export const DEFAULT_MARKET_MAKER_CONFIG: MarketMakerConfig = {
   betCloseGuardMs: 5_000,
   inventorySkewBps: 750,
 };
+
+export function resolveManagedMarketMakerSettlement(
+  input: ManagedMarketMakerSettlementInput,
+): ManagedMarketMakerSettlementAction {
+  if (!input.balance) return "none";
+  const values = Object.values(input.balance);
+  if (values.some((value) => typeof value !== "bigint" || value < 0n)) {
+    throw new Error("market-maker settlement balance is invalid");
+  }
+  const [aShares, bShares, aLocked, bLocked, treasuryFees, makerFees] = values;
+  const hasBalance = values.some((value) => value > 0n);
+  if (!hasBalance) return "close-empty-balance";
+
+  if (input.lifecycleStatus === "CANCELLED") {
+    const refundable = aLocked + bLocked + treasuryFees + makerFees;
+    if (refundable <= 0n) {
+      throw new Error(
+        "cancelled market-maker balance has shares without refundable custody",
+      );
+    }
+    return "claim";
+  }
+
+  if (input.winner !== "A" && input.winner !== "B") {
+    throw new Error("resolved market-maker settlement is missing a winner");
+  }
+  const winningShares = input.winner === "A" ? aShares : bShares;
+  return winningShares > 0n ? "claim" : "close-losing-balance";
+}
 
 export function clampPrice(
   value: number,

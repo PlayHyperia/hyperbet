@@ -29,21 +29,32 @@ describe("SolanaManagedOrderConfirmationDialog", () => {
   it("shows exact cancellation terms and invokes explicit actions", () => {
     let backedOut = false;
     let confirmed = false;
+    let escapedToParent = false;
     const { container } = render(
-      <SolanaManagedOrderConfirmationDialog
-        order={order}
-        onBack={() => {
-          backedOut = true;
+      <div
+        onKeyDown={(event) => {
+          if (event.key === "Escape") escapedToParent = true;
         }}
-        onConfirm={() => {
-          confirmed = true;
-        }}
-      />,
+      >
+        <SolanaManagedOrderConfirmationDialog
+          order={order}
+          onBack={() => {
+            backedOut = true;
+          }}
+          onConfirm={() => {
+            confirmed = true;
+          }}
+        />
+      </div>,
     );
 
     const dialog = getByTestId(container, "solana-managed-order-confirmation");
     expect(dialog.getAttribute("role")).toBe("dialog");
     expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.style.maxHeight).toBe("min(calc(100dvh - 32px), 720px)");
+    expect(dialog.style.overflowY).toBe("auto");
+    expect(dialog.style.overscrollBehavior).toBe("contain");
+    expect(dialog.style.boxSizing).toBe("border-box");
     expect(container.textContent).toContain("Confirm order cancellation");
     expect(container.textContent).toContain("YES 60.0%");
     expect(container.textContent).toContain("1.5");
@@ -56,8 +67,32 @@ describe("SolanaManagedOrderConfirmationDialog", () => {
     expect(container.textContent).toContain(
       "shared PriceLevel rent is excluded",
     );
-    click(getByTestId(container, "solana-managed-order-confirmation-back"));
-    click(getByTestId(container, "solana-managed-order-confirmation-submit"));
+    const backButton = getByTestId(
+      container,
+      "solana-managed-order-confirmation-back",
+    ) as HTMLButtonElement;
+    const confirmButton = getByTestId(
+      container,
+      "solana-managed-order-confirmation-submit",
+    ) as HTMLButtonElement;
+    expect(document.activeElement).toBe(backButton);
+    expect(backButton.style.minHeight).toBe("44px");
+    expect(document.activeElement).not.toBe(confirmButton);
+    expect(confirmButton.style.minHeight).toBe("44px");
+    expect(
+      dialog.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    ).toBe(false);
+    expect(backedOut).toBe(true);
+    expect(escapedToParent).toBe(false);
+    backedOut = false;
+    click(backButton);
+    click(confirmButton);
     expect(backedOut).toBe(true);
     expect(confirmed).toBe(true);
   });

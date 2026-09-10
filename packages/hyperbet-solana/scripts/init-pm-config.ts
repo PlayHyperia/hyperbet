@@ -24,6 +24,8 @@ import {
 import { resolveStageAWalletPath } from "./stage-a-identity";
 import { describeRpcEndpoint } from "./solana-deployment-evidence";
 import { fetchSolanaProgramDeploymentIdentity } from "./solana-deployment-identity";
+import { FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION } from "../account-schema";
+import { evaluateFightOracleAccountSchema } from "./solana-account-schema";
 import {
   resolveSolanaDuelLaunchConfig,
   serializeSolanaDuelLaunchConfig,
@@ -38,6 +40,7 @@ interface OracleConfigAccount {
   disputeWindowSecs: BN;
   paused: boolean;
   configFrozen: boolean;
+  accountSchemaVersion: number;
 }
 
 interface MarketConfigAccount {
@@ -155,6 +158,7 @@ function oracleStateMatches(
   config: SolanaDuelLaunchConfig,
 ): boolean {
   return (
+    existing.accountSchemaVersion === FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION &&
     existing.authority.equals(authority) &&
     existing.reporter.equals(config.reporter) &&
     existing.finalizer.equals(config.finalizer) &&
@@ -430,6 +434,13 @@ async function main(): Promise<void> {
       requireDeployed: true,
     }),
   ]);
+  evaluateFightOracleAccountSchema({
+    programId: oracleProgramId,
+    oracleConfigAccount: await connection.getAccountInfo(
+      deriveOracleConfigPda(oracleProgramId),
+      "finalized",
+    ),
+  });
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const anchorRoot = path.join(path.resolve(__dirname, ".."), "anchor");

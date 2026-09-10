@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "caseId": "hype",
+  "sourceSeed": "0x48595045",
+  "failureFingerprint": "AssertionError|none|fixture vault liability drift",
+  "originalRandomWordCount": 256,
+  "reducedRandomWords": [1, 2, 3, 5, 8],
+  "openActionCount": 9,
+  "actionTrace": ["place:1", "cancel:1"]
+}

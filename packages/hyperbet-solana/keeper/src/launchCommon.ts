@@ -12,6 +12,7 @@ import {
 } from "@solana/web3.js";
 import dotenv from "dotenv";
 
+import { FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION } from "../../account-schema";
 import { resolveSolanaV1Deployment } from "../../deployments/v1";
 import fightOracleIdl from "./idl/fight_oracle.json";
 import type { FightOracle } from "./idl/fight_oracle";
@@ -89,7 +90,16 @@ export function getSenderUrl(): string | null {
 }
 
 function redactUrl(url: string): string {
-  return url.replace(/api-key=[^&]+/g, "api-key=***");
+  return url
+    .replace(
+      /([?&](?:api[-_]?key|token|secret|authorization|credential)=)[^&#\s]*/gi,
+      "$1***",
+    )
+    .replace(/(authorization:\s*bearer\s+)[^\s,;]+/gi, "$1***")
+    .replace(
+      /((?:api[-_]?key|token|secret|credential)\s*[=:]\s*)[^\s,&;]+/gi,
+      "$1***",
+    );
 }
 
 export function sanitizeErrorMessage(error: unknown): string {
@@ -183,9 +193,10 @@ export function findOracleConfigPda(programId: PublicKey): PublicKey {
 }
 
 export const DUEL_WINNER_MARKET_KIND = 1;
+export { FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION };
 export const SIDE_BID = 1;
 export const SIDE_ASK = 2;
-export const ORDER_BEHAVIOR_GTC = 0;
+export const ORDER_BEHAVIOR_POST_ONLY = 2;
 
 function u64LeBuffer(value: bigint | number): Buffer {
   const buffer = Buffer.alloc(8);

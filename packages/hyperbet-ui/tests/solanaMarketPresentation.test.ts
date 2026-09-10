@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-import { deriveTwoSidedClobProbabilityPercent } from "../src/lib/solanaMarketPresentation";
+import {
+  deriveTwoSidedClobProbabilityPercent,
+  shouldRenderSolanaClobStatusRow,
+} from "../src/lib/solanaMarketPresentation";
 
 describe("Solana CLOB market presentation", () => {
   test("derives the midpoint only from a valid two-sided quote", () => {
@@ -21,5 +24,26 @@ describe("Solana CLOB market presentation", () => {
     expect(deriveTwoSidedClobProbabilityPercent(500.5, 600)).toBeNull();
     expect(deriveTwoSidedClobProbabilityPercent(-1, 600)).toBeNull();
     expect(deriveTwoSidedClobProbabilityPercent(500, 1_001)).toBeNull();
+  });
+
+  test("does not repeat an authoritative unavailable message below the market card", () => {
+    expect(
+      shouldRenderSolanaClobStatusRow({
+        orderEntryAvailable: false,
+        tradingUnavailableMessage: "Betting is temporarily unavailable.",
+      }),
+    ).toBe(false);
+    expect(
+      shouldRenderSolanaClobStatusRow({
+        orderEntryAvailable: false,
+        tradingUnavailableMessage: "  ",
+      }),
+    ).toBe(true);
+    expect(
+      shouldRenderSolanaClobStatusRow({
+        orderEntryAvailable: true,
+        tradingUnavailableMessage: "Betting is temporarily unavailable.",
+      }),
+    ).toBe(true);
   });
 });

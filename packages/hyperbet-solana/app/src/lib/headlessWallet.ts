@@ -15,11 +15,99 @@ const HEADLESS_ICON =
 const E2E_REJECT_NEXT_SIGNATURE_KEY =
   "hyperbet.e2e.reject-next-wallet-signature";
 
+export const LOCAL_E2E_WALLET_APPROVAL = Object.freeze({
+  requests: "hyperbet.e2e.wallet-signature-requests",
+  pauseNext: "hyperbet.e2e.pause-next-wallet-signature",
+  pending: "hyperbet.e2e.pending-wallet-signature",
+  releaseEvent: "hyperbet:e2e:release-wallet-signature",
+  cancelEvent: "hyperbet:e2e:cancel-wallet-signature",
+});
+
+// This is the local test wallet's approval UI boundary, not a production
+// wallet bypass. Expiration rejects; only an explicit matching release signs.
+export async function requestLocalE2eWalletSignatureApproval(input: {
+  mode: string;
+  hostname: string | null;
+  storage: Pick<Storage, "getItem" | "setItem" | "removeItem">;
+  events: EventTarget;
+  timeoutMs?: number;
+}): Promise<void> {
+  if (!isHeadlessWalletRuntimeAllowed(input)) return;
+  const timeoutMs = input.timeoutMs ?? 45_000;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
+    throw new Error("Local E2E wallet approval deadline is invalid");
+  }
+  const keys = LOCAL_E2E_WALLET_APPROVAL;
+  const rawCount = input.storage.getItem(keys.requests) ?? "0";
+  const previousCount = Number(rawCount);
+  if (
+    !/^(0|[1-9][0-9]*)$/.test(rawCount) ||
+    !Number.isSafeInteger(previousCount) ||
+    previousCount >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw new Error("Local E2E wallet request counter is invalid");
+  }
+  const requestId = String(previousCount + 1);
+  input.storage.setItem(keys.requests, requestId);
+  if (input.storage.getItem(keys.pending) !== null) {
+    throw new Error("Local E2E wallet already has a pending approval");
+  }
+  if (input.storage.getItem(keys.pauseNext) !== "1") return;
+  input.storage.removeItem(keys.pauseNext);
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      input.events.removeEventListener(keys.releaseEvent, release);
+      input.events.removeEventListener(keys.cancelEvent, cancel);
+      input.storage.removeItem(keys.pending);
+    };
+    const release = (event: Event) => {
+      if (!("detail" in event) || event.detail !== requestId) return;
+      cleanup();
+      resolve();
+    };
+    const cancel = (event: Event) => {
+      if (!("detail" in event) || event.detail !== requestId) return;
+      cleanup();
+      reject(new Error("Local E2E wallet approval cancelled"));
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Local E2E wallet approval timed out"));
+    }, timeoutMs);
+    input.events.addEventListener(keys.releaseEvent, release);
+    input.events.addEventListener(keys.cancelEvent, cancel);
+    input.storage.setItem(keys.pending, requestId);
+  });
+}
+
 type HeadlessWalletEntry = {
   name?: string;
   secretKey: string;
   autoConnect?: boolean;
 };
+
+export function isHeadlessWalletRuntimeAllowed(input: {
+  mode: string;
+  hostname: string | null;
+}): boolean {
+  if (input.mode !== "e2e" || input.hostname === null) return false;
+  const hostname = input.hostname.trim().toLowerCase();
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname === "[::1]"
+  );
+}
+
+function isLocalE2eWalletRuntime(): boolean {
+  return isHeadlessWalletRuntimeAllowed({
+    mode: import.meta.env.MODE,
+    hostname: typeof window === "undefined" ? null : window.location.hostname,
+  });
+}
 
 export type HeadlessWalletDescriptor = {
   autoConnect: boolean;
@@ -42,7 +130,7 @@ function keypairFromSecret(secretKey: Uint8Array): Keypair {
 }
 
 function shouldRejectNextE2eSignature(): boolean {
-  if (import.meta.env.MODE !== "e2e" || typeof window === "undefined") {
+  if (!isLocalE2eWalletRuntime()) {
     return false;
   }
   if (window.sessionStorage.getItem(E2E_REJECT_NEXT_SIGNATURE_KEY) !== "1") {
@@ -110,6 +198,7 @@ function parseSecretKey(secret: string): Uint8Array {
 }
 
 function parseHeadlessWalletEntries(): HeadlessWalletEntry[] {
+  if (!isLocalE2eWalletRuntime()) return [];
   const fromJson = CONFIG.headlessWalletsJson.trim();
   if (!fromJson) {
     const legacySecret = CONFIG.headlessWalletSecretKey.trim();
@@ -195,12 +284,18 @@ function createHeadlessSession(
     signMessage: async (message: Uint8Array) =>
       ed25519.sign(message, keypair.secretKey.slice(0, 32)),
     signTransaction: async (transaction) => {
+      await requestLocalE2eWalletSignatureApproval({
+        mode: import.meta.env.MODE,
+        hostname:
+          typeof window === "undefined" ? null : window.location.hostname,
+        storage: window.sessionStorage,
+        events: window,
+      });
       if (shouldRejectNextE2eSignature()) {
         throw new Error("User rejected the request");
       }
       const web3Transaction = transaction as unknown as
-        | Transaction
-        | VersionedTransaction;
+        Transaction | VersionedTransaction;
       if ("version" in web3Transaction) {
         web3Transaction.sign([keypair]);
       } else {

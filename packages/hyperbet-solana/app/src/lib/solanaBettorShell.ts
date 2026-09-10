@@ -22,6 +22,10 @@ export type SolanaBettorShellReason =
   | "verifying-market"
   | "market-open"
   | "market-locked"
+  | "duel-complete-settlement-pending"
+  | "duel-cancelled-settlement-pending"
+  | "result-proposed"
+  | "result-challenged"
   | "settlement-available"
   | "refund-review";
 
@@ -54,11 +58,14 @@ export interface SolanaBettorShellInput {
   lifecycleMarket: {
     duelId?: string | null;
     duelKey?: string | null;
+    marketRef?: string | null;
     lifecycleStatus?: string | null;
   } | null;
   marketSnapshot: {
     duelKeyHex?: string | null;
+    marketRef?: string | null;
     marketStatus?: string | null;
+    tradingReady?: boolean | null;
   } | null;
 }
 
@@ -82,6 +89,51 @@ export interface SolanaBettorShellState {
     | "Review Refund"
     | "View Activity"
     | "Betting unavailable";
+}
+
+/**
+ * Once the interactive market has mounted, keep it mounted for the lifetime of
+ * the page. Authority/readiness changes still fail closed through
+ * `canPlaceBet`, but retaining the component preserves submitted transaction
+ * receipts, recovery actions, and managed-order state through brief feed or
+ * keeper interruptions.
+ */
+export function retainSolanaMarketPanelSession(input: {
+  retained: boolean;
+  canAccessMarketPanel: boolean;
+}): boolean {
+  return input.retained || input.canAccessMarketPanel;
+}
+
+export type SolanaProgramDeploymentSnapshot = {
+  checked: boolean;
+  cluster: boolean;
+  oracle: boolean;
+  market: boolean;
+  verifiedAtMs: number | null;
+};
+
+export function isSolanaProgramDeploymentReady(input: {
+  snapshot: SolanaProgramDeploymentSnapshot;
+  nowMs: number;
+  maxAgeMs: number;
+}): boolean {
+  const { snapshot, nowMs, maxAgeMs } = input;
+  if (
+    !snapshot.checked ||
+    !snapshot.cluster ||
+    !snapshot.oracle ||
+    !snapshot.market ||
+    snapshot.verifiedAtMs === null ||
+    !Number.isFinite(snapshot.verifiedAtMs) ||
+    !Number.isFinite(nowMs) ||
+    !Number.isFinite(maxAgeMs) ||
+    maxAgeMs <= 0
+  ) {
+    return false;
+  }
+  const ageMs = nowMs - snapshot.verifiedAtMs;
+  return ageMs >= 0 && ageMs <= maxAgeMs;
 }
 
 export function getSolanaBettorShellMessage(
@@ -112,6 +164,14 @@ export function getSolanaBettorShellMessage(
       return "Betting open.";
     case "market-locked":
       return "Betting locked.";
+    case "duel-complete-settlement-pending":
+      return "Duel complete. On-chain settlement is pending.";
+    case "duel-cancelled-settlement-pending":
+      return "Duel cancelled. On-chain settlement is pending.";
+    case "result-proposed":
+      return "Result proposed. Dispute window open.";
+    case "result-challenged":
+      return "Result challenged. Resolution pending.";
     case "settlement-available":
       return "Settlement available.";
     case "refund-review":
@@ -163,6 +223,16 @@ export function resolvePublicLegalDocumentUrls(
     pageOrigin,
   );
   return termsUrl && privacyUrl ? { termsUrl, privacyUrl } : null;
+}
+
+export function hasRequiredSolanaLegalDocuments(input: {
+  isLocalTestCluster: boolean;
+  legalDocumentUrls: { termsUrl: string; privacyUrl: string } | null;
+}): boolean {
+  // Localnet uses disposable test funds and cannot create a real-money
+  // transaction. Public clusters remain fail-closed until both legal
+  // documents resolve to accepted URLs.
+  return input.isLocalTestCluster || input.legalDocumentUrls !== null;
 }
 
 function normalizeText(value: string | null | undefined): string | null {
@@ -239,6 +309,7 @@ export function deriveSolanaBettorShellState(
     lifecycleIdentityMatches &&
     streamDuelKey === authoritativeDuelKey &&
     streamDuelId === authoritativeDuelId;
+  const phase = normalizeText(input.streamCycle?.phase)?.toUpperCase();
 
   const lifecycleAgent1Name = normalizeText(input.lifecycleDuel?.agent1Name);
   const lifecycleAgent2Name = normalizeText(input.lifecycleDuel?.agent2Name);
@@ -278,6 +349,8 @@ export function deriveSolanaBettorShellState(
   const snapshotDuelKey = normalizePredictionMarketDuelKeyHex(
     input.marketSnapshot?.duelKeyHex,
   );
+  const lifecycleMarketRef = normalizeText(input.lifecycleMarket?.marketRef);
+  const snapshotMarketRef = normalizeText(input.marketSnapshot?.marketRef);
   const snapshotMarketStatus = normalizeMarketStatus(
     input.marketSnapshot?.marketStatus,
   );
@@ -285,11 +358,14 @@ export function deriveSolanaBettorShellState(
     canOpenMarketPanel &&
     snapshotDuelKey !== null &&
     snapshotDuelKey === authoritativeDuelKey &&
+    lifecycleMarketRef !== null &&
+    snapshotMarketRef === lifecycleMarketRef &&
     ["open", "locked", "resolved", "cancelled"].includes(snapshotMarketStatus);
   const canPlaceBet =
     openMarketHasAuthority &&
     input.programsReady &&
     snapshotMatches &&
+    input.marketSnapshot?.tradingReady === true &&
     snapshotMarketStatus === "open";
 
   let mode: SolanaBettorShellMode = "unavailable";
@@ -325,9 +401,33 @@ export function deriveSolanaBettorShellState(
     mode = "tradeable";
     reason = "market-open";
     actionLabel = "Place Bet";
-  } else if (["LOCKED", "PROPOSED", "CHALLENGED"].includes(lifecycleStatus)) {
+  } else if (
+    lifecycleStatus === "LOCKED" &&
+    streamMatchesLifecycle &&
+    phase === "RESOLUTION"
+  ) {
+    mode = "locked";
+    reason = "duel-complete-settlement-pending";
+    actionLabel = "View Market";
+  } else if (
+    lifecycleStatus === "LOCKED" &&
+    streamMatchesLifecycle &&
+    phase === "CANCELLED"
+  ) {
+    mode = "locked";
+    reason = "duel-cancelled-settlement-pending";
+    actionLabel = "View Market";
+  } else if (lifecycleStatus === "LOCKED") {
     mode = "locked";
     reason = "market-locked";
+    actionLabel = "View Market";
+  } else if (lifecycleStatus === "PROPOSED") {
+    mode = "locked";
+    reason = "result-proposed";
+    actionLabel = "View Market";
+  } else if (lifecycleStatus === "CHALLENGED") {
+    mode = "locked";
+    reason = "result-challenged";
     actionLabel = "View Market";
   } else if (lifecycleStatus === "RESOLVED") {
     mode = "settlement";
@@ -348,7 +448,6 @@ export function deriveSolanaBettorShellState(
     actionLabel = "View Activity";
   }
 
-  const phase = normalizeText(input.streamCycle?.phase)?.toUpperCase();
   const activityLabel =
     streamMatchesLifecycle && phase === "FIGHTING"
       ? "LIVE"

@@ -6,32 +6,24 @@ import path from "node:path";
 import { type Program } from "@coral-xyz/anchor";
 import {
   normalizePredictionMarketLifecycleMetadata,
+  resolveCurrentSolanaLifecycleAuthority,
   type PredictionMarketLifecycleStatus,
-  resolveLifecycleFromSolanaDuelStatus,
-  resolveLifecycleFromSolanaMarketStatus,
-  resolveLifecycleFromStreamPhase,
   toRecordedBetChain,
   type PredictionMarketLifecycleRecord,
   type PredictionMarketWinner,
   type RecordedBetChain,
 } from "./solanaLifecycle";
 import {
+  collectActiveKeeperCorrelationIds,
   mergePredictionMarketsWithHealth,
   type KeeperBotHealthSnapshot,
-  type KeeperMarketHealthRecord,
 } from "./launchHealth";
 import {
   findUnsupportedJsonRpcMethod,
   isWriteRateLimitedRoute,
   PUBLIC_SOLANA_RPC_READ_METHODS,
 } from "./solanaRpcProxyPolicy";
-import {
-  type Connection,
-  PublicKey,
-  SystemProgram,
-  Transaction,
-  VersionedTransaction,
-} from "@solana/web3.js";
+import { type Connection, PublicKey, SystemProgram } from "@solana/web3.js";
 import {
   createReadOnlyLaunchPrograms,
   duelKeyHexToBytes,
@@ -46,6 +38,7 @@ import {
   findPriceLevelPda,
   findUserBalancePda,
   getSenderUrl,
+  sanitizeErrorMessage,
   DUEL_MARKET_PROGRAM_ID,
 } from "./launchCommon";
 import type { FightOracle } from "./idl/fight_oracle";
@@ -67,6 +60,7 @@ import {
   saveReferral,
   saveInvitedWallet,
 } from "./db";
+import { duelIdFromMetadata } from "./marketRecovery";
 import {
   evaluateKeeperReadiness,
   isAuthoritativeStreamSnapshot,
@@ -86,9 +80,26 @@ import {
   normalizePointsWalletInput,
 } from "./walletKeys";
 import { normalizeSolanaWalletKey } from "./solanaWallet";
+import { exactBytes32Hex as bytes32Hex } from "./exactBytes32";
+import {
+  exactInstructionAccountAddresses as extractInstructionAccounts,
+  exactSolanaPublicKeyAddress,
+  exactTransactionSignerAddresses,
+} from "./solanaInstructionAccounts";
+import { exactInnerInstructionGroups } from "./solanaInnerInstructions";
+import { decodeExactNativeTransferInstruction } from "./solanaNativeTransfer";
+import { decodeExactProgramDataEvents } from "./solanaProgramEvents";
+import { digestFinalizedSolanaTransaction } from "./solanaTransactionDigest";
+import {
+  toSafeIntegerLike as toNumberLike,
+  toU64Like as toBigIntLike,
+} from "./solanaSafeInteger";
 import {
   classifySignatureFinality,
   decodePlaceOrderInstructionData,
+  exactPrimarySolanaTransactionSignature,
+  exactSolanaTransactionSignatures,
+  hasOnlyAllowedNativeTransferEdges,
   isCanonicalSolanaTransactionSignature,
   quoteCostLamports,
   requiresFinalizedBetVerification,
@@ -102,16 +113,42 @@ import {
   type VerifiedPlaceOrderAccounting,
 } from "./solanaBetAccounting";
 import {
+  resolveExternalBetVerificationFailure,
+  type ExternalBetVerificationFailureCode,
+} from "./externalBetVerificationPolicy";
+import {
   fetchUpgradeableProgramIdentity,
-  resolveExpectedUpgradeAuthority,
+  resolveClusterExpectedUpgradeAuthority,
   type ExpectedUpgradeAuthority,
 } from "./solanaProgramIdentity";
+import { evaluateSolanaLifecyclePendingState } from "./solanaLifecyclePendingPolicy";
+import {
+  requireCanonicalCancellationAdjacencyAccounts,
+  requireCanonicalInstructionAccountCardinality,
+  requireClassifiedMarketEvents,
+  requireClassifiedMarketInstructions,
+  requireExactLifecycleEventCoverage,
+  requireExactMarketSyncCoverage,
+  requireOwnedLifecycleExecutionEvents,
+  requireUniqueLifecycleExecutionIdentities,
+} from "./solanaLifecycleInstructionIdentity";
+import {
+  requireCanonicalLifecycleMarketIdentity,
+  requireCanonicalMarketCreationIdentity,
+} from "./solanaLifecycleMarketIdentity";
+import { extractAttributedProgramDataLogs } from "./solanaProgramLogAttribution";
 import {
   collectFinalizedSignatureBackfill,
+  digestFailedFinalizedTransaction,
+  hasExactSuccessfulFinalizedTransactionMeta,
+  MAX_FINALIZED_SIGNATURE_PAGES,
+  MAX_FINALIZED_SIGNATURE_PAGE_SIZE,
   normalizeLifecycleFact,
-  resolveLifecycleIndexStartSlot,
+  requireExactFinalizedBlockTimeParity,
+  resolveClusterLifecycleIndexStartSlot,
   unitsReleasedByVaultRefund,
   verifyClaimLifecycleAccounting,
+  verifyClaimTransferEvidence,
   verifyLosingBalanceCleanupAccounting,
   type SignaturePageEntry,
   type SolanaLifecycleFact,
@@ -120,18 +157,71 @@ import {
   extractStreamStateSourceEvents,
   resolveStreamStateEventsUrl,
 } from "./streamStateSourceSse";
+import {
+  resolveAcceptedStreamCursor,
+  shouldAcceptStreamStateCandidate,
+} from "./streamStateCandidatePolicy";
+import {
+  createInitialStreamSourceAvailability,
+  isStreamSourceAvailable,
+  transitionStreamSourceAvailability,
+} from "./streamSourceAvailability";
+import releaseManifest from "./release-manifest.json";
+import { resolveKeeperReleaseIdentity } from "./releaseIdentity";
+import {
+  fetchKeeperBotHealthSnapshot,
+  resolveKeeperBotHealthSourceConfig,
+} from "./botHealthTransport";
+import { assertServiceRuntimeIsolation } from "./runtimeRolePolicy";
+import { refreshSyntheticStreamHeartbeat } from "./streamStateHeartbeat";
+import {
+  parsePublicPreparationSummary,
+  type PublicPreparationSummary,
+} from "./publicPreparation";
+import {
+  buildFederatedOperatorReadiness,
+  classifyStreamingOperatorFailure,
+  fetchStreamingOperatorMetrics,
+  resolveStreamingOperatorSourceConfig,
+  type StreamingOperatorFailureCode,
+  type StreamingOperatorMetrics,
+} from "./streamOperatorHealth";
+import {
+  OperatorAlertDispatcher,
+  resolveOperatorAlertConfig,
+} from "./operatorAlertDispatcher";
+import {
+  hasExactSecretHeader,
+  isAllowedAppOrigin,
+  resolveClientIdentity,
+  resolveServiceHttpPolicy,
+} from "./serviceHttpPolicy";
+import {
+  decodeSenderTransaction,
+  isWhitelistedSenderTransaction,
+} from "./solanaSenderProxyPolicy";
+import { resolveSolanaProxyRail } from "./solanaProxyRailPolicy";
+import { verifySolanaWalletActionProof } from "./solanaWalletActionProof";
+import {
+  loadOperatorAlertDurableState,
+  persistOperatorAlertDurableState,
+} from "./operatorAlertStateStore";
+import { resolveKeeperRuntimeIdentity } from "./runtimeIdentity";
 
 type StreamState = {
   type: "STREAMING_STATE_UPDATE";
   cycle: Record<string, unknown>;
   leaderboard: unknown[];
   cameraTarget: string | null;
+  preparation: PublicPreparationSummary | null;
   seq: number;
   emittedAt: number;
 };
 
 type BetRecord = {
   id: string;
+  cluster: ServiceSolanaCluster;
+  programId: string;
   bettorWallet: string;
   chain: RecordedBetChain;
   sourceAsset: "SOL";
@@ -194,37 +284,122 @@ const KEEPER_STREAM_STATE_FILE = (
   process.env.KEEPER_STREAM_STATE_FILE ||
   path.resolve(keeperRoot, ".status", "stream-state.json")
 ).trim();
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
-const SERVICE_SOLANA_CLUSTER = (
-  process.env.SOLANA_CLUSTER ||
-  process.env.CLUSTER ||
-  "mainnet-beta"
-)
-  .trim()
-  .toLowerCase();
-const SERVICE_IS_MAINNET =
-  SERVICE_SOLANA_CLUSTER === "mainnet" ||
-  SERVICE_SOLANA_CLUSTER === "mainnet-beta";
+const OPERATOR_ALERT_STATE_FILE = (
+  process.env.HYPERBET_OPERATOR_ALERT_STATE_FILE ||
+  path.resolve(keeperRoot, ".status", "operator-alert-state.json")
+).trim();
+const HTTP_POLICY = resolveServiceHttpPolicy(process.env);
+// Staging carries the same money-moving authority and must fail closed exactly
+// like production. Keep the existing name to avoid weakening downstream gates.
+const IS_PRODUCTION = HTTP_POLICY.deployment;
+assertServiceRuntimeIsolation({
+  production: IS_PRODUCTION,
+  runtimeRole: process.env.HYPERBET_RUNTIME_ROLE,
+  environment: process.env,
+});
+const KEEPER_RELEASE_IDENTITY = resolveKeeperReleaseIdentity(
+  releaseManifest,
+  process.env.HYPERBET_RELEASE_SHA,
+);
+const KEEPER_BOT_HEALTH_SOURCE = resolveKeeperBotHealthSourceConfig({
+  production: IS_PRODUCTION,
+  sourceUrl: process.env.KEEPER_BOT_HEALTH_URL,
+  bearerToken: process.env.KEEPER_BOT_HEALTH_BEARER_TOKEN,
+  timeoutMs: Number(process.env.KEEPER_BOT_HEALTH_TIMEOUT_MS || 3_000),
+});
+const KEEPER_BOT_HEALTH_POLL_MS = readPositiveEnvInteger(
+  "KEEPER_BOT_HEALTH_POLL_MS",
+  2_000,
+  1_000,
+);
+let remoteKeeperBotHealthSnapshot: KeeperBotHealthSnapshot | null = null;
+let remoteKeeperBotHealthLastPollAt: number | null = null;
+let remoteKeeperBotHealthLastSuccessAt: number | null = null;
+let remoteKeeperBotHealthLastError: string | null = null;
+type ServiceSolanaCluster = "localnet" | "devnet" | "testnet" | "mainnet-beta";
+
+function normalizeServiceSolanaCluster(value: string): ServiceSolanaCluster {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "mainnet") return "mainnet-beta";
+  if (
+    normalized === "localnet" ||
+    normalized === "devnet" ||
+    normalized === "testnet" ||
+    normalized === "mainnet-beta"
+  ) {
+    return normalized;
+  }
+  throw new Error("SOLANA_CLUSTER must name a supported canonical cluster");
+}
+
+const SERVICE_SOLANA_CLUSTER = normalizeServiceSolanaCluster(
+  process.env.SOLANA_CLUSTER || process.env.CLUSTER || "mainnet-beta",
+);
+const SERVICE_RUNTIME_IDENTITY = resolveKeeperRuntimeIdentity({
+  role: "service",
+  cluster: SERVICE_SOLANA_CLUSTER,
+  fightOracleProgramId: FIGHT_ORACLE_PROGRAM_ID.toBase58(),
+  duelMarketProgramId: DUEL_MARKET_PROGRAM_ID.toBase58(),
+});
+const EXPECTED_DUEL_BOT_RUNTIME_IDENTITY = resolveKeeperRuntimeIdentity({
+  ...SERVICE_RUNTIME_IDENTITY,
+  role: "duel-bot",
+});
+const OPERATOR_ALERT_CONFIG = resolveOperatorAlertConfig({
+  production: IS_PRODUCTION,
+  cluster: SERVICE_SOLANA_CLUSTER,
+  environment: process.env,
+});
+const operatorAlertInitialState = OPERATOR_ALERT_CONFIG.enabled
+  ? loadOperatorAlertDurableState({
+      statePath: OPERATOR_ALERT_STATE_FILE,
+      routeId: OPERATOR_ALERT_CONFIG.routeId,
+    })
+  : null;
+const operatorAlertDispatcher = new OperatorAlertDispatcher(
+  OPERATOR_ALERT_CONFIG,
+  {
+    initialState: operatorAlertInitialState,
+    persistState: OPERATOR_ALERT_CONFIG.enabled
+      ? (state) =>
+          persistOperatorAlertDurableState(OPERATOR_ALERT_STATE_FILE, state)
+      : undefined,
+  },
+);
+if (OPERATOR_ALERT_CONFIG.enabled && !operatorAlertInitialState) {
+  persistOperatorAlertDurableState(
+    OPERATOR_ALERT_STATE_FILE,
+    operatorAlertDispatcher.durableState(),
+  );
+}
 const REQUIRE_ONCHAIN_BET_VERIFICATION = requiresFinalizedBetVerification({
   nodeEnv: process.env.NODE_ENV,
   cluster: SERVICE_SOLANA_CLUSTER,
 });
-const SOLANA_LIFECYCLE_INDEX_PAGE_SIZE = Math.min(
-  1_000,
-  readPositiveEnvInteger("SOLANA_LIFECYCLE_INDEX_PAGE_SIZE", 250, 1),
+const SOLANA_LIFECYCLE_INDEX_PAGE_SIZE = readBoundedEnvInteger(
+  "SOLANA_LIFECYCLE_INDEX_PAGE_SIZE",
+  250,
+  1,
+  MAX_FINALIZED_SIGNATURE_PAGE_SIZE,
 );
-const SOLANA_LIFECYCLE_INDEX_MAX_PAGES = readPositiveEnvInteger(
+const SOLANA_LIFECYCLE_INDEX_MAX_PAGES = readBoundedEnvInteger(
   "SOLANA_LIFECYCLE_INDEX_MAX_PAGES",
   25,
   1,
+  MAX_FINALIZED_SIGNATURE_PAGES,
 );
-const SOLANA_LIFECYCLE_INDEX_BATCH_SIZE = readPositiveEnvInteger(
+const MAX_SOLANA_LIFECYCLE_INDEX_TRANSACTIONS_PER_RUN = 1_000;
+const SOLANA_LIFECYCLE_INDEX_BATCH_SIZE = readBoundedEnvInteger(
   "SOLANA_LIFECYCLE_INDEX_BATCH_SIZE",
   250,
   1,
+  MAX_SOLANA_LIFECYCLE_INDEX_TRANSACTIONS_PER_RUN,
 );
 
 function loadKeeperBotHealthSnapshot(): KeeperBotHealthSnapshot | null {
+  if (KEEPER_BOT_HEALTH_SOURCE) {
+    return remoteKeeperBotHealthSnapshot;
+  }
   if (!KEEPER_BOT_HEALTH_FILE || !fs_node.existsSync(KEEPER_BOT_HEALTH_FILE)) {
     return null;
   }
@@ -239,6 +414,38 @@ function loadKeeperBotHealthSnapshot(): KeeperBotHealthSnapshot | null {
   } catch (error) {
     console.warn("[service] Failed to read keeper bot health snapshot:", error);
     return null;
+  }
+}
+
+async function pollKeeperBotHealthSource(): Promise<void> {
+  if (!KEEPER_BOT_HEALTH_SOURCE) return;
+  remoteKeeperBotHealthLastPollAt = Date.now();
+  try {
+    remoteKeeperBotHealthSnapshot = await fetchKeeperBotHealthSnapshot(
+      KEEPER_BOT_HEALTH_SOURCE,
+    );
+    remoteKeeperBotHealthLastSuccessAt = Date.now();
+    remoteKeeperBotHealthLastError = null;
+  } catch (error) {
+    remoteKeeperBotHealthLastError =
+      error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function pollStreamOperatorHealthSource(): Promise<void> {
+  if (!STREAM_OPERATOR_HEALTH_SOURCE || streamOperatorPollInFlight) return;
+  streamOperatorPollInFlight = true;
+  streamOperatorLastPollAt = Date.now();
+  try {
+    streamOperatorMetrics = await fetchStreamingOperatorMetrics(
+      STREAM_OPERATOR_HEALTH_SOURCE,
+    );
+    streamOperatorLastSuccessAt = Date.now();
+    streamOperatorLastFailureCode = null;
+  } catch (error) {
+    streamOperatorLastFailureCode = classifyStreamingOperatorFailure(error);
+  } finally {
+    streamOperatorPollInFlight = false;
   }
 }
 
@@ -287,6 +494,21 @@ function readPositiveEnvInteger(
   return Math.max(minimum, Math.floor(parsed));
 }
 
+function readBoundedEnvInteger(
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+  }
+  return parsed;
+}
+
 function readEnvBoolean(name: string, fallback: boolean): boolean {
   const raw = process.env[name]?.trim().toLowerCase();
   if (!raw) return fallback;
@@ -300,6 +522,13 @@ const STREAM_PUBLISH_KEY =
 const ITEM_MANIFEST_BASE_URL =
   process.env.ITEM_MANIFEST_BASE_URL?.trim() ||
   "https://assets.hyperia.club/manifests/items";
+const ITEM_MANIFEST_TIMEOUT_MS = readBoundedEnvInteger(
+  "ITEM_MANIFEST_TIMEOUT_MS",
+  5_000,
+  500,
+  15_000,
+);
+const ITEM_MANIFEST_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const STREAM_STATE_SOURCE = resolveStreamStateSourceConfig({
   production: IS_PRODUCTION,
   sourceUrl: process.env.STREAM_STATE_SOURCE_URL,
@@ -319,6 +548,12 @@ const STREAM_STATE_SOURCE_TIMEOUT_MS = Math.max(
   500,
   Number(process.env.STREAM_STATE_SOURCE_TIMEOUT_MS || 3_000),
 );
+const STREAM_OPERATOR_HEALTH_SOURCE = resolveStreamingOperatorSourceConfig({
+  production: IS_PRODUCTION,
+  streamStateSourceUrl: STREAM_STATE_SOURCE_URL,
+  bearerToken: STREAM_STATE_SOURCE_BEARER_TOKEN,
+  timeoutMs: STREAM_STATE_SOURCE_TIMEOUT_MS,
+});
 const STREAM_STATE_SOURCE_MAX_BACKOFF_MS = Math.max(
   STREAM_STATE_POLL_MS,
   Number(process.env.STREAM_STATE_SOURCE_MAX_BACKOFF_MS || 30_000),
@@ -356,42 +591,73 @@ const READINESS_PARSER_MAX_AGE_MS = readPositiveEnvInteger(
   30_000,
   5_000,
 );
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || "")
-  .split(",")
-  .map((value) => value.trim())
-  .filter(Boolean);
+const SOLANA_LIFECYCLE_PENDING_MAX_AGE_MS = readPositiveEnvInteger(
+  "SOLANA_LIFECYCLE_PENDING_MAX_AGE_MS",
+  120_000,
+  5_000,
+);
 const BET_STORE_LIMIT = Math.max(
   100,
   Number(process.env.BET_STORE_LIMIT || 5000),
 );
-const SOLANA_RPC_PROXY_URL = process.env.SOLANA_RPC_URL?.trim() || "";
-const SOLANA_SENDER_PROXY_URL = getSenderUrl();
-const SOLANA_RPC_PROXY_MAX_BODY_BYTES = Math.max(
-  1024,
-  Number(process.env.SOLANA_RPC_PROXY_MAX_BODY_BYTES || 1_000_000),
+const SOLANA_PROXY_RAIL = resolveSolanaProxyRail({
+  deployment: HTTP_POLICY.deployment,
+  cluster: SERVICE_SOLANA_CLUSTER,
+  rpcUrl: process.env.SOLANA_RPC_URL,
+  mainnetSenderUrl: getSenderUrl(),
+});
+const SOLANA_RPC_PROXY_URL = SOLANA_PROXY_RAIL.rpcUrl;
+const SOLANA_RPC_PROXY_MAX_BODY_BYTES = readBoundedEnvInteger(
+  "SOLANA_RPC_PROXY_MAX_BODY_BYTES",
+  256 * 1024,
+  1_024,
+  256 * 1024,
 );
+const SOLANA_RPC_PROXY_MAX_RESPONSE_BYTES = readBoundedEnvInteger(
+  "SOLANA_RPC_PROXY_MAX_RESPONSE_BYTES",
+  2 * 1024 * 1024,
+  64 * 1024,
+  4 * 1024 * 1024,
+);
+const SOLANA_SENDER_PROXY_MAX_RESPONSE_BYTES = readBoundedEnvInteger(
+  "SOLANA_SENDER_PROXY_MAX_RESPONSE_BYTES",
+  64 * 1024,
+  1_024,
+  256 * 1024,
+);
+const SOLANA_PROXY_TIMEOUT_MS = readBoundedEnvInteger(
+  "SOLANA_PROXY_TIMEOUT_MS",
+  10_000,
+  500,
+  30_000,
+);
+const SOLANA_SENDER_MAX_TRANSACTION_CHARS = 4_096;
 
-const READ_RATE_LIMIT_PER_MINUTE = readPositiveEnvInteger(
+const READ_RATE_LIMIT_PER_MINUTE = readBoundedEnvInteger(
   "READ_RATE_LIMIT_PER_MINUTE",
   IS_PRODUCTION ? 360 : 2_400,
   1,
+  10_000,
 );
-const READ_RATE_LIMIT_BURST = readPositiveEnvInteger(
+const READ_RATE_LIMIT_BURST = readBoundedEnvInteger(
   "READ_RATE_LIMIT_BURST",
   IS_PRODUCTION ? 180 : 1_200,
   1,
+  5_000,
 );
-const WRITE_RATE_LIMIT_PER_MINUTE = readPositiveEnvInteger(
+const WRITE_RATE_LIMIT_PER_MINUTE = readBoundedEnvInteger(
   "WRITE_RATE_LIMIT_PER_MINUTE",
   IS_PRODUCTION ? 120 : 600,
   1,
+  2_000,
 );
-const WRITE_RATE_LIMIT_BURST = readPositiveEnvInteger(
+const WRITE_RATE_LIMIT_BURST = readBoundedEnvInteger(
   "WRITE_RATE_LIMIT_BURST",
   IS_PRODUCTION ? 60 : 300,
   1,
+  500,
 );
-const DISABLE_RATE_LIMIT = readEnvBoolean("DISABLE_RATE_LIMIT", false);
+const DISABLE_RATE_LIMIT = HTTP_POLICY.rateLimitDisabled;
 
 const defaultAgentA = {
   id: "agent-a",
@@ -424,6 +690,7 @@ const initialStreamState = loadStreamStateSnapshot() ?? {
     { id: defaultAgentB.id, name: defaultAgentB.name, wins: 0, losses: 0 },
   ],
   cameraTarget: null,
+  preparation: null,
   seq: 1,
   emittedAt: Date.now(),
 };
@@ -457,11 +724,49 @@ let streamSourceEventsConnected = false;
 let streamSourceEventsLastEventAt: number | null = null;
 let streamSourceEventsLastEventId: number | null = null;
 let streamSourceEventsLastError: string | null = null;
+let streamSourceAvailability = createInitialStreamSourceAvailability(
+  Boolean(STREAM_STATE_SOURCE_URL),
+);
 let streamSourceEventsReconnectAttempt = 0;
+let streamOperatorMetrics: StreamingOperatorMetrics | null = null;
+let streamOperatorLastPollAt: number | null = null;
+let streamOperatorLastSuccessAt: number | null = null;
+let streamOperatorLastFailureCode: StreamingOperatorFailureCode | null = null;
+let streamOperatorPollInFlight = false;
 
 const sseClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
+const sseClientIdentities = new Map<
+  ReadableStreamDefaultController<Uint8Array>,
+  string
+>();
+const sseConnectionsByIdentity = new Map<string, number>();
+const MAX_SSE_CLIENTS = 1_000;
+const MAX_SSE_CLIENTS_PER_IDENTITY = 8;
 const manifestCache = new Map<string, unknown>();
 const rateBuckets = new Map<string, RateBucket>();
+const RATE_BUCKET_MAX_ENTRIES = 10_000;
+const RATE_BUCKET_IDLE_TTL_MS = 10 * 60_000;
+const STATIC_RATE_LIMIT_PATHS = new Set([
+  "/",
+  "/health",
+  "/ready",
+  "/status",
+  "/api/operator/readiness",
+  "/api/streaming/state",
+  "/api/streaming/duel-context",
+  "/api/streaming/state/events",
+  "/api/streaming/state/publish",
+  "/api/streaming/leaderboard/details",
+  "/api/arena/prediction-markets/active",
+  "/api/arena/bet/record-external",
+  "/api/arena/points/leaderboard",
+  "/api/arena/invite/register",
+  "/api/arena/invite/redeem",
+  "/api/keeper/bot-health",
+  "/api/proxy/solana/rpc",
+  "/api/proxy/solana/sender",
+]);
+let rateBucketLastSweepMs = 0;
 
 // ── Persistent state (hydrated from SQLite on startup, written through on change)
 const _db = loadAll(BET_STORE_LIMIT);
@@ -533,6 +838,20 @@ function aggregatePoints(wallets: string[]): WalletPoints {
   return wallets.reduce<WalletPoints>(
     (acc, wallet) => {
       const points = ensureWalletPoints(wallet);
+      acc.selfPoints += points.selfPoints;
+      acc.winPoints += points.winPoints;
+      acc.referralPoints += points.referralPoints;
+      return acc;
+    },
+    { selfPoints: 0, winPoints: 0, referralPoints: 0 },
+  );
+}
+
+function aggregatePointsReadOnly(wallets: string[]): WalletPoints {
+  return wallets.reduce<WalletPoints>(
+    (acc, wallet) => {
+      const points = pointsByWallet.get(normalizeWallet(wallet));
+      if (!points) return acc;
       acc.selfPoints += points.selfPoints;
       acc.winPoints += points.winPoints;
       acc.referralPoints += points.referralPoints;
@@ -701,68 +1020,23 @@ function securityHeaders(): HeadersInit {
 
 function applyCors(req: Request, headers: Headers): void {
   const origin = req.headers.get("origin");
-  if (!origin) {
-    headers.set("access-control-allow-origin", "*");
-    return;
-  }
-
-  if (isAllowedAppOrigin(origin)) {
+  if (origin !== null && isAllowedAppOrigin(origin, HTTP_POLICY)) {
     headers.set("access-control-allow-origin", origin);
     headers.set("vary", "Origin");
-  } else {
-    headers.set("access-control-allow-origin", "*");
+    headers.set("access-control-allow-methods", "GET,POST,OPTIONS");
+    headers.set(
+      "access-control-allow-headers",
+      "content-type,solana-client,x-web3js-version",
+    );
+    headers.set("access-control-expose-headers", "retry-after");
+    headers.set("access-control-max-age", "600");
   }
-
-  headers.set("access-control-allow-methods", "GET,POST,OPTIONS");
-  headers.set(
-    "access-control-allow-headers",
-    "content-type,x-arena-write-key,x-forwarded-for,solana-client,x-web3js-version",
-  );
-  headers.set("access-control-expose-headers", "retry-after");
-  headers.set("access-control-max-age", "86400");
-}
-
-function normalizeOriginLike(value: string | null): string | null {
-  if (!value) return null;
-  try {
-    const url = new URL(value);
-    if (
-      (url.protocol !== "http:" && url.protocol !== "https:") ||
-      !url.hostname
-    ) {
-      return null;
-    }
-    return url.origin;
-  } catch {
-    return null;
-  }
-}
-
-function isAllowedAppOrigin(origin: string | null): boolean {
-  const normalized = normalizeOriginLike(origin);
-  if (!normalized) return false;
-  const { hostname } = new URL(normalized);
-  const lowerHostname = hostname.toLowerCase();
-  const matchesAppDomain = (domain: string) =>
-    lowerHostname === domain || lowerHostname.endsWith(`.${domain}`);
-  const isLoopbackHost =
-    lowerHostname === "localhost" ||
-    lowerHostname === "127.0.0.1" ||
-    lowerHostname === "::1" ||
-    lowerHostname === "[::1]";
-  return (
-    CORS_ORIGINS.includes(normalized) ||
-    matchesAppDomain("hyperbet.win") ||
-    matchesAppDomain("hyperia.gg") ||
-    matchesAppDomain("hyperia.club") ||
-    matchesAppDomain("hyperbet.pages.dev") ||
-    isLoopbackHost
-  );
 }
 
 type ExternalBetVerificationInput = {
   marketRef: string | null;
   duelKey: string | null;
+  duelId: string | null;
 };
 
 type VerifiedExternalBetRecord = {
@@ -770,6 +1044,7 @@ type VerifiedExternalBetRecord = {
   txSignature: string;
   bettorWallet: string;
   duelKey: string | null;
+  duelId: string;
   marketRef: string;
   sourceAsset: "SOL";
   sourceAmountLamports: string;
@@ -778,38 +1053,6 @@ type VerifiedExternalBetRecord = {
   accounting: VerifiedPlaceOrderAccounting;
 };
 
-type ExternalBetVerificationFailureCode =
-  | "context-unavailable"
-  | "request-identity-invalid"
-  | "expected-identity-invalid"
-  | "expected-identity-missing"
-  | "transaction-not-found"
-  | "transaction-meta-missing"
-  | "transaction-failed"
-  | "indexed-evidence-invalid"
-  | "indexed-transaction-shape"
-  | "indexed-order-identity"
-  | "indexed-market-identity"
-  | "indexed-accounting-invalid"
-  | "wallet-signature-mismatch"
-  | "market-instruction-count"
-  | "place-order-data-invalid"
-  | "instruction-account-graph"
-  | "market-account-identity"
-  | "market-pda-identity"
-  | "market-fee-snapshot"
-  | "event-market-invalid"
-  | "order-placed-event-invalid"
-  | "order-matched-event-invalid"
-  | "self-trade-event-invalid"
-  | "fee-event-invalid"
-  | "inner-instructions-missing"
-  | "transfer-event-invalid"
-  | "transaction-query-failed"
-  | "market-account-query-failed"
-  | "event-decode-failed"
-  | "accounting-failed";
-
 type ExternalBetVerificationResult =
   | { status: "verified"; record: VerifiedExternalBetRecord }
   | { status: "rejected"; code: ExternalBetVerificationFailureCode };
@@ -817,7 +1060,7 @@ type ExternalBetVerificationResult =
 type ExternalBetAuthorization =
   | { status: "verified"; record: VerifiedExternalBetRecord }
   | {
-      status: "pending-finality";
+      status: "pending-verification";
       verificationCode: ExternalBetVerificationFailureCode;
     }
   | { status: "rpc-unavailable" }
@@ -843,13 +1086,24 @@ function normalizeDuelKeyHex(value: string | null): string | null {
   return /^[0-9a-f]{64}$/.test(normalized) ? normalized : null;
 }
 
+function normalizeDuelId(value: string | null): string | null {
+  if (value === null || value.length === 0 || value.length > 256) return null;
+  return value.trim() === value ? value : null;
+}
+
+async function verifiedOnchainDuelId(
+  duelState: PublicKey,
+  duelKey: string,
+): Promise<string | null> {
+  if (!solanaCtx) return null;
+  const account =
+    await solanaCtx.fightProgram.account.duelState.fetch(duelState);
+  if (bytes32Hex(account.duelKey) !== duelKey) return null;
+  return duelIdFromMetadata(account.metadataUri, duelKey);
+}
+
 function normalizeBase58Key(value: string | null): string | null {
-  if (!value) return null;
-  try {
-    return new PublicKey(value.trim()).toBase58();
-  } catch {
-    return null;
-  }
+  return exactSolanaPublicKeyAddress(value);
 }
 
 function toInstructionAccountAddress(value: unknown): string | null {
@@ -889,122 +1143,11 @@ function extractInstructionProgramId(instruction: unknown): string | null {
     instruction !== null &&
     "programId" in instruction
   ) {
-    return toInstructionAccountAddress(
+    return exactSolanaPublicKeyAddress(
       (instruction as { programId?: unknown }).programId,
     );
   }
   return null;
-}
-
-function extractInstructionAccounts(instruction: unknown): string[] {
-  if (
-    typeof instruction !== "object" ||
-    instruction === null ||
-    !("accounts" in instruction) ||
-    !Array.isArray((instruction as { accounts?: unknown[] }).accounts)
-  ) {
-    return [];
-  }
-  return (instruction as { accounts: unknown[] }).accounts
-    .map((account) => toInstructionAccountAddress(account))
-    .filter((account): account is string => Boolean(account));
-}
-
-function toNumberLike(value: unknown): number {
-  if (typeof value === "number") return value;
-  if (typeof value === "bigint") return Number(value);
-  if (typeof value === "string") return Number(value);
-  if (
-    typeof value === "object" &&
-    value !== null &&
-    "toNumber" in value &&
-    typeof (value as { toNumber?: () => number }).toNumber === "function"
-  ) {
-    return (value as { toNumber: () => number }).toNumber();
-  }
-  return 0;
-}
-
-function toBigIntLike(value: unknown): bigint | null {
-  try {
-    if (typeof value === "bigint") return value;
-    if (typeof value === "number" && Number.isSafeInteger(value)) {
-      return BigInt(value);
-    }
-    if (typeof value === "string" && /^\d+$/.test(value)) {
-      return BigInt(value);
-    }
-    if (value && typeof value === "object" && "toString" in value) {
-      const rendered = (value as { toString(): string }).toString();
-      return /^\d+$/.test(rendered) ? BigInt(rendered) : null;
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-function bytes32Hex(value: unknown): string | null {
-  const bytes =
-    value instanceof Uint8Array
-      ? Array.from(value)
-      : Array.isArray(value)
-        ? value.map(Number)
-        : null;
-  if (
-    !bytes ||
-    bytes.length !== 32 ||
-    bytes.some((entry) => !Number.isInteger(entry) || entry < 0 || entry > 255)
-  ) {
-    return null;
-  }
-  return Buffer.from(bytes).toString("hex");
-}
-
-function decodeSenderTransaction(
-  transaction: string,
-): Transaction | VersionedTransaction {
-  const raw = Buffer.from(transaction, "base64");
-  try {
-    return VersionedTransaction.deserialize(raw);
-  } catch {
-    return Transaction.from(raw);
-  }
-}
-
-function extractSenderProgramIds(
-  transaction: Transaction | VersionedTransaction,
-): string[] {
-  if (transaction instanceof VersionedTransaction) {
-    const accountKeys = transaction.message.staticAccountKeys;
-    return transaction.message.compiledInstructions.map(
-      (instruction: { programIdIndex: number }) =>
-        accountKeys[instruction.programIdIndex]?.toBase58() ?? "",
-    );
-  }
-  return transaction.instructions.map((instruction: { programId: PublicKey }) =>
-    instruction.programId.toBase58(),
-  );
-}
-
-function isWhitelistedSenderTransaction(
-  transaction: Transaction | VersionedTransaction,
-): boolean {
-  const allowedPrograms = new Set([
-    FIGHT_ORACLE_PROGRAM_ID.toBase58(),
-    DUEL_MARKET_PROGRAM_ID.toBase58(),
-    SystemProgram.programId.toBase58(),
-  ]);
-  const programIds = extractSenderProgramIds(transaction);
-  const touchesHyperbetProgram = programIds.some(
-    (programId) =>
-      programId === FIGHT_ORACLE_PROGRAM_ID.toBase58() ||
-      programId === DUEL_MARKET_PROGRAM_ID.toBase58(),
-  );
-  return (
-    touchesHyperbetProgram &&
-    programIds.every((programId) => allowedPrograms.has(programId))
-  );
 }
 
 function jsonResponse(
@@ -1048,6 +1191,35 @@ function parseBoundedInteger(
   return Math.min(maximum, Math.max(minimum, Math.floor(parsed)));
 }
 
+type BoundedJsonObjectBody =
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; status: 400 | 413; error: string };
+
+async function readBoundedJsonObjectBody(
+  req: Request,
+  maximumBytes: number,
+): Promise<BoundedJsonObjectBody> {
+  let bodyText: string;
+  try {
+    bodyText = await req.text();
+  } catch {
+    return { ok: false, status: 400, error: "Unable to read request body" };
+  }
+  if (Buffer.byteLength(bodyText, "utf8") > maximumBytes) {
+    return { ok: false, status: 413, error: "Request body too large" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return { ok: false, status: 400, error: "Invalid JSON body" };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, status: 400, error: "Invalid JSON body" };
+  }
+  return { ok: true, value: parsed as Record<string, unknown> };
+}
+
 function handleDuelContext(req: Request): Response {
   return jsonResponse(
     req,
@@ -1084,13 +1256,9 @@ function currentBetCloseTime(): number | null {
 
 function currentWinnerFromCycle(): PredictionMarketWinner {
   const cycleAgent1 = streamState.cycle?.agent1 as
-    | { id?: unknown }
-    | null
-    | undefined;
+    { id?: unknown } | null | undefined;
   const cycleAgent2 = streamState.cycle?.agent2 as
-    | { id?: unknown }
-    | null
-    | undefined;
+    { id?: unknown } | null | undefined;
   const winnerId =
     typeof streamState.cycle?.winnerId === "string"
       ? streamState.cycle.winnerId
@@ -1145,33 +1313,6 @@ function normalizeHexProposalId(value: unknown): string | null {
   return null;
 }
 
-function resolveLifecycleFromSolanaSnapshot(
-  duelStatus: string | null,
-  marketStatus: string | null,
-  fallback: PredictionMarketLifecycleStatus,
-): PredictionMarketLifecycleStatus {
-  const duelLifecycle = resolveLifecycleFromSolanaDuelStatus(duelStatus);
-  if (duelLifecycle !== "UNKNOWN") return duelLifecycle;
-  const marketLifecycle = resolveLifecycleFromSolanaMarketStatus(marketStatus);
-  return marketLifecycle !== "UNKNOWN" ? marketLifecycle : fallback;
-}
-
-function resolveWinnerFromSolanaState(
-  winner: string | null,
-  fallback: PredictionMarketWinner,
-): PredictionMarketWinner {
-  switch (winner?.toLowerCase()) {
-    case "a":
-      return "A";
-    case "b":
-      return "B";
-    case "none":
-      return "NONE";
-    default:
-      return fallback;
-  }
-}
-
 function resolvePhaseFromLifecycleStatus(
   lifecycleStatus: PredictionMarketLifecycleStatus | null | undefined,
 ): string | null {
@@ -1194,34 +1335,33 @@ function buildPredictionMarketLifecycleRecords(): PredictionMarketLifecycleRecor
   const snapshot = parsers.solana.snapshot as Record<string, unknown> | null;
   const duelKey = currentDuelKey();
   const duelId = currentDuelId();
-  const cycleLifecycle = resolveLifecycleFromStreamPhase(
-    typeof streamState.cycle?.phase === "string"
-      ? streamState.cycle.phase
-      : null,
-  );
-  const cycleWinner = currentWinnerFromCycle();
-  const derivedCurrentMarketPda =
+  const derivedCurrentDuelPda =
     duelKey != null
-      ? findMarketPda(
-          DUEL_MARKET_PROGRAM_ID,
-          findDuelStatePda(FIGHT_ORACLE_PROGRAM_ID, duelKeyHexToBytes(duelKey)),
+      ? findDuelStatePda(
+          FIGHT_ORACLE_PROGRAM_ID,
+          duelKeyHexToBytes(duelKey),
         ).toBase58()
       : null;
-  const solanaLifecycle = resolveLifecycleFromSolanaSnapshot(
-    typeof snapshot?.currentDuelStatus === "string"
-      ? snapshot.currentDuelStatus
-      : null,
-    typeof snapshot?.currentMarketStatus === "string"
-      ? snapshot.currentMarketStatus
-      : null,
-    cycleLifecycle,
-  );
-  const solanaWinner = resolveWinnerFromSolanaState(
-    typeof snapshot?.currentMarketWinner === "string"
-      ? snapshot.currentMarketWinner
-      : null,
-    cycleWinner,
-  );
+  const derivedCurrentMarketPda =
+    derivedCurrentDuelPda != null
+      ? findMarketPda(
+          DUEL_MARKET_PROGRAM_ID,
+          new PublicKey(derivedCurrentDuelPda),
+        ).toBase58()
+      : null;
+  const lifecycleAuthority = resolveCurrentSolanaLifecycleAuthority({
+    expectedDuelPda: derivedCurrentDuelPda,
+    expectedMarketPda: derivedCurrentMarketPda,
+    snapshotDuelPda: snapshot?.currentDuelPda,
+    snapshotMarketPda: snapshot?.currentMarketPda,
+    currentDuelAccountExists: snapshot?.currentDuelAccountExists,
+    currentMarketAccountExists: snapshot?.currentMarketAccountExists,
+    currentDuelStatus: snapshot?.currentDuelStatus,
+    currentMarketStatus: snapshot?.currentMarketStatus,
+    currentMarketWinner: snapshot?.currentMarketWinner,
+    snapshotSyncedAt: parsers.solana.lastSuccessAt,
+  });
+  const { snapshotMatchesCurrentDuel } = lifecycleAuthority;
 
   if (!parsers.solana.enabled && !snapshot && !derivedCurrentMarketPda) {
     return [];
@@ -1232,36 +1372,21 @@ function buildPredictionMarketLifecycleRecords(): PredictionMarketLifecycleRecor
       chainKey: "solana",
       duelKey,
       duelId,
-      marketId:
-        derivedCurrentMarketPda ??
-        (typeof snapshot?.derivedMarketPda === "string"
-          ? snapshot.derivedMarketPda
-          : typeof snapshot?.latestMarketAccount === "string"
-            ? snapshot.latestMarketAccount
-            : null),
-      marketRef:
-        derivedCurrentMarketPda ??
-        (typeof snapshot?.derivedMarketPda === "string"
-          ? snapshot.derivedMarketPda
-          : typeof snapshot?.latestMarketAccount === "string"
-            ? snapshot.latestMarketAccount
-            : null),
-      lifecycleStatus: solanaLifecycle,
-      winner: solanaWinner,
+      marketId: derivedCurrentMarketPda,
+      marketRef: derivedCurrentMarketPda,
+      lifecycleStatus: lifecycleAuthority.lifecycleStatus,
+      winner: lifecycleAuthority.winner,
       betCloseTime: currentBetCloseTime(),
       contractAddress: null,
-      programId:
-        typeof snapshot?.marketProgram === "string"
-          ? snapshot.marketProgram
-          : null,
-      txRef:
-        typeof snapshot?.recentSignature === "string"
-          ? snapshot.recentSignature
-          : null,
-      syncedAt: parsers.solana.lastSuccessAt,
+      programId: DUEL_MARKET_PROGRAM_ID.toBase58(),
+      txRef: null,
+      syncedAt: lifecycleAuthority.syncedAt,
       metadata: normalizePredictionMarketLifecycleMetadata({
-        proposalId: normalizeHexProposalId(snapshot?.currentProposalId),
+        proposalId: snapshotMatchesCurrentDuel
+          ? normalizeHexProposalId(snapshot?.currentProposalId)
+          : null,
         challengeWindowEndsAt: (() => {
+          if (!snapshotMatchesCurrentDuel) return null;
           const proposedAt = toNullableTimestamp(
             snapshot?.currentProposalProposedAt,
           );
@@ -1274,16 +1399,21 @@ function buildPredictionMarketLifecycleRecords(): PredictionMarketLifecycleRecor
         })(),
         finalizedAt: null,
         cancellationReason: null,
-        fightAccountCount:
-          typeof snapshot?.fightAccountCount === "number"
+        fightAccountCount: snapshotMatchesCurrentDuel
+          ? typeof snapshot?.fightAccountCount === "number"
             ? snapshot.fightAccountCount
-            : null,
-        marketAccountCount:
-          typeof snapshot?.marketAccountCount === "number"
+            : null
+          : null,
+        marketAccountCount: snapshotMatchesCurrentDuel
+          ? typeof snapshot?.marketAccountCount === "number"
             ? snapshot.marketAccountCount
-            : null,
-        duelStatus: snapshot?.currentDuelStatus ?? null,
+            : null
+          : null,
+        duelStatus: snapshotMatchesCurrentDuel
+          ? (snapshot?.currentDuelStatus ?? null)
+          : null,
         proposalChallenged:
+          snapshotMatchesCurrentDuel &&
           typeof snapshot?.currentProposalChallenged === "boolean"
             ? snapshot.currentProposalChallenged
             : null,
@@ -1292,67 +1422,17 @@ function buildPredictionMarketLifecycleRecords(): PredictionMarketLifecycleRecor
   ];
 }
 
-function toFallbackKeeperMarketHealthRecord(
-  record: PredictionMarketLifecycleRecord,
-): KeeperMarketHealthRecord {
-  return {
-    chainKey: record.chainKey,
-    duelId: record.duelId ?? null,
-    duelKey: record.duelKey ?? null,
-    marketRef: record.marketRef ?? null,
-    lifecycleStatus: record.lifecycleStatus,
-    winner: record.winner,
-    fairValue: null,
-    bidPrice: null,
-    askPrice: null,
-    bidUnits: 0,
-    askUnits: 0,
-    openOrderCount: 0,
-    inventoryYes: 0,
-    inventoryNo: 0,
-    openYes: 0,
-    openNo: 0,
-    netExposure: 0,
-    grossExposure: 0,
-    drawdownBps: 0,
-    quoteAgeMs: null,
-    lastStreamAtMs: record.syncedAt ?? null,
-    lastOracleAtMs: record.syncedAt ?? null,
-    lastRpcAtMs: record.syncedAt ?? null,
-    circuitBreakerReason: null,
-    lastResolvedAtMs:
-      typeof record.metadata?.finalizedAt === "number"
-        ? record.metadata.finalizedAt
-        : null,
-    lastClaimAtMs: null,
-    recovery: [],
-  };
-}
-
-function resolveKeeperBotHealthSnapshot(
-  botHealthSnapshot: KeeperBotHealthSnapshot | null,
-): KeeperBotHealthSnapshot | null {
-  if (botHealthSnapshot == null || botHealthSnapshot.markets.length > 0) {
-    return botHealthSnapshot;
-  }
-  const fallbackMarkets = buildPredictionMarketLifecycleRecords().map(
-    toFallbackKeeperMarketHealthRecord,
-  );
-  if (fallbackMarkets.length === 0) {
-    return botHealthSnapshot;
-  }
-  return {
-    ...botHealthSnapshot,
-    markets: fallbackMarkets,
-  };
-}
-
 function resolveServiceReadiness(
   botHealthSnapshot: KeeperBotHealthSnapshot | null,
 ) {
   const cycleId = streamState.cycle?.cycleId;
   return evaluateKeeperReadiness({
     nowMs: Date.now(),
+    release: {
+      required: IS_PRODUCTION,
+      requireBakedManifest: IS_PRODUCTION,
+      ...KEEPER_RELEASE_IDENTITY,
+    },
     requireStreamSource: IS_PRODUCTION,
     streamMaxAgeMs: READINESS_STREAM_MAX_AGE_MS,
     botMaxAgeMs: READINESS_BOT_MAX_AGE_MS,
@@ -1367,9 +1447,93 @@ function resolveServiceReadiness(
       lastSourceError: streamLastSourceError,
     },
     bot: botHealthSnapshot,
+    expectedBotRuntimeIdentity: EXPECTED_DUEL_BOT_RUNTIME_IDENTITY,
     parser: parsers.solana,
     database: checkDatabaseHealth(),
   });
+}
+
+function buildOperatorProjection(input: {
+  observedAtMs: number;
+  serviceReady: boolean;
+  botHealthSnapshot: KeeperBotHealthSnapshot | null;
+}) {
+  const keeperMetrics = input.botHealthSnapshot?.operatorMetrics ?? null;
+  const federated = buildFederatedOperatorReadiness({
+    nowMs: input.observedAtMs,
+    serviceReady: input.serviceReady,
+    streamMaxAgeMs: READINESS_STREAM_MAX_AGE_MS,
+    keeperMaxAgeMs: READINESS_BOT_MAX_AGE_MS,
+    stream: streamOperatorMetrics,
+    keeper: keeperMetrics,
+  });
+  return {
+    schemaVersion: 1 as const,
+    observedAtMs: input.observedAtMs,
+    freshness: {
+      streamStateAgeMs: Math.max(0, input.observedAtMs - streamLastUpdatedAt),
+      botHealthAgeMs:
+        input.botHealthSnapshot?.updatedAtMs == null
+          ? null
+          : Math.max(
+              0,
+              input.observedAtMs - input.botHealthSnapshot.updatedAtMs,
+            ),
+      botRpcAgeMs:
+        input.botHealthSnapshot?.lastSuccessfulRpcAtMs == null
+          ? null
+          : Math.max(
+              0,
+              input.observedAtMs -
+                input.botHealthSnapshot.lastSuccessfulRpcAtMs,
+            ),
+      lifecycleParserAgeMs:
+        parsers.solana.lastSuccessAt == null
+          ? null
+          : Math.max(0, input.observedAtMs - parsers.solana.lastSuccessAt),
+    },
+    stream: streamOperatorMetrics,
+    keeper: keeperMetrics,
+    federated,
+    transport: {
+      configured: STREAM_OPERATOR_HEALTH_SOURCE !== null,
+      lastPollAt: streamOperatorLastPollAt,
+      lastSuccessAt: streamOperatorLastSuccessAt,
+      lastFailureCode: streamOperatorLastFailureCode,
+    },
+    alertDelivery: operatorAlertDispatcher.deliveryStatus(),
+  };
+}
+
+let operatorAlertMonitorInterval: ReturnType<typeof setInterval> | null = null;
+let operatorAlertMonitorInFlight: Promise<void> | null = null;
+
+function monitorOperatorAlerts(): void {
+  if (!operatorAlertDispatcher.isEnabled() || operatorAlertMonitorInFlight) {
+    return;
+  }
+  const botHealthSnapshot = loadKeeperBotHealthSnapshot();
+  const serviceReadiness = resolveServiceReadiness(botHealthSnapshot);
+  const operatorMetrics = buildOperatorProjection({
+    observedAtMs: Date.now(),
+    serviceReady: serviceReadiness.ready,
+    botHealthSnapshot,
+  });
+  operatorAlertMonitorInFlight = operatorAlertDispatcher
+    .observe(operatorMetrics.federated)
+    .then((result) => {
+      if (result.attempted && !result.sent) {
+        console.warn(
+          `[operator-alerts] delivery failed: ${result.failureCode ?? "network"}`,
+        );
+      }
+    })
+    .catch(() => {
+      console.warn("[operator-alerts] monitor failed: invalid-observation");
+    })
+    .finally(() => {
+      operatorAlertMonitorInFlight = null;
+    });
 }
 
 function handlePredictionMarkets(req: Request): Response {
@@ -1393,6 +1557,7 @@ function handlePredictionMarkets(req: Request): Response {
             : (fallbackMarket?.winner ?? "NONE"),
         betCloseTime:
           currentBetCloseTime() ?? fallbackMarket?.betCloseTime ?? null,
+        syncedAt: streamLastUpdatedAt,
       },
       markets,
       updatedAt: Date.now(),
@@ -1427,32 +1592,12 @@ function handleStreamingLeaderboardDetails(req: Request, url: URL): Response {
   );
 }
 
-function clientIp(req: Request): string {
-  const directHeaders = [
-    "cf-connecting-ip",
-    "true-client-ip",
-    "x-real-ip",
-  ] as const;
-  for (const name of directHeaders) {
-    const value = req.headers.get(name)?.trim();
-    if (value) return value;
-  }
-
-  const forwarded = req.headers.get("x-forwarded-for")?.trim();
-  if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim();
-    if (first) return first;
-  }
-
-  const userAgent = req.headers.get("user-agent")?.trim();
-  if (userAgent) {
-    return `ua:${createHash("sha256")
-      .update(userAgent)
-      .digest("hex")
-      .slice(0, 16)}`;
-  }
-
-  return "unknown";
+function clientIp(req: Request, peerAddress: string | null): string {
+  return resolveClientIdentity({
+    headers: req.headers,
+    peerAddress,
+    trustedProxy: HTTP_POLICY.trustedProxy,
+  });
 }
 
 function normalizeRateLimitPath(pathname: string): string {
@@ -1471,11 +1616,30 @@ function normalizeRateLimitPath(pathname: string): string {
   if (pathname.startsWith("/api/arena/invite/")) {
     return "/api/arena/invite/:wallet";
   }
-  return pathname;
+  if (pathname.startsWith("/game-assets/manifests/items/")) {
+    return "/game-assets/manifests/items/:file";
+  }
+  return STATIC_RATE_LIMIT_PATHS.has(pathname) ? pathname : "/_other";
+}
+
+function sweepIdleRateBuckets(now: number): void {
+  if (
+    rateBuckets.size < RATE_BUCKET_MAX_ENTRIES &&
+    now - rateBucketLastSweepMs < 60_000
+  ) {
+    return;
+  }
+  rateBucketLastSweepMs = now;
+  for (const [key, bucket] of rateBuckets) {
+    if (now - bucket.lastRefillMs > RATE_BUCKET_IDLE_TTL_MS) {
+      rateBuckets.delete(key);
+    }
+  }
 }
 
 function checkRateLimit(
   req: Request,
+  peerAddress: string | null,
   pathname: string,
   limitPerMinute: number,
   burst: number,
@@ -1486,12 +1650,16 @@ function checkRateLimit(
 
   const now = Date.now();
   const key = [
-    clientIp(req),
+    clientIp(req, peerAddress),
     req.method.toUpperCase(),
     normalizeRateLimitPath(pathname),
     limitPerMinute,
     burst,
   ].join(":");
+  sweepIdleRateBuckets(now);
+  if (!rateBuckets.has(key) && rateBuckets.size >= RATE_BUCKET_MAX_ENTRIES) {
+    return false;
+  }
   const bucket = rateBuckets.get(key) ?? {
     tokens: burst,
     lastRefillMs: now,
@@ -1516,9 +1684,11 @@ function requireWriteAuth(
   req: Request,
   fallbackKey = ARENA_WRITE_KEY,
 ): boolean {
-  if (!fallbackKey) return true;
-  const provided = req.headers.get("x-arena-write-key")?.trim() || "";
-  return provided === fallbackKey;
+  return hasExactSecretHeader(
+    req.headers.get("x-arena-write-key"),
+    fallbackKey,
+    "hyperbet-service-write-key-v1",
+  );
 }
 
 function hasPrivilegedWriteAuth(
@@ -1590,6 +1760,7 @@ async function verifyIndexedRecordedBet(
   txSignature: string,
   normalizedMarketRef: string | null,
   normalizedDuelKey: string | null,
+  normalizedDuelId: string,
 ): Promise<ExternalBetVerificationResult> {
   const rejectVerification = (
     code: ExternalBetVerificationFailureCode,
@@ -1691,7 +1862,7 @@ async function verifyIndexedRecordedBet(
       new PublicKey(placed.marketPda),
     )) as Record<string, unknown>;
   } catch {
-    return rejectVerification("indexed-market-identity");
+    return rejectVerification("indexed-market-query-failed");
   }
   const canonicalDuelKey = bytes32Hex(marketAccount.duelKey);
   const marketDuelState = normalizeBase58Key(
@@ -1719,14 +1890,26 @@ async function verifyIndexedRecordedBet(
     ).toBase58() !== placed.marketPda ||
     toNumberLike(marketAccount.marketKind) !== DUEL_WINNER_MARKET_KIND ||
     (normalizedDuelKey && normalizedDuelKey !== canonicalDuelKey) ||
-    !Number.isInteger(tradeTreasuryFeeBps) ||
+    tradeTreasuryFeeBps === null ||
     tradeTreasuryFeeBps < 0 ||
     tradeTreasuryFeeBps > 10_000 ||
-    !Number.isInteger(tradeMarketMakerFeeBps) ||
+    tradeMarketMakerFeeBps === null ||
     tradeMarketMakerFeeBps < 0 ||
     tradeMarketMakerFeeBps > 10_000
   ) {
     return rejectVerification("indexed-market-identity");
+  }
+  let canonicalDuelId: string | null = null;
+  try {
+    canonicalDuelId = await verifiedOnchainDuelId(
+      canonicalDuelState,
+      canonicalDuelKey,
+    );
+  } catch {
+    return rejectVerification("duel-id-query-failed");
+  }
+  if (canonicalDuelId !== normalizedDuelId) {
+    return rejectVerification("duel-id-identity");
   }
 
   let accounting: VerifiedPlaceOrderAccounting;
@@ -1757,6 +1940,7 @@ async function verifyIndexedRecordedBet(
       txSignature,
       bettorWallet: normalizedWallet,
       duelKey: canonicalDuelKey,
+      duelId: canonicalDuelId,
       marketRef: placed.marketPda,
       sourceAsset: "SOL",
       sourceAmountLamports: accounting.sourceAmountLamports,
@@ -1779,16 +1963,22 @@ async function verifyRecordedBet(
   const normalizedWallet = normalizeBase58Key(bettorWallet);
   const rawMarketRef = expected.marketRef?.trim() || null;
   const rawDuelKey = expected.duelKey?.trim() || null;
+  const rawDuelId = expected.duelId;
   const normalizedMarketRef = rawMarketRef
     ? normalizeBase58Key(rawMarketRef)
     : null;
   const normalizedDuelKey = normalizeDuelKeyHex(rawDuelKey);
-  if (!normalizedWallet || !txSignature.trim()) {
+  const normalizedDuelId = normalizeDuelId(rawDuelId);
+  if (
+    !normalizedWallet ||
+    !isCanonicalSolanaTransactionSignature(txSignature)
+  ) {
     return rejectVerification("request-identity-invalid");
   }
   if (
     (rawMarketRef && !normalizedMarketRef) ||
-    (rawDuelKey && !normalizedDuelKey)
+    (rawDuelKey && !normalizedDuelKey) ||
+    !normalizedDuelId
   ) {
     return rejectVerification("expected-identity-invalid");
   }
@@ -1803,23 +1993,30 @@ async function verifyRecordedBet(
     if (!transaction) {
       return await verifyIndexedRecordedBet(
         normalizedWallet,
-        txSignature.trim(),
+        txSignature,
         normalizedMarketRef,
         normalizedDuelKey,
+        normalizedDuelId,
       );
     }
     if (!transaction.meta) {
       return rejectVerification("transaction-meta-missing");
     }
-    if (transaction.meta.err) return rejectVerification("transaction-failed");
+    if (!hasExactSuccessfulFinalizedTransactionMeta(transaction.meta)) {
+      return rejectVerification("transaction-failed");
+    }
 
-    const walletSigned = transaction.transaction.message.accountKeys.some(
-      (key) =>
-        key.signer &&
-        normalizeBase58Key(toInstructionAccountAddress(key.pubkey)) ===
-          normalizedWallet,
+    const transactionSignatures = exactSolanaTransactionSignatures(
+      transaction.transaction.signatures,
     );
-    if (!walletSigned) {
+    if (!transactionSignatures || transactionSignatures[0] !== txSignature) {
+      return rejectVerification("transaction-signature-mismatch");
+    }
+    const signerAddresses = exactTransactionSignerAddresses(
+      transaction.transaction.message.accountKeys,
+      transactionSignatures.length,
+    );
+    if (!signerAddresses?.includes(normalizedWallet)) {
       return rejectVerification("wallet-signature-mismatch");
     }
 
@@ -1849,8 +2046,13 @@ async function verifyRecordedBet(
         : null;
     if (!decodedOrder) return rejectVerification("place-order-data-invalid");
 
-    const accounts = extractInstructionAccounts(instruction);
-    if (accounts.length < 11) {
+    const accounts =
+      typeof instruction === "object" && instruction !== null
+        ? extractInstructionAccounts(
+            (instruction as { accounts?: unknown }).accounts,
+          )
+        : null;
+    if (!accounts || accounts.length < 11) {
       return rejectVerification("instruction-account-graph");
     }
     const marketState = normalizeBase58Key(accounts[0] ?? null);
@@ -1931,6 +2133,18 @@ async function verifyRecordedBet(
     ) {
       return rejectVerification("market-pda-identity");
     }
+    let canonicalDuelId: string | null = null;
+    try {
+      canonicalDuelId = await verifiedOnchainDuelId(
+        canonicalDuelState,
+        canonicalDuelKey,
+      );
+    } catch {
+      return rejectVerification("duel-id-query-failed");
+    }
+    if (canonicalDuelId !== normalizedDuelId) {
+      return rejectVerification("duel-id-identity");
+    }
 
     const tradeTreasuryFeeBps = toNumberLike(
       marketAccount.tradeTreasuryFeeBpsSnapshot,
@@ -1947,10 +2161,10 @@ async function verifyRecordedBet(
     if (
       treasury !== snapshottedTreasury ||
       marketMaker !== snapshottedMarketMaker ||
-      !Number.isInteger(tradeTreasuryFeeBps) ||
+      tradeTreasuryFeeBps === null ||
       tradeTreasuryFeeBps < 0 ||
       tradeTreasuryFeeBps > 10_000 ||
-      !Number.isInteger(tradeMarketMakerFeeBps) ||
+      tradeMarketMakerFeeBps === null ||
       tradeMarketMakerFeeBps < 0 ||
       tradeMarketMakerFeeBps > 10_000
     ) {
@@ -1962,45 +2176,86 @@ async function verifyRecordedBet(
     const matchedEvents: MatchedOrderEvidence[] = [];
     const selfTradeEvents: SelfTradeEvidence[] = [];
     const tradeFeeEscrowEvents: TradeFeeEscrowEvidence[] = [];
-    for (const log of transaction.meta.logMessages ?? []) {
-      if (!log.startsWith("Program data: ")) continue;
-      const decodedEvent = solanaCtx.marketProgram.coder.events.decode(
-        log.slice("Program data: ".length),
+    const attributedProgramLogs = extractAttributedProgramDataLogs(
+      transaction.meta.logMessages ?? [],
+      solanaCtx.marketProgramId.toBase58(),
+    );
+    if (attributedProgramLogs.invocationCount !== 1) {
+      return rejectVerification("market-instruction-count");
+    }
+    let decodedProgramEvents: DecodedMarketEvent[];
+    try {
+      decodedProgramEvents = decodeExactProgramDataEvents(
+        attributedProgramLogs.programData,
+        (programData) =>
+          solanaCtx!.marketProgram.coder.events.decode(programData),
       );
-      if (!decodedEvent) continue;
-      const data = decodedEvent.data as Record<string, unknown>;
+      requireClassifiedMarketEvents(
+        decodedProgramEvents.map((event) => event.name),
+      );
+      const directBetEventNames = new Set([
+        "marketSynced",
+        "orderPlaced",
+        "orderMatched",
+        "selfTradePolicyTriggered",
+        "tradeFeesEscrowed",
+      ]);
+      if (
+        decodedProgramEvents.some(
+          (event) => !directBetEventNames.has(event.name),
+        )
+      ) {
+        return rejectVerification("event-decode-failed");
+      }
+    } catch {
+      return rejectVerification("event-decode-failed");
+    }
+    let marketSyncEventCount = 0;
+    for (const decodedEvent of decodedProgramEvents) {
+      const data = decodedEvent.data;
       const eventMarket = normalizeBase58Key(
         toInstructionAccountAddress(data.marketKey ?? data.marketRef ?? null),
       );
       if (!eventMarket) return rejectVerification("event-market-invalid");
-      if (decodedEvent.name === "orderPlaced") {
+      if (decodedEvent.name === "marketSynced") {
+        marketSyncEventCount += 1;
+      } else if (decodedEvent.name === "orderPlaced") {
         const orderId = toBigIntLike(data.orderId);
         const amount = toBigIntLike(data.amount);
         const maker = normalizeBase58Key(
           toInstructionAccountAddress(data.maker),
         );
-        if (orderId === null || amount === null || !maker) {
+        const side = toNumberLike(data.side);
+        const price = toNumberLike(data.price);
+        if (
+          orderId === null ||
+          amount === null ||
+          !maker ||
+          side === null ||
+          price === null
+        ) {
           return rejectVerification("order-placed-event-invalid");
         }
         placedEvents.push({
           marketRef: eventMarket,
           orderId,
           maker,
-          side: toNumberLike(data.side),
-          price: toNumberLike(data.price),
+          side,
+          price,
           amount,
         });
       } else if (decodedEvent.name === "orderMatched") {
         const takerOrderId = toBigIntLike(data.takerOrderId);
         const matchedAmount = toBigIntLike(data.matchedAmount);
-        if (takerOrderId === null || matchedAmount === null) {
+        const price = toNumberLike(data.price);
+        if (takerOrderId === null || matchedAmount === null || price === null) {
           return rejectVerification("order-matched-event-invalid");
         }
         matchedEvents.push({
           marketRef: eventMarket,
           takerOrderId,
           matchedAmount,
-          price: toNumberLike(data.price),
+          price,
         });
       } else if (decodedEvent.name === "selfTradePolicyTriggered") {
         const takerOrderId = toBigIntLike(data.takerOrderId);
@@ -2040,44 +2295,27 @@ async function verifyRecordedBet(
         });
       }
     }
+    if (marketSyncEventCount !== 1) {
+      return rejectVerification("event-decode-failed");
+    }
 
-    const innerInstructions = transaction.meta.innerInstructions?.find(
-      (entry) => entry.index === instructionIndex,
+    const innerInstructionGroups = exactInnerInstructionGroups(
+      transaction.meta.innerInstructions,
     );
+    const innerInstructions = innerInstructionGroups?.get(instructionIndex);
     if (!innerInstructions) {
       return rejectVerification("inner-instructions-missing");
     }
     const transfers: NativeTransferEvidence[] = [];
-    for (const innerInstruction of innerInstructions.instructions) {
-      if (
-        typeof innerInstruction !== "object" ||
-        innerInstruction === null ||
-        !("parsed" in innerInstruction)
-      ) {
-        continue;
-      }
-      const parsed = (innerInstruction as { parsed?: unknown }).parsed;
-      if (!parsed || typeof parsed !== "object") continue;
-      const parsedRecord = parsed as {
-        type?: unknown;
-        info?: Record<string, unknown>;
-      };
-      if (parsedRecord.type !== "transfer" || !parsedRecord.info) continue;
-      const source = normalizeBase58Key(
-        typeof parsedRecord.info.source === "string"
-          ? parsedRecord.info.source
-          : null,
-      );
-      const destination = normalizeBase58Key(
-        typeof parsedRecord.info.destination === "string"
-          ? parsedRecord.info.destination
-          : null,
-      );
-      const lamports = toBigIntLike(parsedRecord.info.lamports);
-      if (!source || !destination || lamports === null) {
+    for (const innerInstruction of innerInstructions) {
+      const decodedTransfer =
+        decodeExactNativeTransferInstruction(innerInstruction);
+      if (decodedTransfer.kind === "invalid") {
         return rejectVerification("transfer-event-invalid");
       }
-      transfers.push({ source, destination, lamports });
+      if (decodedTransfer.kind === "transfer") {
+        transfers.push(decodedTransfer.transfer);
+      }
     }
 
     verificationStage = "accounting-failed";
@@ -2100,9 +2338,10 @@ async function verifyRecordedBet(
       status: "verified",
       record: {
         chain: toRecordedBetChain("solana"),
-        txSignature: txSignature.trim(),
+        txSignature,
         bettorWallet: normalizedWallet,
         duelKey: canonicalDuelKey,
+        duelId: canonicalDuelId,
         marketRef: marketState,
         sourceAsset: "SOL",
         sourceAmountLamports: accounting.sourceAmountLamports,
@@ -2122,9 +2361,9 @@ async function authorizeExternalBetRecord(
   txSignature: string,
   expected: ExternalBetVerificationInput,
 ): Promise<ExternalBetAuthorization> {
-  const signature = txSignature.trim();
+  const signature = txSignature;
   if (
-    !isAllowedAppOrigin(req.headers.get("origin")) ||
+    !isAllowedAppOrigin(req.headers.get("origin"), HTTP_POLICY) ||
     !isCanonicalSolanaTransactionSignature(signature)
   ) {
     return { status: "rejected" };
@@ -2146,13 +2385,16 @@ async function authorizeExternalBetRecord(
 
   const verification = await verifyRecordedBet(
     bettorWallet,
-    txSignature,
+    signature,
     expected,
   );
   if (verification.status === "verified") return verification;
-  return finality === "pending"
+  return resolveExternalBetVerificationFailure({
+    finality,
+    code: verification.code,
+  }) === "retry"
     ? {
-        status: "pending-finality",
+        status: "pending-verification",
         verificationCode: verification.code,
       }
     : { status: "rejected", verificationCode: verification.code };
@@ -2213,6 +2455,7 @@ function toStreamState(payload: unknown): StreamState | null {
       candidate.cameraTarget === null
         ? (candidate.cameraTarget as string | null)
         : null,
+    preparation: parsePublicPreparationSummary(candidate.preparation),
     seq:
       typeof candidate.seq === "number" && Number.isFinite(candidate.seq)
         ? candidate.seq
@@ -2236,12 +2479,36 @@ function sendSse(
   controller.enqueue(encoder.encode(message));
 }
 
+function removeSseClient(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+): void {
+  sseClients.delete(controller);
+  const identity = sseClientIdentities.get(controller);
+  if (identity === undefined) return;
+  sseClientIdentities.delete(controller);
+  const remaining = (sseConnectionsByIdentity.get(identity) ?? 1) - 1;
+  if (remaining <= 0) sseConnectionsByIdentity.delete(identity);
+  else sseConnectionsByIdentity.set(identity, remaining);
+}
+
+function addSseClient(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  identity: string,
+): void {
+  sseClients.add(controller);
+  sseClientIdentities.set(controller, identity);
+  sseConnectionsByIdentity.set(
+    identity,
+    (sseConnectionsByIdentity.get(identity) ?? 0) + 1,
+  );
+}
+
 function broadcastStreamState(nextState: StreamState, event = "state"): void {
   for (const controller of sseClients) {
     try {
       sendSse(controller, event, nextState.seq, nextState);
     } catch {
-      sseClients.delete(controller);
+      removeSseClient(controller);
     }
   }
 }
@@ -2252,15 +2519,13 @@ function publishStreamState(
   logUpdate = true,
 ): void {
   const receivedAt = Date.now();
-  streamSeq = Math.max(streamSeq + 1, next.seq || streamSeq + 1);
+  const cursor = resolveAcceptedStreamCursor(next);
+  streamSeq = cursor.seq;
   streamState = {
     ...next,
     type: "STREAMING_STATE_UPDATE",
-    seq: streamSeq,
-    emittedAt:
-      Number.isFinite(next.emittedAt) && next.emittedAt > 0
-        ? next.emittedAt
-        : receivedAt,
+    seq: cursor.seq,
+    emittedAt: cursor.emittedAt,
   };
   streamLastUpdatedAt = receivedAt;
   streamLastSourceError = null;
@@ -2279,16 +2544,19 @@ function relayStreamTimelineState(
   logUpdate = true,
 ): void {
   const receivedAt = Date.now();
-  streamSeq = Math.max(streamSeq + 1, next.seq || streamSeq + 1);
+  const cursor = resolveAcceptedStreamCursor(next);
+  streamSeq = cursor.seq;
   const timelineState: StreamState = {
     ...next,
     type: "STREAMING_STATE_UPDATE",
-    seq: streamSeq,
-    emittedAt:
-      Number.isFinite(next.emittedAt) && next.emittedAt > 0
-        ? next.emittedAt
-        : receivedAt,
+    seq: cursor.seq,
+    emittedAt: cursor.emittedAt,
   };
+  // This is the same accepted public source as REST polling. Keep GET/reset
+  // current without turning replay frames into browser wagering authority or
+  // adding synchronous persistence writes at the source event cadence.
+  streamState = timelineState;
+  streamLastUpdatedAt = receivedAt;
   streamSourceEventsLastEventAt = receivedAt;
   streamSourceEventsLastError = null;
   broadcastStreamState(timelineState, "timeline");
@@ -2333,6 +2601,8 @@ async function pollStreamStateSource(): Promise<void> {
   if (Date.now() < streamSourceBackoffUntil) return;
 
   streamSourcePollInFlight = true;
+  const stateAtRequestStart = streamState;
+  const requestStartedAt = Date.now();
   const controller = new AbortController();
   const timeoutId = setTimeout(
     () => controller.abort(),
@@ -2373,6 +2643,36 @@ async function pollStreamStateSource(): Promise<void> {
       registerStreamSourceFailure(streamLastSourceError);
       return;
     }
+    if (
+      !shouldAcceptStreamStateCandidate(streamState, nextState, {
+        sourceAvailable: isStreamSourceAvailable(streamSourceAvailability),
+      })
+    ) {
+      // A valid response can lose a race to a newer public SSE frame. Do not
+      // turn that normal same-epoch race into a readiness outage. Malformed,
+      // prior-epoch and disconnected-source candidates still fail closed.
+      const supersededByAcceptedSse =
+        isStreamSourceAvailable(streamSourceAvailability) &&
+        streamState !== stateAtRequestStart &&
+        streamSourceEventsLastEventAt !== null &&
+        streamSourceEventsLastEventAt >= requestStartedAt &&
+        shouldAcceptStreamStateCandidate(stateAtRequestStart, streamState, {
+          sourceAvailable: true,
+        }) &&
+        shouldAcceptStreamStateCandidate(stateAtRequestStart, nextState, {
+          sourceAvailable: true,
+        });
+      if (!supersededByAcceptedSse) {
+        streamLastSourceError = "Awaiting authoritative stream frame";
+      }
+      resetStreamSourceFailures();
+      return;
+    }
+
+    streamSourceAvailability = transitionStreamSourceAvailability(
+      streamSourceAvailability,
+      "authoritative-frame",
+    ).state;
 
     const changed =
       streamState.cycle?.cycleId !== nextState.cycle?.cycleId ||
@@ -2488,6 +2788,23 @@ async function consumeStreamStateSourceEvents(): Promise<void> {
         if (!nextState) {
           throw new Error("stream source event contained an invalid state");
         }
+        if (
+          !shouldAcceptStreamStateCandidate(streamState, nextState, {
+            sourceAvailable: isStreamSourceAvailable(streamSourceAvailability),
+          })
+        ) {
+          streamLastSourceError = "Awaiting authoritative stream frame";
+          if (event.id !== null) {
+            streamSourceEventsLastEventId = event.id;
+          }
+          continue;
+        }
+
+        streamSourceAvailability = transitionStreamSourceAvailability(
+          streamSourceAvailability,
+          "authoritative-frame",
+        ).state;
+        streamLastSourceError = null;
 
         const changed =
           streamState.cycle?.cycleId !== nextState.cycle?.cycleId ||
@@ -2519,6 +2836,15 @@ async function runStreamStateSourceEvents(): Promise<void> {
         error instanceof Error
           ? error.message
           : "stream source event connection failed";
+      streamLastSourceError = streamSourceEventsLastError;
+      const availability = transitionStreamSourceAvailability(
+        streamSourceAvailability,
+        "disconnected",
+      );
+      streamSourceAvailability = availability.state;
+      if (availability.publishUnavailable) {
+        broadcastStreamState(streamState, "unavailable");
+      }
       const delayMs = streamSourceEventsReconnectDelayMs();
       streamSourceEventsReconnectAttempt += 1;
       if (
@@ -2559,10 +2885,15 @@ function isTransactionSigner(
   transaction: ParsedFinalizedTransaction,
   wallet: string,
 ): boolean {
-  return transaction.transaction.message.accountKeys.some(
-    (key) =>
-      key.signer &&
-      normalizeBase58Key(toInstructionAccountAddress(key.pubkey)) === wallet,
+  const transactionSignatures = exactSolanaTransactionSignatures(
+    transaction.transaction.signatures,
+  );
+  if (!transactionSignatures) return false;
+  return (
+    exactTransactionSignerAddresses(
+      transaction.transaction.message.accountKeys,
+      transactionSignatures.length,
+    )?.includes(wallet) ?? false
   );
 }
 
@@ -2570,40 +2901,23 @@ function innerNativeTransfers(
   transaction: ParsedFinalizedTransaction,
   instructionIndex: number,
 ): NativeTransferEvidence[] {
-  const entry = transaction.meta?.innerInstructions?.find(
-    (candidate) => candidate.index === instructionIndex,
+  const groups = exactInnerInstructionGroups(
+    transaction.meta?.innerInstructions,
   );
+  if (!groups) {
+    throw new Error("finalized transaction has malformed inner instructions");
+  }
   const transfers: NativeTransferEvidence[] = [];
-  for (const instruction of entry?.instructions ?? []) {
-    if (
-      typeof instruction !== "object" ||
-      instruction === null ||
-      !("parsed" in instruction)
-    ) {
-      continue;
-    }
-    const parsed = (instruction as { parsed?: unknown }).parsed;
-    if (!parsed || typeof parsed !== "object") continue;
-    const record = parsed as {
-      type?: unknown;
-      info?: Record<string, unknown>;
-    };
-    if (record.type !== "transfer" || !record.info) continue;
-    const source = normalizeBase58Key(
-      typeof record.info.source === "string" ? record.info.source : null,
-    );
-    const destination = normalizeBase58Key(
-      typeof record.info.destination === "string"
-        ? record.info.destination
-        : null,
-    );
-    const lamports = toBigIntLike(record.info.lamports);
-    if (!source || !destination || lamports === null || lamports <= 0n) {
+  for (const instruction of groups.get(instructionIndex) ?? []) {
+    const decodedTransfer = decodeExactNativeTransferInstruction(instruction);
+    if (decodedTransfer.kind === "invalid") {
       throw new Error(
         "indexed transaction contains an invalid native transfer",
       );
     }
-    transfers.push({ source, destination, lamports });
+    if (decodedTransfer.kind === "transfer") {
+      transfers.push(decodedTransfer.transfer);
+    }
   }
   return transfers;
 }
@@ -2622,23 +2936,6 @@ function sumNativeTransfers(
   );
 }
 
-function digestFinalizedTransactionEvidence(
-  transaction: ParsedFinalizedTransaction,
-): string {
-  const serialized = JSON.stringify(transaction, (_key, value) => {
-    if (typeof value === "bigint") return value.toString();
-    if (value instanceof PublicKey) return value.toBase58();
-    if (value instanceof Uint8Array) {
-      return Buffer.from(value).toString("base64");
-    }
-    return value;
-  });
-  if (!serialized) {
-    throw new Error("finalized transaction evidence is not serializable");
-  }
-  return createHash("sha256").update(serialized).digest("hex");
-}
-
 function marketRefFromEvent(event: DecodedMarketEvent): string {
   const marketRef = normalizeBase58Key(
     toInstructionAccountAddress(
@@ -2654,7 +2951,10 @@ function marketRefFromEvent(event: DecodedMarketEvent): string {
 async function parseFinalizedMarketLifecycleTransaction(
   transaction: ParsedFinalizedTransaction,
 ): Promise<{ instructionNames: string[]; facts: SolanaLifecycleFact[] }> {
-  if (!solanaCtx || !transaction.meta || transaction.meta.err) {
+  if (
+    !solanaCtx ||
+    !hasExactSuccessfulFinalizedTransactionMeta(transaction.meta)
+  ) {
     throw new Error(
       "lifecycle index requires a successful finalized transaction",
     );
@@ -2687,38 +2987,52 @@ async function parseFinalizedMarketLifecycleTransaction(
         "lifecycle index encountered an unknown market instruction",
       );
     }
+    const accounts = extractInstructionAccounts(
+      (instruction as { accounts?: unknown }).accounts,
+    );
+    if (!accounts) {
+      throw new Error("lifecycle index contains malformed market accounts");
+    }
     instructions.push({
       index,
       name: decoded.name,
       data: decoded.data as Record<string, unknown>,
-      accounts: extractInstructionAccounts(instruction),
+      accounts,
       transfers: innerNativeTransfers(transaction, index),
     });
   }
-
-  const logMessages = transaction.meta.logMessages ?? [];
-  const invokedDirectly = logMessages.some((log) =>
-    log.startsWith(`Program ${programId} invoke`),
+  requireClassifiedMarketInstructions(
+    instructions.map((instruction) => instruction.name),
   );
-  if (invokedDirectly && instructions.length === 0) {
+  requireCanonicalInstructionAccountCardinality(
+    instructions.map((instruction) => ({
+      name: instruction.name,
+      accountCount: instruction.accounts.length,
+    })),
+  );
+  requireUniqueLifecycleExecutionIdentities(
+    instructions.map((instruction) => ({
+      name: instruction.name,
+      marketRef: normalizeBase58Key(instruction.accounts[0] ?? null),
+      orderId: toBigIntLike(instruction.data.orderId),
+    })),
+  );
+
+  const attributedProgramLogs = extractAttributedProgramDataLogs(
+    transaction.meta.logMessages ?? [],
+    programId,
+  );
+  if (attributedProgramLogs.invocationCount !== instructions.length) {
     throw new Error(
-      "lifecycle index does not permit unparsed CPI-only market transactions",
+      "lifecycle index requires exact direct market-program invocation coverage",
     );
   }
 
-  const events: DecodedMarketEvent[] = [];
-  for (const log of logMessages) {
-    if (!log.startsWith("Program data: ")) continue;
-    const decoded = solanaCtx.marketProgram.coder.events.decode(
-      log.slice("Program data: ".length),
-    );
-    if (decoded) {
-      events.push({
-        name: decoded.name,
-        data: decoded.data as Record<string, unknown>,
-      });
-    }
-  }
+  const events = decodeExactProgramDataEvents(
+    attributedProgramLogs.programData,
+    (programData) => solanaCtx!.marketProgram.coder.events.decode(programData),
+  );
+  requireClassifiedMarketEvents(events.map((event) => event.name));
 
   const marketAccountCache = new Map<string, Record<string, unknown>>();
   const fetchMarket = async (marketPda: string) => {
@@ -2732,23 +3046,15 @@ async function parseFinalizedMarketLifecycleTransaction(
   };
   const validateCanonicalMarket = async (marketPda: string) => {
     const market = await fetchMarket(marketPda);
-    const canonicalDuelState = normalizeBase58Key(
-      toInstructionAccountAddress(market.duelState),
-    );
-    const marketKind = toNumberLike(market.marketKind);
-    if (
-      !canonicalDuelState ||
-      findMarketPda(
-        solanaCtx!.marketProgramId,
-        new PublicKey(canonicalDuelState),
-        marketKind,
-      ).toBase58() !== marketPda
-    ) {
-      throw new Error(
-        "indexed lifecycle instruction has a noncanonical market",
-      );
-    }
-    return { market, canonicalDuelState };
+    const identity = requireCanonicalLifecycleMarketIdentity({
+      fightProgramId: FIGHT_ORACLE_PROGRAM_ID,
+      marketProgramId: solanaCtx!.marketProgramId,
+      marketRef: marketPda,
+      duelState: market.duelState as PublicKey | { toBase58(): string },
+      duelKey: market.duelKey,
+      marketKind: market.marketKind,
+    });
+    return { market, canonicalDuelState: identity.duelStateRef };
   };
   const validateMarketAndDuel = async (
     marketPda: string,
@@ -2764,6 +3070,59 @@ async function parseFinalizedMarketLifecycleTransaction(
     return market;
   };
 
+  requireExactMarketSyncCoverage({
+    instructions: instructions.map((instruction) => ({
+      name: instruction.name,
+      marketRef: normalizeBase58Key(instruction.accounts[0] ?? null),
+    })),
+    eventMarketRefs: events
+      .filter((event) => event.name === "marketSynced")
+      .map((event) => marketRefFromEvent(event)),
+  });
+  requireExactLifecycleEventCoverage({
+    instructions: instructions.map((instruction) => ({
+      name: instruction.name,
+      marketRef: normalizeBase58Key(
+        instruction.accounts[instruction.name === "initializeMarket" ? 3 : 0] ??
+          null,
+      ),
+    })),
+    events: events.map((event) => ({
+      name: event.name,
+      marketRef: marketRefFromEvent(event),
+    })),
+  });
+  requireOwnedLifecycleExecutionEvents({
+    instructions: instructions.map((instruction) => ({
+      name: instruction.name,
+      marketRef: normalizeBase58Key(instruction.accounts[0] ?? null),
+      orderId: toBigIntLike(instruction.data.orderId),
+    })),
+    events: events.map((event) => ({
+      name: event.name,
+      marketRef: marketRefFromEvent(event),
+      orderId: toBigIntLike(
+        event.name === "tradeFeesEscrowed"
+          ? event.data.orderId
+          : event.data.takerOrderId,
+      ),
+    })),
+  });
+  for (const instruction of instructions) {
+    if (instruction.name !== "syncMarketFromDuel") continue;
+    const marketRef = normalizeBase58Key(instruction.accounts[0] ?? null);
+    const duelState = normalizeBase58Key(instruction.accounts[1] ?? null);
+    if (
+      instruction.accounts.length !== 2 ||
+      instruction.transfers.length !== 0 ||
+      !marketRef ||
+      !duelState
+    ) {
+      throw new Error("syncMarketFromDuel account graph is noncanonical");
+    }
+    await validateMarketAndDuel(marketRef, duelState);
+  }
+
   const facts: SolanaLifecycleFact[] = [];
   const marketInstructionRefs = new Set<string>();
   for (const instruction of instructions) {
@@ -2777,6 +3136,7 @@ async function parseFinalizedMarketLifecycleTransaction(
         "cancelOrder",
         "reclaimRestingOrder",
         "closeFilledOrder",
+        "closeEmptyUserBalance",
         "closeEmptyPriceLevel",
         "claim",
         "closeLosingBalance",
@@ -2792,13 +3152,55 @@ async function parseFinalizedMarketLifecycleTransaction(
       marketInstructionRefs.add(marketRef);
     }
   }
+  for (const instruction of instructions) {
+    if (instruction.name !== "initializeMarket") continue;
+    const marketRef = normalizeBase58Key(instruction.accounts[3] ?? null);
+    const matchingEvents = events.filter(
+      (event) =>
+        event.name === "marketCreated" &&
+        marketRefFromEvent(event) === marketRef,
+    );
+    if (!marketRef || matchingEvents.length !== 1) {
+      throw new Error(
+        "initializeMarket requires one canonical marketCreated event",
+      );
+    }
+  }
 
   for (const event of events) {
     const marketPda = marketRefFromEvent(event);
     if (!marketInstructionRefs.has(marketPda)) {
       throw new Error(`${event.name} is not bound to a decoded instruction`);
     }
-    if (event.name === "orderPlaced") {
+    if (event.name === "marketCreated") {
+      const matching = instructions.filter(
+        (instruction) =>
+          instruction.name === "initializeMarket" &&
+          instruction.accounts[3] === marketPda,
+      );
+      const instruction = matching[0];
+      if (!instruction || matching.length !== 1) {
+        throw new Error(
+          "marketCreated event does not match one initializeMarket instruction",
+        );
+      }
+      const identity = requireCanonicalMarketCreationIdentity({
+        fightProgramId: FIGHT_ORACLE_PROGRAM_ID,
+        marketProgramId: solanaCtx.marketProgramId,
+        instructionDuelKey: instruction.data.duelKey,
+        instructionMarketKind: instruction.data.marketKind,
+        eventDuelKey: event.data.duelKey,
+        eventMarketKind: event.data.marketKind,
+        eventMarketRef: marketPda,
+        accounts: instruction.accounts,
+        operatorSigned: isTransactionSigner(
+          transaction,
+          instruction.accounts[0] ?? "",
+        ),
+        nativeTransferCount: instruction.transfers.length,
+      });
+      await validateMarketAndDuel(marketPda, identity.duelStateRef);
+    } else if (event.name === "orderPlaced") {
       const orderId = toBigIntLike(event.data.orderId);
       const amount = toBigIntLike(event.data.amount);
       const maker = normalizeBase58Key(
@@ -2821,6 +3223,10 @@ async function parseFinalizedMarketLifecycleTransaction(
         orderId === null ||
         amount === null ||
         !maker ||
+        (side !== 1 && side !== 2) ||
+        price === null ||
+        price <= 0 ||
+        price >= 1_000 ||
         matching.length !== 1 ||
         (orderBehavior !== 0 && orderBehavior !== 1 && orderBehavior !== 2) ||
         !isTransactionSigner(transaction, maker)
@@ -2894,6 +3300,7 @@ async function parseFinalizedMarketLifecycleTransaction(
         makerOrderId === null ||
         takerOrderId === null ||
         amount === null ||
+        price === null ||
         !matchingInstruction
       ) {
         throw new Error(
@@ -2951,6 +3358,48 @@ async function parseFinalizedMarketLifecycleTransaction(
           wallet: maker,
         }),
       );
+    } else if (event.name === "emptyUserBalanceClosed") {
+      const wallet = normalizeBase58Key(
+        toInstructionAccountAddress(event.data.user),
+      );
+      const matching = instructions.filter(
+        (instruction) =>
+          instruction.name === "closeEmptyUserBalance" &&
+          instruction.accounts[0] === marketPda &&
+          instruction.accounts[2] === wallet,
+      );
+      const instruction = matching[0];
+      if (
+        !wallet ||
+        !instruction ||
+        matching.length !== 1 ||
+        instruction.accounts.length !== 3 ||
+        instruction.accounts[1] !==
+          findUserBalancePda(
+            solanaCtx.marketProgramId,
+            new PublicKey(marketPda),
+            new PublicKey(wallet),
+          ).toBase58() ||
+        !isTransactionSigner(transaction, wallet) ||
+        instruction.transfers.length !== 0
+      ) {
+        throw new Error(
+          "emptyUserBalanceClosed account/event graph is noncanonical",
+        );
+      }
+      const market = await validateCanonicalMarket(marketPda);
+      if (enumName(market.market.status)?.toLowerCase() === "open") {
+        throw new Error(
+          "emptyUserBalanceClosed cannot occur while the market is open",
+        );
+      }
+      facts.push(
+        normalizeLifecycleFact({
+          kind: "EMPTY_USER_BALANCE_CLOSED",
+          marketPda,
+          wallet,
+        }),
+      );
     } else if (event.name === "priceLevelClosed") {
       const side = toNumberLike(event.data.side);
       const price = toNumberLike(event.data.price);
@@ -2960,35 +3409,66 @@ async function parseFinalizedMarketLifecycleTransaction(
       const closer = normalizeBase58Key(
         toInstructionAccountAddress(event.data.closer),
       );
-      const matching = instructions.filter(
-        (instruction) =>
-          instruction.name === "closeEmptyPriceLevel" &&
-          instruction.accounts[0] === marketPda &&
-          toNumberLike(instruction.data.side) === side &&
-          toNumberLike(instruction.data.price) === price &&
-          instruction.accounts[2] === rentRecipient &&
-          instruction.accounts[3] === closer,
-      );
-      const instruction = matching[0];
       if (
         (side !== 1 && side !== 2) ||
         price === null ||
         price <= 0 ||
         price >= 1_000 ||
         !rentRecipient ||
-        !closer ||
-        !instruction ||
-        matching.length !== 1 ||
-        instruction.accounts.length !== 4 ||
-        instruction.accounts[1] !==
-          findPriceLevelPda(
-            solanaCtx.marketProgramId,
-            new PublicKey(marketPda),
-            side,
-            price,
-          ).toBase58() ||
-        !isTransactionSigner(transaction, closer) ||
-        instruction.transfers.length !== 0
+        !closer
+      ) {
+        throw new Error("priceLevelClosed account/event graph is noncanonical");
+      }
+      const expectedPriceLevel = findPriceLevelPda(
+        solanaCtx.marketProgramId,
+        new PublicKey(marketPda),
+        side,
+        price,
+      ).toBase58();
+      const matching = instructions.filter((instruction) => {
+        if (
+          instruction.accounts[0] !== marketPda ||
+          toNumberLike(instruction.data.side) !== side ||
+          toNumberLike(instruction.data.price) !== price
+        ) {
+          return false;
+        }
+        if (instruction.name === "closeEmptyPriceLevel") {
+          return (
+            instruction.accounts[1] === expectedPriceLevel &&
+            instruction.accounts[2] === rentRecipient &&
+            instruction.accounts[3] === closer
+          );
+        }
+        return (
+          (instruction.name === "cancelOrder" ||
+            instruction.name === "reclaimRestingOrder") &&
+          instruction.accounts[3] === expectedPriceLevel &&
+          instruction.accounts[5] === rentRecipient &&
+          rentRecipient === closer
+        );
+      });
+      const instruction = matching[0];
+      if (!instruction || matching.length !== 1) {
+        throw new Error("priceLevelClosed account/event graph is noncanonical");
+      }
+      let canonicalInstructionGraph = false;
+      if (instruction.name === "closeEmptyPriceLevel") {
+        canonicalInstructionGraph =
+          instruction.accounts.length === 4 &&
+          instruction.transfers.length === 0;
+      } else {
+        try {
+          requireCanonicalCancellationAdjacencyAccounts(instruction.accounts);
+          canonicalInstructionGraph =
+            instruction.accounts[6] === SystemProgram.programId.toBase58();
+        } catch {
+          canonicalInstructionGraph = false;
+        }
+      }
+      if (
+        !canonicalInstructionGraph ||
+        !isTransactionSigner(transaction, closer)
       ) {
         throw new Error("priceLevelClosed account/event graph is noncanonical");
       }
@@ -3015,7 +3495,6 @@ async function parseFinalizedMarketLifecycleTransaction(
       );
     } else if (
       ![
-        "marketCreated",
         "orderCancelled",
         "restingOrderReclaimed",
         "losingBalanceClosed",
@@ -3126,17 +3605,16 @@ async function parseFinalizedMarketLifecycleTransaction(
     if (
       marketMakerSnapshot !== marketMaker ||
       treasurySnapshot !== treasury ||
-      !Number.isInteger(treasuryFeeBps) ||
+      treasuryFeeBps === null ||
       treasuryFeeBps < 0 ||
       treasuryFeeBps > 10_000 ||
-      !Number.isInteger(marketMakerFeeBps) ||
+      marketMakerFeeBps === null ||
       marketMakerFeeBps < 0 ||
       marketMakerFeeBps > 10_000 ||
-      instruction.transfers.some(
-        (transfer) =>
-          (transfer.source === wallet && transfer.destination !== vault) ||
-          (transfer.source === vault && transfer.destination !== wallet),
-      )
+      !hasOnlyAllowedNativeTransferEdges(instruction.transfers, [
+        { source: wallet, destination: vault },
+        { source: vault, destination: wallet },
+      ])
     ) {
       throw new Error(`${instruction.name} fee/transfer graph is noncanonical`);
     }
@@ -3164,7 +3642,7 @@ async function parseFinalizedMarketLifecycleTransaction(
     for (const event of matchingEvents) {
       const amount = toBigIntLike(event.data.matchedAmount);
       const executionPrice = toNumberLike(event.data.price);
-      if (amount === null) {
+      if (amount === null || executionPrice === null) {
         throw new Error("orderMatched event has an invalid amount");
       }
       const cost = quoteCostLamports(side, executionPrice, amount);
@@ -3362,6 +3840,8 @@ async function parseFinalizedMarketLifecycleTransaction(
         treasuryFeeLamports === null ||
         marketMakerFeeLamports === null ||
         (treasuryFeeLamports === 0n && marketMakerFeeLamports === 0n) ||
+        (treasuryFeeLamports > 0n && treasury === vault) ||
+        (marketMakerFeeLamports > 0n && marketMaker === vault) ||
         sumNativeTransfers(instruction.transfers, vault, treasury) !==
           treasuryFeeLamports +
             (treasury === marketMaker ? marketMakerFeeLamports : 0n) ||
@@ -3463,6 +3943,7 @@ async function parseFinalizedMarketLifecycleTransaction(
       instruction.name === "cancelOrder" ||
       instruction.name === "reclaimRestingOrder"
     ) {
+      requireCanonicalCancellationAdjacencyAccounts(instruction.accounts);
       const orderId = toBigIntLike(instruction.data.orderId);
       const side = toNumberLike(instruction.data.side);
       const price = toNumberLike(instruction.data.price);
@@ -3481,7 +3962,9 @@ async function parseFinalizedMarketLifecycleTransaction(
       if (
         orderId === null ||
         (side !== 1 && side !== 2) ||
-        !Number.isInteger(price) ||
+        price === null ||
+        price <= 0 ||
+        price >= 1_000 ||
         !vault ||
         !wallet ||
         matchingEvents.length !== 1 ||
@@ -3511,13 +3994,12 @@ async function parseFinalizedMarketLifecycleTransaction(
         );
       }
       if (
-        instruction.transfers.some(
-          (transfer) =>
-            transfer.source === vault && transfer.destination !== wallet,
-        )
+        !hasOnlyAllowedNativeTransferEdges(instruction.transfers, [
+          { source: vault, destination: wallet },
+        ])
       ) {
         throw new Error(
-          `${instruction.name} contains an unexplained vault transfer`,
+          `${instruction.name} contains an unexplained native transfer`,
         );
       }
       const refundLamports = sumNativeTransfers(
@@ -3587,16 +4069,6 @@ async function parseFinalizedMarketLifecycleTransaction(
     ) {
       throw new Error("claim account/transfer graph is noncanonical");
     }
-    const payoutLamports = sumNativeTransfers(
-      instruction.transfers,
-      vault,
-      wallet,
-    );
-    const feeLamports = sumNativeTransfers(
-      instruction.transfers,
-      vault,
-      marketMaker,
-    );
     const status = enumName(market.status)?.toLowerCase();
     const winner = enumName(market.winner)?.toLowerCase();
     const claimEvents = events.filter(
@@ -3634,20 +4106,34 @@ async function parseFinalizedMarketLifecycleTransaction(
       claimEvents.length !== 1 ||
       eventStatus !== status ||
       eventWinner !== winner ||
-      eventPayout !== payoutLamports ||
-      eventWinningsFee !== feeLamports ||
+      eventPayout === null ||
+      eventWinningsFee === null ||
       refundedTradeTreasuryFee === null ||
       refundedTradeMarketMakerFee === null ||
+      winningsFeeBps === null ||
+      winningsFeeBps < 0 ||
+      winningsFeeBps > 10_000
+    ) {
+      throw new Error("claim market/event accounting is invalid");
+    }
+    if (
       (status === "resolved" &&
         (refundedTradeTreasuryFee !== 0n ||
           refundedTradeMarketMakerFee !== 0n)) ||
       (status === "cancelled" &&
-        (feeLamports !== 0n ||
-          refundedTradeTreasuryFee + refundedTradeMarketMakerFee >
-            payoutLamports))
+        (eventWinningsFee !== 0n ||
+          refundedTradeTreasuryFee + refundedTradeMarketMakerFee > eventPayout))
     ) {
       throw new Error("claim market/event accounting is invalid");
     }
+    const { payoutLamports, feeLamports } = verifyClaimTransferEvidence({
+      transfers: instruction.transfers,
+      vault,
+      wallet,
+      marketMaker,
+      eventPayoutLamports: eventPayout,
+      eventWinningsFeeLamports: eventWinningsFee,
+    });
     const kind = verifyClaimLifecycleAccounting({
       status,
       winner,
@@ -3675,7 +4161,7 @@ async function parseFinalizedMarketLifecycleTransaction(
   }
 
   return {
-    instructionNames: [...new Set(instructions.map((item) => item.name))],
+    instructionNames: instructions.map((item) => item.name),
     facts,
   };
 }
@@ -3698,23 +4184,23 @@ try {
     fightProgram: fightOracle,
     marketProgram: duelMarket,
     marketProgramId: duelMarket.programId,
-    expectedFightUpgradeAuthority: resolveExpectedUpgradeAuthority({
+    expectedFightUpgradeAuthority: resolveClusterExpectedUpgradeAuthority({
+      cluster: SERVICE_SOLANA_CLUSTER,
       value:
         process.env.FIGHT_ORACLE_EXPECTED_UPGRADE_AUTHORITY ||
         process.env.SOLANA_EXPECTED_UPGRADE_AUTHORITY,
-      required: SERVICE_IS_MAINNET,
       label: "fight oracle",
     }),
-    expectedMarketUpgradeAuthority: resolveExpectedUpgradeAuthority({
+    expectedMarketUpgradeAuthority: resolveClusterExpectedUpgradeAuthority({
+      cluster: SERVICE_SOLANA_CLUSTER,
       value:
         process.env.DUEL_MARKET_EXPECTED_UPGRADE_AUTHORITY ||
         process.env.SOLANA_EXPECTED_UPGRADE_AUTHORITY,
-      required: SERVICE_IS_MAINNET,
       label: "duel market",
     }),
-    lifecycleIndexStartSlot: resolveLifecycleIndexStartSlot({
+    lifecycleIndexStartSlot: resolveClusterLifecycleIndexStartSlot({
+      cluster: SERVICE_SOLANA_CLUSTER,
       value: process.env.SOLANA_LIFECYCLE_INDEX_START_SLOT,
-      required: SERVICE_IS_MAINNET,
     }),
   };
   parsers.solana.enabled = true;
@@ -3733,6 +4219,8 @@ async function syncFinalizedMarketLifecycleIndex(): Promise<{
   indexedFacts: number;
   remainingTransactions: number;
   reconciledBets: number;
+  pendingBets: number;
+  oldestPendingBetAgeMs: number | null;
   rewardChanges: number;
   terminalSettlements: number;
   settledBets: number;
@@ -3781,9 +4269,9 @@ async function syncFinalizedMarketLifecycleIndex(): Promise<{
         blockTime: reference.blockTime,
         succeeded: false,
         instructionNames: [],
-        transactionDigest: createHash("sha256")
-          .update(`failed:${reference.signature}`)
-          .digest("hex"),
+        transactionDigest: digestFailedFinalizedTransaction(
+          reference.signature,
+        ),
         facts: [],
         indexedAt: Date.now(),
       });
@@ -3800,16 +4288,26 @@ async function syncFinalizedMarketLifecycleIndex(): Promise<{
     );
     if (
       !transaction ||
-      !transaction.meta ||
-      transaction.meta.err ||
+      !hasExactSuccessfulFinalizedTransactionMeta(transaction.meta) ||
       transaction.slot !== reference.slot ||
-      !transaction.transaction.signatures.includes(reference.signature) ||
-      (reference.blockTime !== null &&
-        transaction.blockTime !== null &&
-        transaction.blockTime !== reference.blockTime)
+      exactPrimarySolanaTransactionSignature(
+        transaction.transaction.signatures,
+      ) !== reference.signature
     ) {
       throw new Error(
         `finalized lifecycle transaction evidence drifted for ${reference.signature}`,
+      );
+    }
+    let finalizedBlockTime: number | null;
+    try {
+      finalizedBlockTime = requireExactFinalizedBlockTimeParity({
+        referenceBlockTime: reference.blockTime,
+        transactionBlockTime: transaction.blockTime,
+      });
+    } catch (error) {
+      throw new Error(
+        `finalized lifecycle transaction evidence drifted for ${reference.signature}`,
+        { cause: error },
       );
     }
     let parsed: Awaited<
@@ -3833,10 +4331,10 @@ async function syncFinalizedMarketLifecycleIndex(): Promise<{
       startSlot: solanaCtx.lifecycleIndexStartSlot,
       signature: reference.signature,
       slot: reference.slot,
-      blockTime: transaction.blockTime ?? reference.blockTime,
+      blockTime: finalizedBlockTime,
       succeeded: true,
       instructionNames: parsed.instructionNames,
-      transactionDigest: digestFinalizedTransactionEvidence(transaction),
+      transactionDigest: digestFinalizedSolanaTransaction(transaction),
       facts: parsed.facts,
       indexedAt: Date.now(),
     });
@@ -3855,6 +4353,7 @@ async function syncFinalizedMarketLifecycleIndex(): Promise<{
     cluster: SERVICE_SOLANA_CLUSTER,
     programId,
   });
+  const reconciledAt = Date.now();
   const reconciliation = reconcileSolanaBetLifecycleAccounting({
     cluster: SERVICE_SOLANA_CLUSTER,
     programId,
@@ -3862,7 +4361,7 @@ async function syncFinalizedMarketLifecycleIndex(): Promise<{
     throughSignature:
       updatedCheckpoint?.signature ??
       `start:${solanaCtx.lifecycleIndexStartSlot}`,
-    reconciledAt: Date.now(),
+    reconciledAt,
   });
   for (const change of reconciliation.changes) {
     const wallet = normalizeWallet(change.wallet);
@@ -3885,9 +4384,15 @@ async function syncFinalizedMarketLifecycleIndex(): Promise<{
     }
     pointsEvents.unshift(...change.events.slice().reverse());
   }
-  if (reconciliation.pendingBets > 0) {
+  const pendingState = evaluateSolanaLifecyclePendingState({
+    pendingBets: reconciliation.pendingBets,
+    oldestPendingBetRecordedAt: reconciliation.oldestPendingBetRecordedAt,
+    nowMs: reconciledAt,
+    maximumPendingAgeMs: SOLANA_LIFECYCLE_PENDING_MAX_AGE_MS,
+  });
+  if (!pendingState.withinFinalizationGrace) {
     throw new Error(
-      `Solana lifecycle reconciliation is waiting for ${reconciliation.pendingBets} recorded bet transaction(s) to enter the finalized index`,
+      `Solana lifecycle reconciliation has ${pendingState.pendingBets} recorded bet transaction(s) outside the ${SOLANA_LIFECYCLE_PENDING_MAX_AGE_MS}ms finalized-index grace`,
     );
   }
   return {
@@ -3900,6 +4405,8 @@ async function syncFinalizedMarketLifecycleIndex(): Promise<{
       pending.length - SOLANA_LIFECYCLE_INDEX_BATCH_SIZE,
     ),
     reconciledBets: reconciliation.reconciledBets,
+    pendingBets: pendingState.pendingBets,
+    oldestPendingBetAgeMs: pendingState.oldestPendingBetAgeMs,
     rewardChanges: reconciliation.changes.length,
     terminalSettlements: reconciliation.terminalSettlements,
     settledBets: reconciliation.settledBets,
@@ -4022,6 +4529,8 @@ async function pollSolanaSnapshot(): Promise<void> {
       lifecycleIndexedFacts: lifecycleIndex.indexedFacts,
       lifecycleRemainingTransactions: lifecycleIndex.remainingTransactions,
       lifecycleReconciledBets: lifecycleIndex.reconciledBets,
+      lifecyclePendingBets: lifecycleIndex.pendingBets,
+      lifecycleOldestPendingBetAgeMs: lifecycleIndex.oldestPendingBetAgeMs,
       lifecycleRewardChanges: lifecycleIndex.rewardChanges,
       lifecycleTerminalSettlements: lifecycleIndex.terminalSettlements,
       lifecycleSettledBets: lifecycleIndex.settledBets,
@@ -4032,6 +4541,8 @@ async function pollSolanaSnapshot(): Promise<void> {
       derivedMarketPda,
       currentDuelPda,
       currentMarketPda,
+      currentDuelAccountExists: currentDuelAccount !== null,
+      currentMarketAccountExists: currentMarketAccount !== null,
       currentDuelStatus: enumName(currentDuelAccount?.status),
       currentMarketStatus: enumName(currentMarketAccount?.status),
       currentMarketWinner: enumName(currentMarketAccount?.winner),
@@ -4053,8 +4564,9 @@ async function pollSolanaSnapshot(): Promise<void> {
     parsers.solana.lastSuccessAt = Date.now();
     parsers.solana.lastError = null;
   } catch (error) {
-    parsers.solana.lastError =
-      error instanceof Error ? error.message : "Solana poll failed";
+    const diagnostic = sanitizeErrorMessage(error);
+    parsers.solana.lastError = diagnostic;
+    console.error(`[solana-parser] ${diagnostic}`);
   }
 }
 
@@ -4077,24 +4589,19 @@ function getReferralOwner(
 }
 
 function pointsForWalletResponse(wallet: string): Record<string, unknown> {
-  const normalized = rememberWalletCase(wallet);
-  const aggregate = aggregatePoints([normalized]);
-  const referredBy = getReferralOwner(normalized);
+  const normalized = normalizeWallet(wallet);
+  const aggregate = aggregatePointsReadOnly([normalized]);
+  const referredBy = referredByWallet.get(normalized) ?? null;
 
   return {
-    wallet: wallet.trim(),
+    wallet: displayWallet(normalized),
     totalPoints: totalPoints(aggregate),
     selfPoints: aggregate.selfPoints,
     winPoints: aggregate.winPoints,
     referralPoints: aggregate.referralPoints,
     invitedWalletCount: (invitedWalletsByWallet.get(normalized) ?? new Set())
       .size,
-    referredBy: referredBy
-      ? {
-          wallet: displayWallet(referredBy.wallet),
-          code: referredBy.code,
-        }
-      : null,
+    referred: referredBy !== null,
   };
 }
 
@@ -4117,7 +4624,7 @@ function leaderboardResponse(
 }
 
 function rankResponse(wallet: string): Record<string, unknown> {
-  const normalized = rememberWalletCase(wallet);
+  const normalized = normalizeWallet(wallet);
   const rows = leaderboardRows("alltime");
   const rank =
     rows.findIndex((entry) => normalizeWallet(entry.wallet) === normalized) + 1;
@@ -4125,7 +4632,7 @@ function rankResponse(wallet: string): Record<string, unknown> {
   return {
     wallet: displayWallet(normalized),
     rank: rank > 0 ? rank : 0,
-    totalPoints: totalPoints(aggregatePoints([normalized])),
+    totalPoints: totalPoints(aggregatePointsReadOnly([normalized])),
   };
 }
 
@@ -4135,7 +4642,7 @@ function historyResponse(
   offset: number,
   eventType: string | null,
 ): Record<string, unknown> {
-  const normalized = rememberWalletCase(wallet);
+  const normalized = normalizeWallet(wallet);
   const filtered = pointsEvents.filter((entry) => {
     if (entry.wallet !== normalized) return false;
     if (eventType && entry.eventType !== eventType) return false;
@@ -4150,9 +4657,7 @@ function historyResponse(
     totalPoints: entry.totalPoints,
     referenceType: entry.referenceType,
     referenceId: entry.referenceId,
-    relatedWallet: entry.relatedWallet
-      ? displayWallet(entry.relatedWallet)
-      : null,
+    related: entry.relatedWallet !== null,
     createdAt: entry.createdAt,
   }));
 
@@ -4172,6 +4677,14 @@ function canonicalSolanaRequestAddress(value: string): string | null {
     return canonical === value ? canonical : null;
   } catch {
     return null;
+  }
+}
+
+function decodePathComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return "";
   }
 }
 
@@ -4244,10 +4757,12 @@ function handleSolanaSettlementHistory(
     return jsonResponse(
       req,
       {
-        schemaVersion: 1,
+        schemaVersion: 2,
         chain: "SOLANA",
         asset: "SOL",
         decimals: 9,
+        cluster: SERVICE_SOLANA_CLUSTER,
+        programId: DUEL_MARKET_PROGRAM_ID.toBase58(),
         ledger: settlementLedgerStatus(),
         ...history,
         updatedAt: Date.now(),
@@ -4269,12 +4784,24 @@ function handleSolanaSettlementHistory(
 }
 
 async function handleBetRecord(req: Request): Promise<Response> {
-  let payload: Record<string, unknown>;
-  try {
-    payload = (await req.json()) as Record<string, unknown>;
-  } catch {
-    return jsonResponse(req, { error: "Invalid JSON body" }, 400);
+  const databaseHealth = checkDatabaseHealth();
+  if (!databaseHealth.ok) {
+    return jsonResponse(
+      req,
+      {
+        error: "Bet ledger is unavailable pending operator recovery",
+        retryable: false,
+      },
+      503,
+      { "cache-control": "no-store" },
+    );
   }
+
+  const body = await readBoundedJsonObjectBody(req, 32 * 1024);
+  if (body.ok === false) {
+    return jsonResponse(req, { error: body.error }, body.status);
+  }
+  const payload = body.value;
 
   const walletRaw = String(payload.bettorWallet || "").trim();
   if (!walletRaw) {
@@ -4288,6 +4815,19 @@ async function handleBetRecord(req: Request): Promise<Response> {
       ? String(payload.marketRef)
       : null;
   const duelKeyRaw = payload.duelKey ? String(payload.duelKey).trim() : null;
+  const duelIdValue = payload.duelId;
+  const duelIdRaw =
+    typeof duelIdValue === "string" ? normalizeDuelId(duelIdValue) : null;
+  if (
+    (duelIdValue !== undefined && duelIdValue !== null && !duelIdRaw) ||
+    (duelKeyRaw === null) !== (duelIdRaw === null)
+  ) {
+    return jsonResponse(
+      req,
+      { error: "Canonical duelId and duelKey must be supplied together" },
+      400,
+    );
+  }
   const authorizedByWriteKey = hasPrivilegedWriteAuth(req);
   const allowPrivilegedBypass =
     authorizedByWriteKey && !REQUIRE_ONCHAIN_BET_VERIFICATION;
@@ -4296,12 +4836,17 @@ async function handleBetRecord(req: Request): Promise<Response> {
     : await authorizeExternalBetRecord(req, walletRaw, txSignature, {
         marketRef: marketRefRaw,
         duelKey: duelKeyRaw,
+        duelId: duelIdRaw,
       });
-  if (authorization.status === "pending-finality") {
+  if (authorization.status === "pending-verification") {
+    const transactionVisibilityPending =
+      authorization.verificationCode === "transaction-not-found";
     return jsonResponse(
       req,
       {
-        error: "Solana place-order finalization is still pending",
+        error: transactionVisibilityPending
+          ? "Finalized Solana place-order visibility is still propagating"
+          : "Solana place-order verification is temporarily unavailable",
         retryable: true,
         ...(!IS_PRODUCTION
           ? {
@@ -4313,8 +4858,8 @@ async function handleBetRecord(req: Request): Promise<Response> {
             }
           : {}),
       },
-      425,
-      { "retry-after": "1" },
+      transactionVisibilityPending ? 425 : 503,
+      { "retry-after": transactionVisibilityPending ? "1" : "2" },
     );
   }
   if (authorization.status === "rpc-unavailable") {
@@ -4372,6 +4917,14 @@ async function handleBetRecord(req: Request): Promise<Response> {
   const canonicalTxSignature = verifiedExternalBet?.txSignature ?? txSignature;
   const canonicalMarketRef = verifiedExternalBet?.marketRef ?? marketRefRaw;
   const canonicalDuelKey = verifiedExternalBet?.duelKey ?? duelKeyRaw;
+  const canonicalDuelId = verifiedExternalBet?.duelId ?? duelIdRaw;
+  if ((canonicalDuelKey === null) !== (canonicalDuelId === null)) {
+    return jsonResponse(
+      req,
+      { error: "Canonical duelId and duelKey must be supplied together" },
+      400,
+    );
+  }
   const canonicalExternalBetRef = allowPrivilegedBypass
     ? payload.externalBetRef
       ? String(payload.externalBetRef)
@@ -4383,6 +4936,8 @@ async function handleBetRecord(req: Request): Promise<Response> {
       : null;
   const record: BetRecord = {
     id: `${recordedAt}-${Math.random().toString(36).slice(2, 10)}`,
+    cluster: SERVICE_SOLANA_CLUSTER,
+    programId: DUEL_MARKET_PROGRAM_ID.toBase58(),
     bettorWallet: displayWallet(normalizedWallet),
     chain: toRecordedBetChain("solana"),
     sourceAsset: "SOL",
@@ -4392,7 +4947,7 @@ async function handleBetRecord(req: Request): Promise<Response> {
     txSignature: canonicalTxSignature,
     marketPda: canonicalMarketRef,
     duelKey: canonicalDuelKey,
-    duelId: payload.duelId ? String(payload.duelId).trim() : null,
+    duelId: canonicalDuelId,
     inviteCode: null,
     externalBetRef: canonicalExternalBetRef,
     recordedAt,
@@ -4481,16 +5036,11 @@ async function handleBetRecord(req: Request): Promise<Response> {
 }
 
 async function handleInviteRedeem(req: Request): Promise<Response> {
-  if (!requireWriteAuth(req)) {
-    return jsonResponse(req, { error: "Unauthorized write key" }, 401);
+  const body = await readBoundedJsonObjectBody(req, 8 * 1024);
+  if (body.ok === false) {
+    return jsonResponse(req, { error: body.error }, body.status);
   }
-
-  let payload: Record<string, unknown>;
-  try {
-    payload = (await req.json()) as Record<string, unknown>;
-  } catch {
-    return jsonResponse(req, { error: "Invalid JSON body" }, 400);
-  }
+  const payload = body.value;
 
   const walletRaw = String(payload.wallet || "").trim();
   const inviteCode = String(payload.inviteCode || "")
@@ -4504,7 +5054,36 @@ async function handleInviteRedeem(req: Request): Promise<Response> {
     );
   }
 
-  const wallet = rememberWalletCase(walletRaw);
+  const canonicalWallet = canonicalSolanaRequestAddress(walletRaw);
+  if (!canonicalWallet) {
+    return jsonResponse(
+      req,
+      { error: "Canonical Solana wallet is required" },
+      400,
+    );
+  }
+
+  if (
+    !hasPrivilegedWriteAuth(req) &&
+    !verifySolanaWalletActionProof({
+      action: "invite-redeem",
+      cluster: SERVICE_SOLANA_CLUSTER,
+      wallet: canonicalWallet,
+      inviteCode,
+      issuedAtMs: body.value.issuedAtMs as number,
+      signature:
+        typeof body.value.signature === "string" ? body.value.signature : "",
+    }).ok
+  ) {
+    return jsonResponse(
+      req,
+      { error: "Valid wallet authorization is required" },
+      401,
+      { "cache-control": "no-store" },
+    );
+  }
+
+  const wallet = rememberWalletCase(canonicalWallet);
 
   const inviterWallet = walletByInviteCode.get(inviteCode);
   if (!inviterWallet) {
@@ -4520,12 +5099,17 @@ async function handleInviteRedeem(req: Request): Promise<Response> {
 
   const existing = referredByWallet.get(wallet);
   if (existing) {
-    return jsonResponse(req, {
-      result: {
-        alreadyRedeemed: true,
-        signupBonus: 0,
+    return jsonResponse(
+      req,
+      {
+        result: {
+          alreadyRedeemed: true,
+          signupBonus: 0,
+        },
       },
-    });
+      200,
+      { "cache-control": "no-store" },
+    );
   }
 
   referredByWallet.set(wallet, { wallet: inviterWallet, code: inviteCode });
@@ -4566,53 +5150,152 @@ async function handleInviteRedeem(req: Request): Promise<Response> {
     createdAt: Date.now(),
   });
 
-  return jsonResponse(req, {
-    result: {
-      alreadyRedeemed: false,
-      signupBonus,
+  return jsonResponse(
+    req,
+    {
+      result: {
+        alreadyRedeemed: false,
+        signupBonus,
+      },
     },
-  });
+    200,
+    { "cache-control": "no-store" },
+  );
+}
+
+async function handleInviteRegister(req: Request): Promise<Response> {
+  const body = await readBoundedJsonObjectBody(req, 8 * 1024);
+  if (body.ok === false) {
+    return jsonResponse(req, { error: body.error }, body.status);
+  }
+  const walletRaw =
+    typeof body.value.wallet === "string" ? body.value.wallet.trim() : "";
+  const wallet = canonicalSolanaRequestAddress(walletRaw);
+  if (!wallet) {
+    return jsonResponse(
+      req,
+      { error: "Canonical Solana wallet is required" },
+      400,
+    );
+  }
+
+  if (
+    !hasPrivilegedWriteAuth(req) &&
+    !verifySolanaWalletActionProof({
+      action: "invite-register",
+      cluster: SERVICE_SOLANA_CLUSTER,
+      wallet,
+      inviteCode: null,
+      issuedAtMs: body.value.issuedAtMs as number,
+      signature:
+        typeof body.value.signature === "string" ? body.value.signature : "",
+    }).ok
+  ) {
+    return jsonResponse(
+      req,
+      { error: "Valid wallet authorization is required" },
+      401,
+      { "cache-control": "no-store" },
+    );
+  }
+  return jsonResponse(
+    req,
+    { wallet, inviteCode: inviteCodeForWallet(wallet) },
+    200,
+    { "cache-control": "no-store" },
+  );
 }
 
 function inviteSummary(
   walletRaw: string,
   platformView: string,
 ): Record<string, unknown> {
-  const wallet = rememberWalletCase(walletRaw);
-  const code = inviteCodeForWallet(wallet);
+  const wallet = normalizeWallet(walletRaw);
+  const code = inviteCodeByWallet.get(wallet) ?? null;
   const invited = invitedWalletsByWallet.get(wallet) ?? new Set<string>();
-  const aggregate = aggregatePoints([wallet]);
-  const referredBy = getReferralOwner(wallet);
-  const invitedWallets = [...invited].map((entry) => displayWallet(entry));
+  const aggregate = aggregatePointsReadOnly([wallet]);
+  const referredBy = referredByWallet.get(wallet) ?? null;
   const totalReferralWinPoints = pointsEvents
     .filter(
       (entry) => entry.wallet === wallet && entry.eventType === "REFERRAL_WIN",
     )
     .reduce((sum, entry) => sum + entry.totalPoints, 0);
+  const normalizedPlatformView = /^[A-Za-z0-9._-]{1,32}$/u.test(platformView)
+    ? platformView
+    : "unknown";
 
   return {
     wallet: displayWallet(wallet),
-    platformView: platformView || "unknown",
+    platformView: normalizedPlatformView,
     inviteCode: code,
-    invitedWalletCount: invitedWallets.length,
-    invitedWallets: invitedWallets.slice(0, 25),
-    invitedWalletsTruncated: invitedWallets.length > 25,
+    inviteRegistrationRequired: code === null,
+    invitedWalletCount: invited.size,
     pointsFromReferrals: aggregate.referralPoints,
-    referredByWallet: referredBy ? displayWallet(referredBy.wallet) : null,
-    referredByCode: referredBy ? referredBy.code : null,
-    activeReferralCount: invitedWallets.length,
+    referred: referredBy !== null,
+    activeReferralCount: invited.size,
     pendingSignupBonuses: 0,
     totalReferralWinPoints,
   };
 }
 
-async function handleSolanaRpcProxy(req: Request): Promise<Response> {
+async function readBoundedUpstreamText(
+  response: Response,
+  maximumBytes: number,
+): Promise<string> {
+  const contentLength = response.headers.get("content-length");
+  if (
+    contentLength &&
+    /^\d+$/u.test(contentLength) &&
+    Number(contentLength) > maximumBytes
+  ) {
+    await response.body?.cancel();
+    throw new Error("upstream response exceeded the byte limit");
+  }
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maximumBytes) {
+        await reader.cancel();
+        throw new Error("upstream response exceeded the byte limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+async function handleSolanaRpcProxy(req: Request, url: URL): Promise<Response> {
   if (!SOLANA_RPC_PROXY_URL) {
     return jsonResponse(
       req,
       { error: "SOLANA_RPC_URL is not configured" },
       503,
     );
+  }
+  const requestedCluster = url.searchParams
+    .get("cluster")
+    ?.trim()
+    .toLowerCase();
+  if (requestedCluster && requestedCluster !== SERVICE_SOLANA_CLUSTER) {
+    return jsonResponse(req, { error: "Unsupported Solana cluster" }, 400);
+  }
+  if (
+    HTTP_POLICY.deployment &&
+    !hasPrivilegedWriteAuth(req) &&
+    !isAllowedAppOrigin(req.headers.get("origin"), HTTP_POLICY)
+  ) {
+    return jsonResponse(req, { error: "Forbidden" }, 403, {
+      "cache-control": "no-store",
+    });
   }
 
   const rpcBody = await readJsonRpcBody(req, SOLANA_RPC_PROXY_MAX_BODY_BYTES);
@@ -4641,60 +5324,74 @@ async function handleSolanaRpcProxy(req: Request): Promise<Response> {
       },
       body: rpcBody.bodyText,
       cache: "no-store",
+      signal: AbortSignal.timeout(SOLANA_PROXY_TIMEOUT_MS),
     });
-    const payload = await upstream.text();
+    const payload = await readBoundedUpstreamText(
+      upstream,
+      SOLANA_RPC_PROXY_MAX_RESPONSE_BYTES,
+    );
+    JSON.parse(payload);
     const headers = new Headers({
-      "content-type":
-        upstream.headers.get("content-type") ||
-        "application/json; charset=utf-8",
+      "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
       ...securityHeaders(),
     });
     applyCors(req, headers);
     return new Response(payload, { status: upstream.status, headers });
   } catch (error) {
+    console.warn(`[solana-rpc-proxy] ${sanitizeErrorMessage(error)}`);
     return jsonResponse(
       req,
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to proxy Solana RPC request",
-      },
+      { error: "Failed to proxy Solana RPC request" },
       502,
+      { "cache-control": "no-store" },
     );
   }
 }
 
 async function handleSolanaSenderProxy(req: Request): Promise<Response> {
-  if (!SOLANA_SENDER_PROXY_URL) {
-    return jsonResponse(req, { error: "Helius Sender is not configured" }, 503);
+  const sender = SOLANA_PROXY_RAIL.sender;
+  if (!sender) {
+    return jsonResponse(req, { error: "Solana Sender is not configured" }, 503);
   }
 
-  let payload: Record<string, unknown>;
-  try {
-    payload = (await req.json()) as Record<string, unknown>;
-  } catch {
-    return jsonResponse(req, { error: "Invalid JSON body" }, 400);
+  const body = await readBoundedJsonObjectBody(req, 16 * 1024);
+  if (body.ok === false) {
+    return jsonResponse(req, { error: body.error }, body.status);
   }
+  const payload = body.value;
 
   const transaction =
     typeof payload.transaction === "string" ? payload.transaction.trim() : "";
   if (!transaction) {
     return jsonResponse(req, { error: "transaction is required" }, 400);
   }
+  if (transaction.length > SOLANA_SENDER_MAX_TRANSACTION_CHARS) {
+    return jsonResponse(req, { error: "transaction is too large" }, 413);
+  }
 
   const authorizedByKey = hasPrivilegedWriteAuth(req);
-  const trustedOrigin = isAllowedAppOrigin(req.headers.get("origin"));
+  const trustedOrigin = isAllowedAppOrigin(
+    req.headers.get("origin"),
+    HTTP_POLICY,
+  );
 
-  let decodedTransaction: Transaction | VersionedTransaction;
+  let decodedTransaction;
   try {
     decodedTransaction = decodeSenderTransaction(transaction);
   } catch {
     return jsonResponse(req, { error: "invalid transaction encoding" }, 400);
   }
 
-  if (!isWhitelistedSenderTransaction(decodedTransaction)) {
+  if (
+    !isWhitelistedSenderTransaction(
+      decodedTransaction,
+      new Set([
+        FIGHT_ORACLE_PROGRAM_ID.toBase58(),
+        DUEL_MARKET_PROGRAM_ID.toBase58(),
+      ]),
+    )
+  ) {
     return jsonResponse(
       req,
       { error: "sender proxy only accepts Hyperbet Solana transactions" },
@@ -4711,7 +5408,7 @@ async function handleSolanaSenderProxy(req: Request): Promise<Response> {
   }
 
   try {
-    const upstream = await fetch(SOLANA_SENDER_PROXY_URL, {
+    const upstream = await fetch(sender.url, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -4724,23 +5421,32 @@ async function handleSolanaSenderProxy(req: Request): Promise<Response> {
           transaction,
           {
             encoding: "base64",
-            skipPreflight: true,
-            maxRetries: 0,
+            skipPreflight: sender.skipPreflight,
+            maxRetries: sender.maxRetries,
           },
         ],
       }),
       cache: "no-store",
+      signal: AbortSignal.timeout(SOLANA_PROXY_TIMEOUT_MS),
     });
-    const raw = (await upstream.json()) as Record<string, unknown>;
+    const rawText = await readBoundedUpstreamText(
+      upstream,
+      SOLANA_SENDER_PROXY_MAX_RESPONSE_BYTES,
+    );
+    const raw = JSON.parse(rawText) as Record<string, unknown>;
     const error = raw.error;
     if (!upstream.ok || error) {
-      const message =
-        typeof error === "object" &&
-        error !== null &&
-        typeof (error as Record<string, unknown>).message === "string"
-          ? ((error as Record<string, unknown>).message as string)
-          : `Sender proxy HTTP ${upstream.status}`;
-      return jsonResponse(req, { error: message }, upstream.status || 502);
+      console.warn(
+        `[solana-sender-proxy] upstream rejected request with HTTP ${upstream.status}`,
+      );
+      return jsonResponse(
+        req,
+        { error: "Solana Sender rejected the transaction" },
+        upstream.status >= 400 && upstream.status <= 599
+          ? upstream.status
+          : 502,
+        { "cache-control": "no-store" },
+      );
     }
 
     const signature = typeof raw.result === "string" ? raw.result : null;
@@ -4750,15 +5456,12 @@ async function handleSolanaSenderProxy(req: Request): Promise<Response> {
 
     return jsonResponse(req, { signature }, 200);
   } catch (error) {
+    console.warn(`[solana-sender-proxy] ${sanitizeErrorMessage(error)}`);
     return jsonResponse(
       req,
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to proxy Solana Sender request",
-      },
+      { error: "Failed to proxy Solana Sender request" },
       502,
+      { "cache-control": "no-store" },
     );
   }
 }
@@ -4792,7 +5495,7 @@ async function readJsonRpcBody(
     };
   }
 
-  if (bodyText.length > maxBodyBytes) {
+  if (Buffer.byteLength(bodyText, "utf8") > maxBodyBytes) {
     return {
       ok: false,
       response: jsonResponse(req, { error: "JSON-RPC body too large" }, 413),
@@ -4812,10 +5515,23 @@ async function readJsonRpcBody(
   const requests = (
     Array.isArray(parsedBody) ? parsedBody : [parsedBody]
   ) as JsonRpcRequestPayload[];
+  if (requests.length > 50) {
+    return {
+      ok: false,
+      response: jsonResponse(req, { error: "JSON-RPC batch too large" }, 413),
+    };
+  }
   const hasInvalidRequest = requests.some((entry) => {
     if (!entry || typeof entry !== "object") return true;
-    const method = (entry as Record<string, unknown>).method;
-    return typeof method !== "string" || method.trim().length === 0;
+    const record = entry as Record<string, unknown>;
+    const method = record.method;
+    const params = record.params;
+    return (
+      record.jsonrpc !== "2.0" ||
+      typeof method !== "string" ||
+      !/^[A-Za-z][A-Za-z0-9]{0,127}$/u.test(method) ||
+      (params !== undefined && (params === null || typeof params !== "object"))
+    );
   });
   if (requests.length === 0 || hasInvalidRequest) {
     return {
@@ -4863,23 +5579,32 @@ async function handleItemManifest(
   try {
     const upstream = await fetch(`${ITEM_MANIFEST_BASE_URL}/${fileName}`, {
       cache: "no-store",
+      signal: AbortSignal.timeout(ITEM_MANIFEST_TIMEOUT_MS),
     });
     if (upstream.ok) {
-      const payload = await upstream.json();
+      const payloadText = await readBoundedUpstreamText(
+        upstream,
+        ITEM_MANIFEST_MAX_RESPONSE_BYTES,
+      );
+      const payload = JSON.parse(payloadText) as unknown;
+      if (payload == null || typeof payload !== "object") {
+        throw new Error("item manifest payload was not an object or array");
+      }
       manifestCache.set(fileName, payload);
       return jsonResponse(req, payload, 200, {
         "cache-control": "public, max-age=60, stale-while-revalidate=60",
       });
     }
-  } catch {
-    // Fall back below.
+  } catch (error) {
+    console.warn(`[item-manifest] ${sanitizeErrorMessage(error)}`);
   }
 
-  const fallback: unknown[] = [];
-  manifestCache.set(fileName, fallback);
-  return jsonResponse(req, fallback, 200, {
-    "cache-control": "public, max-age=60, stale-while-revalidate=60",
-  });
+  return jsonResponse(
+    req,
+    { error: "Item manifest is temporarily unavailable", retryable: true },
+    503,
+    { "cache-control": "no-store", "retry-after": "5" },
+  );
 }
 
 async function handleStreamPublish(req: Request): Promise<Response> {
@@ -4887,12 +5612,11 @@ async function handleStreamPublish(req: Request): Promise<Response> {
     return jsonResponse(req, { error: "Unauthorized stream publish key" }, 401);
   }
 
-  let payload: Record<string, unknown>;
-  try {
-    payload = (await req.json()) as Record<string, unknown>;
-  } catch {
-    return jsonResponse(req, { error: "Invalid JSON body" }, 400);
+  const body = await readBoundedJsonObjectBody(req, 256 * 1024);
+  if (body.ok === false) {
+    return jsonResponse(req, { error: body.error }, body.status);
   }
+  const payload = body.value;
 
   const nextState = toStreamState(payload);
   if (!nextState) {
@@ -4906,12 +5630,29 @@ async function handleStreamPublish(req: Request): Promise<Response> {
 const server = Bun.serve({
   port: PORT,
   idleTimeout: 60,
-  development: process.env.NODE_ENV !== "production",
-  fetch: async (req: Request) => {
+  maxRequestBodySize: 512 * 1024,
+  development: !HTTP_POLICY.deployment,
+  fetch: async (req: Request, bunServer) => {
     const url = new URL(req.url);
+    const requestOrigin = req.headers.get("origin");
+    if (
+      requestOrigin != null &&
+      !isAllowedAppOrigin(requestOrigin, HTTP_POLICY)
+    ) {
+      return jsonResponse(req, { error: "Forbidden" }, 403, {
+        "cache-control": "no-store",
+      });
+    }
+    if (req.method === "OPTIONS" && requestOrigin == null) {
+      return jsonResponse(req, { error: "Forbidden" }, 403, {
+        "cache-control": "no-store",
+      });
+    }
+    const peerAddress = bunServer.requestIP(req)?.address ?? null;
     const isWriteRoute = isWriteRateLimitedRoute(req.method, url.pathname);
     const allowed = checkRateLimit(
       req,
+      peerAddress,
       url.pathname,
       isWriteRoute ? WRITE_RATE_LIMIT_PER_MINUTE : READ_RATE_LIMIT_PER_MINUTE,
       isWriteRoute ? WRITE_RATE_LIMIT_BURST : READ_RATE_LIMIT_BURST,
@@ -4930,39 +5671,58 @@ const server = Bun.serve({
       req.method === "GET" &&
       (url.pathname === "/health" || url.pathname === "/ready")
     ) {
-      const botHealthSnapshot = resolveKeeperBotHealthSnapshot(
-        loadKeeperBotHealthSnapshot(),
-      );
+      const botHealthSnapshot = loadKeeperBotHealthSnapshot();
       const readiness = resolveServiceReadiness(botHealthSnapshot);
+      const operatorMetrics = buildOperatorProjection({
+        observedAtMs: Date.now(),
+        serviceReady: readiness.ready,
+        botHealthSnapshot,
+      });
+      const ready =
+        readiness.ready && (!IS_PRODUCTION || operatorMetrics.federated.ready);
       return jsonResponse(
         req,
         {
-          ok: readiness.ready,
+          ok: ready,
           service: "hyperbet-solana-backend",
           now: Date.now(),
+          release: KEEPER_RELEASE_IDENTITY,
+          runtime: SERVICE_RUNTIME_IDENTITY,
           readiness,
+          operatorReadiness: operatorMetrics.federated,
+          correlationIds: collectActiveKeeperCorrelationIds(botHealthSnapshot),
         },
-        readiness.ready ? 200 : 503,
+        ready ? 200 : 503,
         { "cache-control": "no-store" },
       );
     }
 
     if (url.pathname === "/status") {
+      const observedAtMs = Date.now();
       const predictionMarkets = buildPredictionMarketLifecycleRecords();
-      const botHealthSnapshotRaw = resolveKeeperBotHealthSnapshot(
-        loadKeeperBotHealthSnapshot(),
-      );
+      const botHealthSnapshotRaw = loadKeeperBotHealthSnapshot();
       const botHealthSnapshot = botHealthSnapshotRaw;
       const readiness = resolveServiceReadiness(botHealthSnapshot);
       const marketStatuses = mergePredictionMarketsWithHealth(
         predictionMarkets,
         botHealthSnapshot,
       );
+      const operatorMetrics = buildOperatorProjection({
+        observedAtMs,
+        serviceReady: readiness.ready,
+        botHealthSnapshot,
+      });
+      const ready =
+        readiness.ready && (!IS_PRODUCTION || operatorMetrics.federated.ready);
       return jsonResponse(req, {
-        ok: readiness.ready,
+        ok: ready,
         service: "hyperbet-solana-backend",
-        now: Date.now(),
+        now: observedAtMs,
+        release: KEEPER_RELEASE_IDENTITY,
+        runtime: SERVICE_RUNTIME_IDENTITY,
         readiness,
+        operatorMetrics,
+        correlationIds: collectActiveKeeperCorrelationIds(botHealthSnapshot),
         stream: {
           seq: streamState.seq,
           cycleId: streamState.cycle?.cycleId ?? null,
@@ -4986,6 +5746,7 @@ const server = Bun.serve({
                 )
               : null,
           sourceEventsConnected: streamSourceEventsConnected,
+          sourceAvailable: isStreamSourceAvailable(streamSourceAvailability),
           sourceEventsLastEventAt: streamSourceEventsLastEventAt,
           sourceEventsLastEventId: streamSourceEventsLastEventId,
           sourceEventsLastError: streamSourceEventsLastError,
@@ -4995,11 +5756,21 @@ const server = Bun.serve({
         parsers,
         proxies: {
           solanaRpc: Boolean(SOLANA_RPC_PROXY_URL),
-          solanaSender: Boolean(SOLANA_SENDER_PROXY_URL),
+          solanaSender: Boolean(SOLANA_PROXY_RAIL.sender),
         },
         bot: {
-          supervision: "external",
+          supervision: "dedicated-service",
+          runtime: botHealthSnapshot?.runtime ?? null,
           running: Boolean(botHealthSnapshot?.running),
+          transport: {
+            source: KEEPER_BOT_HEALTH_SOURCE ? "remote" : "local-file",
+            sourceUrl: KEEPER_BOT_HEALTH_SOURCE
+              ? sanitizeUrlForStatus(KEEPER_BOT_HEALTH_SOURCE.sourceUrl)
+              : null,
+            lastPollAt: remoteKeeperBotHealthLastPollAt,
+            lastSuccessAt: remoteKeeperBotHealthLastSuccessAt,
+            lastError: remoteKeeperBotHealthLastError,
+          },
           health: botHealthSnapshot,
         },
         stats: {
@@ -5025,6 +5796,27 @@ const server = Bun.serve({
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/api/operator/readiness") {
+      const observedAtMs = Date.now();
+      const botHealthSnapshot = loadKeeperBotHealthSnapshot();
+      const serviceReadiness = resolveServiceReadiness(botHealthSnapshot);
+      const operatorMetrics = buildOperatorProjection({
+        observedAtMs,
+        serviceReady: serviceReadiness.ready,
+        botHealthSnapshot,
+      });
+      return jsonResponse(
+        req,
+        {
+          ok: operatorMetrics.federated.ready,
+          service: "hyperbet-solana-backend",
+          operatorMetrics,
+        },
+        operatorMetrics.federated.ready ? 200 : 503,
+        { "cache-control": "no-store" },
+      );
+    }
+
     if (url.pathname === "/") {
       return textResponse(
         req,
@@ -5033,6 +5825,20 @@ const server = Bun.serve({
     }
 
     if (req.method === "GET" && url.pathname === "/api/streaming/state") {
+      if (!isStreamSourceAvailable(streamSourceAvailability)) {
+        return jsonResponse(
+          req,
+          {
+            error: "Live stream authority is temporarily unavailable",
+            retryable: true,
+          },
+          503,
+          {
+            "cache-control": "no-store",
+            "retry-after": "1",
+          },
+        );
+      }
       return jsonResponse(req, streamState, 200, {
         "cache-control": "no-store",
       });
@@ -5053,15 +5859,14 @@ const server = Bun.serve({
     }
 
     if (req.method === "GET" && url.pathname === "/api/keeper/bot-health") {
-      const botHealthSnapshotRaw = resolveKeeperBotHealthSnapshot(
-        loadKeeperBotHealthSnapshot(),
-      );
+      const botHealthSnapshotRaw = loadKeeperBotHealthSnapshot();
       const readiness = resolveServiceReadiness(botHealthSnapshotRaw);
       return jsonResponse(
         req,
         {
           ok: readiness.ready,
-          supervision: "external",
+          supervision: "dedicated-service",
+          runtime: botHealthSnapshotRaw?.runtime ?? null,
           running: Boolean(botHealthSnapshotRaw?.running),
           readiness,
           health: botHealthSnapshotRaw,
@@ -5082,16 +5887,34 @@ const server = Bun.serve({
       req.method === "GET" &&
       url.pathname === "/api/streaming/state/events"
     ) {
+      const sseIdentity = clientIp(req, peerAddress);
+      if (
+        sseClients.size >= MAX_SSE_CLIENTS ||
+        (sseConnectionsByIdentity.get(sseIdentity) ?? 0) >=
+          MAX_SSE_CLIENTS_PER_IDENTITY
+      ) {
+        return jsonResponse(
+          req,
+          { error: "Stream connection limit exceeded" },
+          429,
+          { "cache-control": "no-store", "retry-after": "5" },
+        );
+      }
+      let clientController: ReadableStreamDefaultController<Uint8Array> | null =
+        null;
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
-          sseClients.add(controller);
+          clientController = controller;
+          addSseClient(controller, sseIdentity);
           sendSse(controller, "reset", streamState.seq, streamState);
           controller.enqueue(encoder.encode(": connected\n\n"));
         },
         cancel(reason) {
           void reason;
-          // The controller that was cancelled is already detached from writes;
-          // stale controllers are pruned on keepalive/broadcast write failure.
+          if (clientController) {
+            removeSseClient(clientController);
+            clientController = null;
+          }
         },
       });
 
@@ -5127,11 +5950,18 @@ const server = Bun.serve({
       req.method === "GET" &&
       url.pathname === "/api/arena/points/leaderboard"
     ) {
-      const limit = Math.max(
+      const limit = parseBoundedInteger(
+        url.searchParams.get("limit"),
+        20,
         1,
-        Math.min(200, Number(url.searchParams.get("limit") || 20)),
+        200,
       );
-      const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+      const offset = parseBoundedInteger(
+        url.searchParams.get("offset"),
+        0,
+        0,
+        10_000,
+      );
       const payload = leaderboardResponse(
         limit,
         offset,
@@ -5148,11 +5978,19 @@ const server = Bun.serve({
       req.method === "GET" &&
       url.pathname.startsWith("/api/arena/points/rank/")
     ) {
-      const wallet = normalizePointsWalletInput(
-        decodeURIComponent(url.pathname.replace("/api/arena/points/rank/", "")),
+      const wallet = canonicalSolanaRequestAddress(
+        normalizePointsWalletInput(
+          decodePathComponent(
+            url.pathname.replace("/api/arena/points/rank/", ""),
+          ),
+        ),
       );
       if (!wallet) {
-        return jsonResponse(req, { error: "Wallet is required" }, 400);
+        return jsonResponse(
+          req,
+          { error: "Canonical Solana wallet is required" },
+          400,
+        );
       }
       return jsonResponse(req, rankResponse(wallet), 200, {
         "cache-control": "no-store",
@@ -5163,7 +6001,7 @@ const server = Bun.serve({
       /^\/api\/arena\/settlements\/([^/]+)$/,
     );
     if (req.method === "GET" && settlementWalletMatch) {
-      const walletPath = decodeURIComponent(settlementWalletMatch[1] ?? "");
+      const walletPath = decodePathComponent(settlementWalletMatch[1] ?? "");
       return handleSolanaSettlementHistory(req, url, walletPath);
     }
 
@@ -5171,13 +6009,19 @@ const server = Bun.serve({
       req.method === "GET" &&
       url.pathname.startsWith("/api/arena/points/history/")
     ) {
-      const wallet = normalizePointsWalletInput(
-        decodeURIComponent(
-          url.pathname.replace("/api/arena/points/history/", ""),
+      const wallet = canonicalSolanaRequestAddress(
+        normalizePointsWalletInput(
+          decodePathComponent(
+            url.pathname.replace("/api/arena/points/history/", ""),
+          ),
         ),
       );
       if (!wallet) {
-        return jsonResponse(req, { error: "Wallet is required" }, 400);
+        return jsonResponse(
+          req,
+          { error: "Canonical Solana wallet is required" },
+          400,
+        );
       }
       const limit = parseBoundedInteger(
         url.searchParams.get("limit"),
@@ -5185,7 +6029,12 @@ const server = Bun.serve({
         1,
         100,
       );
-      const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+      const offset = parseBoundedInteger(
+        url.searchParams.get("offset"),
+        0,
+        0,
+        10_000,
+      );
       return jsonResponse(
         req,
         historyResponse(
@@ -5205,26 +6054,47 @@ const server = Bun.serve({
       /^\/api\/arena\/points\/([^/]+)$/,
     );
     if (req.method === "GET" && pointsWalletMatch) {
-      const wallet = normalizePointsWalletInput(
-        decodeURIComponent(pointsWalletMatch[1] ?? ""),
+      const wallet = canonicalSolanaRequestAddress(
+        normalizePointsWalletInput(
+          decodePathComponent(pointsWalletMatch[1] ?? ""),
+        ),
       );
       if (!wallet) {
-        return jsonResponse(req, { error: "Wallet is required" }, 400);
+        return jsonResponse(
+          req,
+          { error: "Canonical Solana wallet is required" },
+          400,
+        );
       }
-      return jsonResponse(req, pointsForWalletResponse(wallet));
+      return jsonResponse(req, pointsForWalletResponse(wallet), 200, {
+        "cache-control": "no-store",
+      });
     }
 
     if (req.method === "GET" && url.pathname.startsWith("/api/arena/invite/")) {
-      const wallet = decodeURIComponent(
-        url.pathname.replace("/api/arena/invite/", ""),
+      const wallet = canonicalSolanaRequestAddress(
+        decodePathComponent(url.pathname.replace("/api/arena/invite/", "")),
       );
       if (!wallet) {
-        return jsonResponse(req, { error: "Wallet is required" }, 400);
+        return jsonResponse(
+          req,
+          { error: "Canonical Solana wallet is required" },
+          400,
+        );
       }
       return jsonResponse(
         req,
         inviteSummary(wallet, url.searchParams.get("platform") || "unknown"),
+        200,
+        { "cache-control": "no-store" },
       );
+    }
+
+    if (
+      req.method === "POST" &&
+      url.pathname === "/api/arena/invite/register"
+    ) {
+      return handleInviteRegister(req);
     }
 
     if (req.method === "POST" && url.pathname === "/api/arena/invite/redeem") {
@@ -5232,7 +6102,7 @@ const server = Bun.serve({
     }
 
     if (req.method === "POST" && url.pathname === "/api/proxy/solana/rpc") {
-      return handleSolanaRpcProxy(req);
+      return handleSolanaRpcProxy(req, url);
     }
 
     if (req.method === "POST" && url.pathname === "/api/proxy/solana/sender") {
@@ -5243,7 +6113,7 @@ const server = Bun.serve({
       req.method === "GET" &&
       url.pathname.startsWith("/game-assets/manifests/items/")
     ) {
-      const fileName = decodeURIComponent(
+      const fileName = decodePathComponent(
         url.pathname.replace("/game-assets/manifests/items/", ""),
       );
       return handleItemManifest(req, fileName);
@@ -5260,7 +6130,7 @@ setInterval(() => {
     try {
       controller.enqueue(encoder.encode(": keepalive\n\n"));
     } catch {
-      sseClients.delete(controller);
+      removeSseClient(controller);
     }
   }
 }, 20_000);
@@ -5281,13 +6151,47 @@ if (STREAM_STATE_SOURCE_URL) {
   }
 }
 
+if (STREAM_OPERATOR_HEALTH_SOURCE) {
+  console.log(
+    `[${nowIso()}] [stream-operations] polling source ${sanitizeUrlForStatus(STREAM_OPERATOR_HEALTH_SOURCE.sourceUrl)}`,
+  );
+  setInterval(() => {
+    void pollStreamOperatorHealthSource();
+  }, STREAM_STATE_POLL_MS);
+  void pollStreamOperatorHealthSource();
+}
+
 if (STREAM_STATE_HEARTBEAT_MS > 0) {
   console.log(
     `[${nowIso()}] [stream] test heartbeat enabled every ${STREAM_STATE_HEARTBEAT_MS}ms`,
   );
   setInterval(() => {
-    publishStreamState(streamState, "heartbeat");
+    publishStreamState(
+      refreshSyntheticStreamHeartbeat(streamState),
+      "heartbeat",
+      false,
+    );
   }, STREAM_STATE_HEARTBEAT_MS);
+}
+
+if (KEEPER_BOT_HEALTH_SOURCE) {
+  console.log(
+    `[${nowIso()}] [bot-health] polling dedicated service ${sanitizeUrlForStatus(KEEPER_BOT_HEALTH_SOURCE.sourceUrl)}`,
+  );
+  setInterval(() => {
+    void pollKeeperBotHealthSource();
+  }, KEEPER_BOT_HEALTH_POLL_MS);
+  void pollKeeperBotHealthSource();
+}
+
+if (operatorAlertDispatcher.isEnabled()) {
+  console.log(
+    `[${nowIso()}] [operator-alerts] monitoring every ${OPERATOR_ALERT_CONFIG.monitorIntervalMs}ms`,
+  );
+  operatorAlertMonitorInterval = setInterval(
+    monitorOperatorAlerts,
+    OPERATOR_ALERT_CONFIG.monitorIntervalMs,
+  );
 }
 
 setInterval(() => {
@@ -5295,12 +6199,29 @@ setInterval(() => {
 }, CONTRACT_POLL_MS);
 void pollContractParsers();
 
-process.on("SIGINT", () => {
-  server.stop(true);
-  process.exit(0);
-});
+let serviceShutdownStarted = false;
 
-process.on("SIGTERM", () => {
+async function stopService(): Promise<void> {
+  if (serviceShutdownStarted) return;
+  serviceShutdownStarted = true;
+  if (operatorAlertMonitorInterval) {
+    clearInterval(operatorAlertMonitorInterval);
+    operatorAlertMonitorInterval = null;
+  }
   server.stop(true);
+  const pendingAlert = operatorAlertMonitorInFlight;
+  if (pendingAlert) {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    await Promise.race([
+      pendingAlert,
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, OPERATOR_ALERT_CONFIG.timeoutMs + 100);
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+  }
   process.exit(0);
-});
+}
+
+process.once("SIGINT", () => void stopService());
+process.once("SIGTERM", () => void stopService());

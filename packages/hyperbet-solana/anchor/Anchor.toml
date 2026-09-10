@@ -6,20 +6,20 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-fight_oracle = "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM"
-duel_market = "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy"
+fight_oracle = "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu"
+duel_market = "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
 
 [programs.localnet]
-fight_oracle = "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM"
-duel_market = "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy"
+fight_oracle = "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu"
+duel_market = "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
 
 [programs.testnet]
-fight_oracle = "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM"
-duel_market = "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy"
+fight_oracle = "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu"
+duel_market = "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
 
 [programs.mainnet]
-fight_oracle = "B5mRCRDJk9BrnH7regMWW5mpTQ8QG1CcCGSnDxMt8hmo"
-duel_market = "DYtd7AoyTX2tbmZ8vpC3mxZgqTpyaDei4TFXZukWBJEf"
+fight_oracle = "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu"
+duel_market = "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
 
 [registry]
 url = "https://api.apr.dev"

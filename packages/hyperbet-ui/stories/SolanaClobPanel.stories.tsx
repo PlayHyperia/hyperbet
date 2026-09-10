@@ -18,6 +18,7 @@ const meta = {
     agent1Name: "StormWarden",
     agent2Name: "JadePhoenix",
     compact: false,
+    tradingEnabled: false,
     connectionOverride: new Connection("https://api.devnet.solana.com"),
     walletOverride: { publicKey: null },
     programAddresses: {

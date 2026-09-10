@@ -5,6 +5,7 @@ import {
   DUEL_WINNER_MARKET_KIND,
   duelKeyHexToBytes,
   enumIs,
+  FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION,
   findClobVaultPda,
   findDuelStatePda,
   findMarketPda,
@@ -13,6 +14,7 @@ import {
   findProposalRecordPda,
   findUserBalancePda,
   getRpcWsUrl,
+  ORDER_BEHAVIOR_POST_ONLY,
   requireEnv,
   sanitizeErrorMessage,
   SIDE_BID,
@@ -27,6 +29,14 @@ afterEach(() => {
 });
 
 describe("launch-only Solana helpers", () => {
+  test("keeps keeper order behavior aligned with the deployed program ABI", () => {
+    expect(ORDER_BEHAVIOR_POST_ONLY).toBe(2);
+  });
+
+  test("re-exports the exact fight-oracle account schema contract", () => {
+    expect(FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION).toBe(2);
+  });
+
   test("validates and decodes canonical 32-byte duel keys", () => {
     const value = "ab".repeat(32);
     expect(Buffer.from(duelKeyHexToBytes(value)).toString("hex")).toBe(value);
@@ -112,6 +122,15 @@ describe("launch-only Solana helpers", () => {
         new Error("RPC https://example.test/?api-key=top-secret&x=1 failed"),
       ),
     ).toBe("RPC https://example.test/?api-key=***&x=1 failed");
+    expect(
+      sanitizeErrorMessage(
+        new Error(
+          "RPC https://example.test/?token=url-secret&x=1 failed; Authorization: Bearer header-secret; credential=inline-secret",
+        ),
+      ),
+    ).toBe(
+      "RPC https://example.test/?token=***&x=1 failed; Authorization: Bearer ***; credential=***",
+    );
   });
 
   test("uses an explicit RPC websocket endpoint without inventing one", () => {

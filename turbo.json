@@ -1,33 +1,21 @@
 {
   "$schema": "https://turbo.build/schema.json",
-  "globalDependencies": [
-    "**/.env.example"
-  ],
+  "globalDependencies": ["**/.env.example"],
+  "globalEnv": ["HYPERIA_REPOSITORY_DIR"],
   "tasks": {
     "build": {
-      "dependsOn": [
-        "^build"
-      ],
-      "outputs": [
-        "dist/**",
-        "app/dist/**",
-        "target/idl/**",
-        "target/types/**"
-      ]
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "app/dist/**", "target/idl/**", "target/types/**"]
     },
     "test": {
-      "dependsOn": [
-        "build"
-      ],
+      "dependsOn": ["build"],
       "outputs": []
     },
     "lint": {
       "outputs": []
     },
     "typecheck": {
-      "dependsOn": [
-        "^build"
-      ],
+      "dependsOn": ["^typecheck"],
       "outputs": []
     },
     "clean": {

@@ -76,10 +76,9 @@ export async function sendKitInstructions(
     let computeUnitLimitBigInt: bigint | undefined;
 
     if (useHeliusSender) {
-      const priorityFee = await fetchPriorityFeeEstimate(
-        rpcEndpoint,
-        [...accountKeys],
-      );
+      const priorityFee = await fetchPriorityFeeEstimate(rpcEndpoint, [
+        ...accountKeys,
+      ]);
       computeUnitLimitBigInt = BigInt(computeUnitLimit);
       preparedInstructions = [
         getSetComputeUnitLimitInstruction({ units: computeUnitLimit }),
@@ -117,6 +116,6 @@ export async function sendKitInstructions(
     return signature;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`${context}: ${stage}: ${message}`);
+    throw new Error(`${context}: ${stage}: ${message}`, { cause: error });
   }
 }

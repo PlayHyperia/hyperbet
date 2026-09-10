@@ -5,7 +5,7 @@
  * IDL can be found at `target/idl/duel_market.json`.
  */
 export type DuelMarket = {
-  "address": "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy",
+  "address": "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG",
   "metadata": {
     "name": "duelMarket",
     "version": "0.1.0",
@@ -61,6 +61,10 @@ export type DuelMarket = {
         },
         {
           "name": "priceLevel",
+          "docs": [
+            "continuation-pending order. Existing levels are owner/discriminator,",
+            "identity, and bump checked in the instruction before any book mutation."
+          ],
           "writable": true
         },
         {
@@ -258,6 +262,67 @@ export type DuelMarket = {
           "type": "u16"
         }
       ]
+    },
+    {
+      "name": "closeEmptyUserBalance",
+      "docs": [
+        "Returns an empty UserBalance PDA's rent to its owner. Resting-order",
+        "placement initializes this account before any match occurs, so a user",
+        "who later cancels or reclaims only unmatched liquidity can otherwise be",
+        "left with a permanently empty account. This instruction is deliberately",
+        "valid once matching has stopped and cannot move market custody. Keeping",
+        "it unavailable while open prevents an active maker order from losing",
+        "the balance account required by a later fill."
+      ],
+      "discriminator": [
+        143,
+        212,
+        24,
+        6,
+        221,
+        46,
+        27,
+        56
+      ],
+      "accounts": [
+        {
+          "name": "marketState"
+        },
+        {
+          "name": "userBalance",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  108,
+                  97,
+                  110,
+                  99,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "marketState"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        }
+      ],
+      "args": []
     },
     {
       "name": "closeFilledOrder",
@@ -598,7 +663,7 @@ export type DuelMarket = {
         },
         {
           "name": "program",
-          "address": "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy"
+          "address": "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
         },
         {
           "name": "programData"
@@ -926,6 +991,10 @@ export type DuelMarket = {
         },
         {
           "name": "priceLevel",
+          "docs": [
+            "continuation-pending order. Existing levels are owner/discriminator,",
+            "identity, and bump checked in the instruction before any book mutation."
+          ],
           "writable": true
         },
         {
@@ -1282,6 +1351,19 @@ export type DuelMarket = {
         187,
         224,
         236
+      ]
+    },
+    {
+      "name": "emptyUserBalanceClosed",
+      "discriminator": [
+        174,
+        21,
+        99,
+        167,
+        59,
+        135,
+        73,
+        177
       ]
     },
     {
@@ -1706,6 +1788,11 @@ export type DuelMarket = {
       "code": 6052,
       "name": "invalidUserBalance",
       "msg": "The supplied user balance is not canonical"
+    },
+    {
+      "code": 6053,
+      "name": "userBalanceNotEmpty",
+      "msg": "User balance still contains shares, collateral, or fee custody"
     }
   ],
   "types": [
@@ -1901,6 +1988,23 @@ export type DuelMarket = {
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "competitiveSnapshotVersion",
+            "type": "u32"
+          },
+          {
+            "name": "competitiveSnapshotDigest",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "accountSchemaVersion",
+            "type": "u16"
           }
         ]
       }
@@ -1930,6 +2034,22 @@ export type DuelMarket = {
           },
           {
             "name": "cancelled"
+          }
+        ]
+      }
+    },
+    {
+      "name": "emptyUserBalanceClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "marketKey",
+            "type": "pubkey"
+          },
+          {
+            "name": "user",
+            "type": "pubkey"
           }
         ]
       }

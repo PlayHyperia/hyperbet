@@ -4,7 +4,7 @@ import {
   type SolanaClobMarketSnapshot,
 } from "@hyperbet/ui/components/SolanaClobPanel";
 
-import { useAppConnection, useAppWallet } from "../lib/appWallet";
+import { useAppConnection, useAppWallet } from "../lib/appWalletContext";
 import { CONFIG } from "../lib/config";
 import { resolveTransactionWallet } from "../lib/transactionAuthority";
 

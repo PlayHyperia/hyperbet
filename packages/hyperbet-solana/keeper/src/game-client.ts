@@ -1,5 +1,20 @@
 import { createHash } from "node:crypto";
 
+export type StreamingDuelStrategySummary = {
+  schemaVersion: 1;
+  approach: "aggressive" | "defensive" | "balanced" | "outlast";
+  tacticalMacro:
+    "pressure" | "hold_range" | "kite" | "orbit" | "defensive_reset" | "finish";
+  attackStyle: "accurate" | "aggressive" | "controlled" | "defensive";
+  prayer:
+    "superhuman_strength" | "rock_skin" | "hawk_eye" | "mystic_lore" | null;
+  preferredCombatRole: "melee" | "ranged" | "mage" | null;
+  foodThreshold: number;
+  switchDefensiveAt: number;
+  source: "model" | "deterministic" | "diagnostic";
+  policyVersion: string;
+};
+
 export type StreamingAgent = {
   id: string;
   name: string;
@@ -14,12 +29,13 @@ export type StreamingAgent = {
   rank: number;
   headToHeadWins: number;
   headToHeadLosses: number;
+  strategySummary: StreamingDuelStrategySummary | null;
 };
 
 export type CompetitiveSnapshot = {
-  snapshotVersion: 1 | 2 | 3;
+  snapshotVersion: 1 | 2 | 3 | 4;
   persisted: true;
-  diagnostic: false;
+  diagnostic: boolean;
   preparationId: string;
   cycleId: string;
   duelId: string;
@@ -28,7 +44,20 @@ export type CompetitiveSnapshot = {
   betOpenTime: number;
   betCloseTime: number;
   combatPolicyVersion: string;
+  /** Present on schema-v4 snapshots; legacy snapshots predate clock binding. */
+  timing?: CompetitiveSnapshotTiming;
   contestants: [Record<string, unknown>, Record<string, unknown>];
+};
+
+export type CompetitiveSnapshotTiming = {
+  contractVersion: 2;
+  timeoutPolicy: "hp_percentage_then_damage_then_draw_v1";
+  countdownDurationMs: number;
+  fightingDurationMs: number;
+  endWarningDurationMs: number;
+  maxFightDurationMs: number;
+  fightStartTime: number;
+  fightDeadline: number;
 };
 
 const FROZEN_ARMOR_SLOTS = [
@@ -43,11 +72,34 @@ const FROZEN_ARMOR_SLOTS = [
 ] as const;
 
 export type StreamingWinReason =
-  | "kill"
-  | "forfeit"
-  | "hp_advantage"
-  | "damage_advantage"
-  | "draw";
+  "kill" | "forfeit" | "hp_advantage" | "damage_advantage" | "draw";
+
+export type RendererHealthDerivation = {
+  schemaVersion: 1;
+  evaluatedAtMs: number | null;
+  canonicalCycleId: string | null;
+  canonicalPhase: string | null;
+  externalSnapshotPresent: boolean;
+  externalSnapshotUpdatedAt: number | null;
+  rendererPresent: boolean;
+  rendererReady: boolean | null;
+  rendererPhase: string | null;
+  rendererDegradedReason: string | null;
+  rendererUpdatedAt: number | null;
+  scenePresent: boolean;
+  sceneReady: boolean | null;
+  sceneCycleId: string | null;
+  scenePhase: string | null;
+  captureClientConnected: boolean | null;
+  captureFfmpegRunning: boolean | null;
+};
+
+export type StreamingRendererHealth = {
+  ready: boolean;
+  degradedReason: string | null;
+  updatedAt: number;
+  derivation?: RendererHealthDerivation;
+};
 
 export type StreamingCycle = {
   sourceEpoch: number;
@@ -73,6 +125,7 @@ export type StreamingCycle = {
   replayHash: string | null;
   agent1: StreamingAgent | null;
   agent2: StreamingAgent | null;
+  rendererHealth: StreamingRendererHealth;
 };
 
 export type BettingFeedStateUpdate = {
@@ -102,6 +155,7 @@ export type BettingFeedStateUpdate = {
   arenaPositions?: unknown;
   winnerName?: string | null;
   rendererHealth?: unknown;
+  replay?: unknown;
 };
 
 export type DuelLifecycleEvent = {
@@ -128,6 +182,7 @@ export type DuelLifecycleEvent = {
   replayHash: string | null;
   agent1: StreamingAgent | null;
   agent2: StreamingAgent | null;
+  rendererHealth: StreamingRendererHealth;
 };
 
 export type BettingFeedCheckpoint = {
@@ -136,8 +191,17 @@ export type BettingFeedCheckpoint = {
   lastEmittedAt: number;
   duelId: string | null;
   competitiveSnapshotDigest: string | null;
+  /** Optional only while upgrading a checkpoint written before timing persistence. */
+  betOpenTime?: number | null;
+  /** Optional only while upgrading a checkpoint written before timing persistence. */
+  betCloseTime?: number | null;
+  /** Null until countdown publishes the immutable start boundary. */
+  fightStartTime?: number | null;
+  /** Null until an authoritative terminal frame is accepted. */
+  duelEndTime?: number | null;
   phase: string | null;
   terminal: boolean;
+  terminalEventKey: string | null;
   degradedReason: string | null;
   updatedAt: number;
 };
@@ -148,6 +212,7 @@ export type BettingFeedCheckpointStore = {
     checkpoint: Omit<BettingFeedCheckpoint, "degradedReason" | "updatedAt"> & {
       updatedAt?: number;
     },
+    evidenceFrame?: StreamingCycle,
   ): BettingFeedCheckpoint;
   markBettingFeedDegraded(reason: unknown, now?: number): void;
 };
@@ -190,6 +255,7 @@ export function normalizeLifecycleEvent(
     replayHash: cycle.replayHash,
     agent1: cycle.agent1,
     agent2: cycle.agent2,
+    rendererHealth: cycle.rendererHealth,
   };
 }
 
@@ -211,6 +277,71 @@ function isNullableNonemptyString(value: unknown): value is string | null {
   );
 }
 
+const STRATEGY_APPROACHES = new Set([
+  "aggressive",
+  "defensive",
+  "balanced",
+  "outlast",
+]);
+const STRATEGY_ATTACK_STYLES = new Set([
+  "accurate",
+  "aggressive",
+  "controlled",
+  "defensive",
+]);
+const STRATEGY_SOURCES = new Set(["model", "deterministic", "diagnostic"]);
+const SAFE_STRATEGY_POLICY_VERSION = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+
+function isStrategySummary(
+  value: unknown,
+): value is StreamingDuelStrategySummary | null {
+  if (value === null) return true;
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "schemaVersion",
+      "approach",
+      "tacticalMacro",
+      "attackStyle",
+      "prayer",
+      "preferredCombatRole",
+      "foodThreshold",
+      "switchDefensiveAt",
+      "source",
+      "policyVersion",
+    ]) ||
+    value.schemaVersion !== 1 ||
+    typeof value.approach !== "string" ||
+    !STRATEGY_APPROACHES.has(value.approach) ||
+    typeof value.tacticalMacro !== "string" ||
+    !TACTICAL_MACROS.has(value.tacticalMacro) ||
+    typeof value.attackStyle !== "string" ||
+    !STRATEGY_ATTACK_STYLES.has(value.attackStyle) ||
+    !(
+      value.prayer === null ||
+      (typeof value.prayer === "string" && TACTICAL_PRAYERS.has(value.prayer))
+    ) ||
+    !(
+      value.preferredCombatRole === null ||
+      (typeof value.preferredCombatRole === "string" &&
+        COMBAT_STYLE_SET.has(value.preferredCombatRole))
+    ) ||
+    !Number.isSafeInteger(value.foodThreshold) ||
+    Number(value.foodThreshold) < 20 ||
+    Number(value.foodThreshold) > 60 ||
+    !Number.isSafeInteger(value.switchDefensiveAt) ||
+    Number(value.switchDefensiveAt) < 20 ||
+    Number(value.switchDefensiveAt) > 40 ||
+    typeof value.source !== "string" ||
+    !STRATEGY_SOURCES.has(value.source) ||
+    typeof value.policyVersion !== "string" ||
+    !SAFE_STRATEGY_POLICY_VERSION.test(value.policyVersion)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function isCanonicalAgent(value: unknown): value is StreamingAgent | null {
   if (value === null) return true;
   if (!isRecord(value)) return false;
@@ -230,6 +361,7 @@ function isCanonicalAgent(value: unknown): value is StreamingAgent | null {
       "rank",
       "headToHeadWins",
       "headToHeadLosses",
+      "strategySummary",
     ]) &&
     typeof agent.id === "string" &&
     agent.id.trim().length > 0 &&
@@ -248,7 +380,8 @@ function isCanonicalAgent(value: unknown): value is StreamingAgent | null {
     isSafeNonnegativeInteger(agent.damageDealtThisFight) &&
     isSafeNonnegativeInteger(agent.rank) &&
     isSafeNonnegativeInteger(agent.headToHeadWins) &&
-    isSafeNonnegativeInteger(agent.headToHeadLosses)
+    isSafeNonnegativeInteger(agent.headToHeadLosses) &&
+    isStrategySummary(agent.strategySummary)
   );
 }
 
@@ -289,6 +422,9 @@ const PREPARATION_UUID =
 const CANCELLATION_REASON = /^[a-z0-9][a-z0-9_.:-]{0,127}$/;
 const UINT64_MAX = 18_446_744_073_709_551_615n;
 const COMBAT_STYLE_SET = new Set(["melee", "ranged", "mage"]);
+const STREAMING_DUEL_TIMING_CONTRACT_VERSION = 2 as const;
+const STREAMING_DUEL_TIMEOUT_POLICY =
+  "hp_percentage_then_damage_then_draw_v1" as const;
 const BETTING_FEED_KEYS = [
   "schemaVersion",
   "sourceEpoch",
@@ -317,6 +453,49 @@ const BETTING_FEED_KEYS = [
   "winnerName",
   "rendererHealth",
 ] as const;
+
+function isBettingReplayMetadata(
+  value: unknown,
+  sourceEpoch: unknown,
+  sequence: unknown,
+): boolean {
+  if (value === undefined) return true;
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "sourceEpoch",
+      "latestSeq",
+      "oldestSeq",
+      "bufferedFrames",
+      "bufferedBytes",
+      "lastBroadcastSeq",
+    ]) ||
+    value.sourceEpoch !== sourceEpoch ||
+    !isSafeNonnegativeInteger(value.bufferedFrames) ||
+    !isSafeNonnegativeInteger(value.bufferedBytes) ||
+    !isSafeNonnegativeInteger(value.lastBroadcastSeq)
+  ) {
+    return false;
+  }
+  const latestSeq = value.latestSeq;
+  const oldestSeq = value.oldestSeq;
+  if (latestSeq === null || oldestSeq === null) {
+    return (
+      latestSeq === null &&
+      oldestSeq === null &&
+      value.bufferedFrames === 0 &&
+      value.bufferedBytes === 0
+    );
+  }
+  return Boolean(
+    isSafeNonnegativeInteger(latestSeq) &&
+    isSafeNonnegativeInteger(oldestSeq) &&
+    Number(oldestSeq) <= Number(latestSeq) &&
+    Number(latestSeq) >= Number(sequence) &&
+    Number(value.lastBroadcastSeq) <= Number(latestSeq) &&
+    Number(value.bufferedFrames) <= Number(latestSeq) - Number(oldestSeq) + 1,
+  );
+}
 
 function isNonemptyText(value: unknown, maxLength = 256): value is string {
   return (
@@ -364,15 +543,83 @@ function isArenaPositions(
   );
 }
 
-function isRendererHealth(value: unknown): boolean {
-  return Boolean(
-    isRecord(value) &&
-    hasExactKeys(value, ["ready", "degradedReason", "updatedAt"]) &&
-    typeof value.ready === "boolean" &&
-    isNullableNonemptyString(value.degradedReason) &&
-    Number.isSafeInteger(value.updatedAt) &&
-    Number(value.updatedAt) > 0,
-  );
+/** Allowlisted observations only; this must never grant or deny authority. */
+function normalizeRendererDerivation(
+  value: unknown,
+): RendererHealthDerivation | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
+  if (
+    input.schemaVersion !== 1 ||
+    typeof input.externalSnapshotPresent !== "boolean" ||
+    typeof input.rendererPresent !== "boolean" ||
+    typeof input.scenePresent !== "boolean"
+  )
+    return null;
+  const timestamp = (candidate: unknown): number | null =>
+    typeof candidate === "number" &&
+    Number.isSafeInteger(candidate) &&
+    candidate > 0
+      ? candidate
+      : null;
+  const token = (candidate: unknown, limit: number): string | null =>
+    typeof candidate === "string" &&
+    candidate.length <= limit &&
+    /^[A-Za-z0-9_.:-]+$/.test(candidate)
+      ? candidate
+      : null;
+  const boolean = (candidate: unknown): boolean | null =>
+    typeof candidate === "boolean" ? candidate : null;
+  return {
+    schemaVersion: 1,
+    evaluatedAtMs: timestamp(input.evaluatedAtMs),
+    canonicalCycleId: token(input.canonicalCycleId, 128),
+    canonicalPhase: token(input.canonicalPhase, 32),
+    externalSnapshotPresent: input.externalSnapshotPresent === true,
+    externalSnapshotUpdatedAt: timestamp(input.externalSnapshotUpdatedAt),
+    rendererPresent: input.rendererPresent === true,
+    rendererReady: boolean(input.rendererReady),
+    rendererPhase: token(input.rendererPhase, 32),
+    rendererDegradedReason: token(input.rendererDegradedReason, 128),
+    rendererUpdatedAt: timestamp(input.rendererUpdatedAt),
+    scenePresent: input.scenePresent === true,
+    sceneReady: boolean(input.sceneReady),
+    sceneCycleId: token(input.sceneCycleId, 128),
+    scenePhase: token(input.scenePhase, 32),
+    captureClientConnected: boolean(input.captureClientConnected),
+    captureFfmpegRunning: boolean(input.captureFfmpegRunning),
+  };
+}
+
+function normalizeRendererHealth(
+  value: unknown,
+  emittedAt: unknown,
+): StreamingRendererHealth | null {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "ready",
+      "degradedReason",
+      "updatedAt",
+      ...(Object.hasOwn(value, "derivation") ? ["derivation"] : []),
+    ]) ||
+    typeof value.ready !== "boolean" ||
+    !isNullableNonemptyString(value.degradedReason) ||
+    !Number.isSafeInteger(value.updatedAt) ||
+    Number(value.updatedAt) <= 0 ||
+    !Number.isSafeInteger(emittedAt) ||
+    Number(value.updatedAt) > Number(emittedAt) ||
+    (value.ready && value.degradedReason !== null)
+  ) {
+    return null;
+  }
+  const derivation = normalizeRendererDerivation(value.derivation);
+  return {
+    ready: value.ready,
+    degradedReason: value.degradedReason,
+    updatedAt: Number(value.updatedAt),
+    ...(derivation ? { derivation } : {}),
+  };
 }
 
 function isCombatStyle(value: unknown): value is "melee" | "ranged" | "mage" {
@@ -484,6 +731,48 @@ function isFrozenArmorIds(value: unknown): boolean {
   );
 }
 
+function isCompetitiveSnapshotTiming(
+  value: unknown,
+  betCloseTime: number,
+): value is CompetitiveSnapshotTiming {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      "contractVersion",
+      "timeoutPolicy",
+      "countdownDurationMs",
+      "fightingDurationMs",
+      "endWarningDurationMs",
+      "maxFightDurationMs",
+      "fightStartTime",
+      "fightDeadline",
+    ])
+  ) {
+    return false;
+  }
+  const positiveDurations = [
+    value.countdownDurationMs,
+    value.fightingDurationMs,
+    value.endWarningDurationMs,
+    value.maxFightDurationMs,
+  ];
+  return Boolean(
+    value.contractVersion === STREAMING_DUEL_TIMING_CONTRACT_VERSION &&
+    value.timeoutPolicy === STREAMING_DUEL_TIMEOUT_POLICY &&
+    positiveDurations.every(
+      (duration) => Number.isSafeInteger(duration) && Number(duration) > 0,
+    ) &&
+    Number(value.maxFightDurationMs) ===
+      Number(value.fightingDurationMs) + Number(value.endWarningDurationMs) &&
+    Number.isSafeInteger(value.fightStartTime) &&
+    Number(value.fightStartTime) ===
+      betCloseTime + Number(value.countdownDurationMs) &&
+    Number.isSafeInteger(value.fightDeadline) &&
+    Number(value.fightDeadline) ===
+      Number(value.fightStartTime) + Number(value.maxFightDurationMs),
+  );
+}
+
 function isCombatLoadouts(
   value: unknown,
   availableStyles: string[],
@@ -501,7 +790,7 @@ function isCombatLoadouts(
       "arrowsId",
       "shieldId",
       "spellId",
-      ...(snapshotVersion === 3 ? ["armorIds"] : []),
+      ...(snapshotVersion >= 3 ? ["armorIds"] : []),
     ];
     if (
       !isRecord(loadout) ||
@@ -511,7 +800,7 @@ function isCombatLoadouts(
       !isNullableNonemptyString(loadout.arrowsId) ||
       !isNullableNonemptyString(loadout.shieldId) ||
       !isNullableNonemptyString(loadout.spellId) ||
-      (snapshotVersion === 3 && !isFrozenArmorIds(loadout.armorIds))
+      (snapshotVersion >= 3 && !isFrozenArmorIds(loadout.armorIds))
     ) {
       return false;
     }
@@ -558,6 +847,28 @@ function isPreparationEvidence(
     return false;
   }
   return true;
+}
+
+function strategySummaryMatchesPreparation(
+  summary: StreamingDuelStrategySummary | null,
+  preparation: unknown,
+  snapshotVersion: CompetitiveSnapshot["snapshotVersion"],
+): boolean {
+  if (snapshotVersion < 2) return summary === null;
+  if (summary === null || !isRecord(preparation)) return false;
+  const tacticalStrategy = preparation.tacticalStrategy;
+  return Boolean(
+    isRecord(tacticalStrategy) &&
+    summary.approach === tacticalStrategy.approach &&
+    summary.tacticalMacro === tacticalStrategy.tacticalMacro &&
+    summary.attackStyle === tacticalStrategy.attackStyle &&
+    summary.prayer === tacticalStrategy.prayer &&
+    summary.preferredCombatRole === tacticalStrategy.preferredCombatRole &&
+    summary.foodThreshold === tacticalStrategy.foodThreshold &&
+    summary.switchDefensiveAt === tacticalStrategy.switchDefensiveAt &&
+    summary.source === preparation.planningSource &&
+    summary.policyVersion === preparation.planningPolicyVersion,
+  );
 }
 
 const TACTICAL_APPROACHES = new Set([
@@ -716,11 +1027,90 @@ function isCompetitiveContestant(
       value.availableCombatStyles,
       value.provider,
       value.model,
+    ) ||
+    !strategySummaryMatchesPreparation(
+      agent.strategySummary,
+      value.preparation,
+      snapshotVersion,
     )
   ) {
     return false;
   }
   return true;
+}
+
+function isLocalDiagnosticContestant(
+  value: unknown,
+  snapshotVersion: CompetitiveSnapshot["snapshotVersion"],
+  side: "agent1" | "agent2",
+  agent: StreamingAgent,
+): value is Record<string, unknown> {
+  if (!isRecord(value) || !hasExactKeys(value, CONTESTANT_KEYS)) return false;
+  const preparation = value.preparation;
+  return Boolean(
+    value.side === side &&
+    value.agentId === agent.id &&
+    value.name === agent.name &&
+    value.provider === agent.provider &&
+    value.model === agent.model &&
+    value.provider === "diagnostic" &&
+    value.model === "diagnostic" &&
+    Number.isSafeInteger(value.combatLevel) &&
+    Number(value.combatLevel) >= 1 &&
+    Number.isSafeInteger(value.startingHp) &&
+    Number(value.startingHp) >= 1 &&
+    Number.isSafeInteger(value.maxHp) &&
+    Number(value.maxHp) >= Number(value.startingHp) &&
+    isSafeNonnegativeInteger(value.wins) &&
+    isSafeNonnegativeInteger(value.losses) &&
+    isSafeNonnegativeInteger(value.rank) &&
+    isSafeNonnegativeInteger(value.headToHeadWins) &&
+    isSafeNonnegativeInteger(value.headToHeadLosses) &&
+    typeof value.loadoutFingerprint === "string" &&
+    SHA256_HEX.test(value.loadoutFingerprint) &&
+    isCompetitiveEquipment(value.equipment) &&
+    isCompetitiveInventory(value.inventory) &&
+    value.selectedSpell === null &&
+    isCompetitiveSkillLevels(value.skillLevels) &&
+    isCompetitivePrayer(value.prayer) &&
+    isCombatStyle(value.initialCombatStyle) &&
+    isUniqueStyleArray(value.availableCombatStyles) &&
+    value.availableCombatStyles.includes(value.initialCombatStyle) &&
+    isCombatLoadouts(
+      value.combatLoadouts,
+      value.availableCombatStyles,
+      snapshotVersion,
+    ) &&
+    isRecord(preparation) &&
+    hasExactKeys(preparation, [
+      "primaryStyle",
+      "availableStyles",
+      "planningSource",
+      "planningPolicyVersion",
+      "agentPolicyFingerprint",
+      "modelProvider",
+      "model",
+      "tacticalStrategy",
+    ]) &&
+    preparation.primaryStyle === value.initialCombatStyle &&
+    isUniqueStyleArray(preparation.availableStyles) &&
+    [...preparation.availableStyles].sort().join(",") ===
+      [...value.availableCombatStyles].sort().join(",") &&
+    preparation.planningSource === "diagnostic" &&
+    isNonemptyText(preparation.planningPolicyVersion, 128) &&
+    preparation.agentPolicyFingerprint === null &&
+    preparation.modelProvider === "diagnostic" &&
+    preparation.model === "diagnostic" &&
+    isCompetitiveTacticalStrategy(
+      preparation.tacticalStrategy,
+      value.availableCombatStyles,
+    ) &&
+    strategySummaryMatchesPreparation(
+      agent.strategySummary,
+      preparation,
+      snapshotVersion,
+    ),
+  );
 }
 
 function normalizeCompetitiveSnapshot(input: {
@@ -734,14 +1124,21 @@ function normalizeCompetitiveSnapshot(input: {
   agent1: StreamingAgent;
   agent2: StreamingAgent;
   allowLegacyTerminalCancellation: boolean;
+  allowDiagnosticSnapshot: boolean;
 }): CompetitiveSnapshot | null {
   const snapshotVersion = isRecord(input.snapshot)
     ? input.snapshot.snapshotVersion
     : null;
+  const localDiagnostic = Boolean(
+    input.allowDiagnosticSnapshot &&
+    isRecord(input.snapshot) &&
+    input.snapshot.diagnostic === true,
+  );
   if (
     input.version !== snapshotVersion ||
     !(
-      snapshotVersion === 3 ||
+      snapshotVersion === 4 ||
+      (snapshotVersion === 3 && input.allowLegacyTerminalCancellation) ||
       ((snapshotVersion === 1 || snapshotVersion === 2) &&
         input.allowLegacyTerminalCancellation)
     ) ||
@@ -760,10 +1157,12 @@ function normalizeCompetitiveSnapshot(input: {
       "betOpenTime",
       "betCloseTime",
       "combatPolicyVersion",
+      ...(snapshotVersion >= 4 ? ["timing"] : []),
       "contestants",
     ]) ||
     input.snapshot.persisted !== true ||
-    input.snapshot.diagnostic !== false ||
+    (input.snapshot.diagnostic !== false &&
+      !(input.allowDiagnosticSnapshot && input.snapshot.diagnostic === true)) ||
     typeof input.snapshot.preparationId !== "string" ||
     !PREPARATION_UUID.test(input.snapshot.preparationId) ||
     !isNonemptyText(input.snapshot.cycleId, 128) ||
@@ -773,18 +1172,23 @@ function normalizeCompetitiveSnapshot(input: {
     input.snapshot.betOpenTime !== input.betOpenTime ||
     input.snapshot.betCloseTime !== input.betCloseTime ||
     input.snapshot.combatPolicyVersion !==
-      (snapshotVersion === 3
+      (snapshotVersion >= 3
         ? "duel-combat-policy-v2"
         : "duel-combat-policy-v1") ||
+    (snapshotVersion >= 4 &&
+      !isCompetitiveSnapshotTiming(
+        input.snapshot.timing,
+        input.betCloseTime,
+      )) ||
     !Array.isArray(input.snapshot.contestants) ||
     input.snapshot.contestants.length !== 2 ||
-    !isCompetitiveContestant(
+    !(localDiagnostic ? isLocalDiagnosticContestant : isCompetitiveContestant)(
       input.snapshot.contestants[0],
       snapshotVersion,
       "agent1",
       input.agent1,
     ) ||
-    !isCompetitiveContestant(
+    !(localDiagnostic ? isLocalDiagnosticContestant : isCompetitiveContestant)(
       input.snapshot.contestants[1],
       snapshotVersion,
       "agent2",
@@ -803,8 +1207,13 @@ function normalizeCompetitiveSnapshot(input: {
 
 export function normalizeBettingFeedCycle(
   payload: BettingFeedStateUpdate,
+  options: { allowDiagnosticSnapshot?: boolean } = {},
 ): StreamingCycle | null {
-  if (!isRecord(payload) || !hasExactKeys(payload, BETTING_FEED_KEYS)) {
+  if (
+    !isRecord(payload) ||
+    (!hasExactKeys(payload, BETTING_FEED_KEYS) &&
+      !hasExactKeys(payload, [...BETTING_FEED_KEYS, "replay"]))
+  ) {
     return null;
   }
   const phaseIsValid =
@@ -915,6 +1324,7 @@ export function normalizeBettingFeedCycle(
           agent2: payload.agent2,
           allowLegacyTerminalCancellation:
             payload.outcome === "cancelled" && payload.duelEndTime !== null,
+          allowDiagnosticSnapshot: options.allowDiagnosticSnapshot === true,
         })
       : null;
   const competitiveShapeIsValid = hasActiveIdentity
@@ -934,11 +1344,20 @@ export function normalizeBettingFeedCycle(
       (payload.fightStartTime === null ||
         (typeof payload.fightStartTime === "number" &&
           payload.fightStartTime >= payload.betCloseTime &&
-          payload.fightStartTime <= payload.emittedAt)) &&
+          (competitiveSnapshot?.snapshotVersion !== 4 ||
+            payload.fightStartTime ===
+              competitiveSnapshot.timing?.fightStartTime) &&
+          (payload.phase === "ANNOUNCEMENT" || payload.phase === "COUNTDOWN"
+            ? payload.fightStartTime >= payload.emittedAt
+            : (payload.phase === "FIGHTING" ||
+                payload.phase === "RESOLUTION") &&
+              payload.fightStartTime <= payload.emittedAt))) &&
       (payload.duelEndTime === null ||
         (typeof payload.duelEndTime === "number" &&
           payload.duelEndTime >=
-            (payload.fightStartTime ?? payload.betOpenTime) &&
+            (payload.outcome === "cancelled"
+              ? payload.betOpenTime
+              : (payload.fightStartTime ?? payload.betOpenTime)) &&
           payload.duelEndTime <= payload.emittedAt))
     : payload.betOpenTime === null &&
       payload.betCloseTime === null &&
@@ -950,6 +1369,10 @@ export function normalizeBettingFeedCycle(
       payload.winReason === null &&
       payload.seed === null &&
       payload.replayHash === null;
+  const rendererHealth = normalizeRendererHealth(
+    payload.rendererHealth,
+    payload.emittedAt,
+  );
 
   if (
     payload.schemaVersion !== 3 ||
@@ -961,6 +1384,11 @@ export function normalizeBettingFeedCycle(
     Number(payload.emittedAt) <= 0 ||
     !Number.isSafeInteger(payload.phaseVersion) ||
     Number(payload.phaseVersion) < 0 ||
+    !isBettingReplayMetadata(
+      payload.replay,
+      payload.sourceEpoch,
+      payload.seq,
+    ) ||
     !duelIdIsValid ||
     !duelKeyIsValid ||
     (payload.duelId === null) !== (payload.duelKey === null) ||
@@ -984,7 +1412,7 @@ export function normalizeBettingFeedCycle(
       payload.outcome === "cancelled" && payload.duelEndTime !== null,
     ) ||
     !winnerNameIsValid ||
-    !isRendererHealth(payload.rendererHealth) ||
+    rendererHealth === null ||
     !competitiveShapeIsValid ||
     !timelineIsValid ||
     !terminalShapeIsValid
@@ -1018,6 +1446,7 @@ export function normalizeBettingFeedCycle(
     replayHash: payload.replayHash ?? null,
     agent1: payload.agent1 ?? null,
     agent2: payload.agent2 ?? null,
+    rendererHealth,
   };
 }
 
@@ -1051,22 +1480,21 @@ export class GameClient {
   private url: string;
   private pollInterval: ReturnType<typeof setInterval> | null = null;
   private onDuelStartCb:
-    | ((data: DuelLifecycleEvent) => void | Promise<void>)
-    | null = null;
+    ((data: DuelLifecycleEvent) => void | Promise<void>) | null = null;
   private onBettingLockedCb:
-    | ((data: DuelLifecycleEvent) => void | Promise<void>)
-    | null = null;
+    ((data: DuelLifecycleEvent) => void | Promise<void>) | null = null;
   private onDuelEndCb:
-    | ((data: DuelLifecycleEvent) => void | Promise<void>)
-    | null = null;
+    ((data: DuelLifecycleEvent) => void | Promise<void>) | null = null;
   private onStateFrameCb:
-    | ((data: StreamingCycle) => void | Promise<void>)
-    | null = null;
+    ((data: StreamingCycle) => void | Promise<void>) | null = null;
+  private onSourceObservationCb:
+    ((data: StreamingCycle) => void | Promise<void>) | null = null;
   private pollInFlight = false;
   private readonly pollTimeoutMs: number;
   private readonly pollIntervalMs: number;
   private readonly betSyncToken: string;
   private readonly checkpointStore: BettingFeedCheckpointStore | null;
+  private readonly allowDiagnosticSnapshot: boolean;
   private checkpoint: BettingFeedCheckpoint | null;
   private readonly activeControllers = new Set<AbortController>();
   private runtimeBootstrapped = false;
@@ -1078,11 +1506,22 @@ export class GameClient {
   private lastLockedCycleId: string | null = null;
   private lastResolutionEventKey: string | null = null;
 
-  constructor(url: string, checkpointStore?: BettingFeedCheckpointStore) {
+  constructor(
+    url: string,
+    checkpointStore?: BettingFeedCheckpointStore,
+    options: {
+      allowDiagnosticSnapshot?: boolean;
+      bearerToken?: string;
+    } = {},
+  ) {
     this.url = url.replace(/\/$/, "");
     this.checkpointStore = checkpointStore ?? null;
     this.checkpoint = this.checkpointStore?.getBettingFeedCheckpoint() ?? null;
-    this.betSyncToken = process.env.BET_SYNC_SOURCE_BEARER_TOKEN?.trim() || "";
+    this.allowDiagnosticSnapshot = options.allowDiagnosticSnapshot === true;
+    this.betSyncToken =
+      options.bearerToken === undefined
+        ? process.env.BET_SYNC_SOURCE_BEARER_TOKEN?.trim() || ""
+        : options.bearerToken.trim();
     const configuredTimeout = Number(process.env.GAME_STATE_POLL_TIMEOUT_MS);
     this.pollTimeoutMs =
       Number.isFinite(configuredTimeout) && configuredTimeout > 0
@@ -1155,14 +1594,21 @@ export class GameClient {
   }
 
   private resolutionEventKey(event: DuelLifecycleEvent): string {
-    return [
-      event.cycleId,
-      event.outcome ?? "",
-      event.cancellationReason ?? "",
-      event.winnerId ?? "",
-      event.seed ?? "",
-      event.replayHash ?? "",
-    ].join(":");
+    return createHash("sha256")
+      .update(
+        canonicalJson({
+          cycleId: event.cycleId,
+          duelId: event.duelId,
+          duelEndTime: event.duelEndTime,
+          outcome: event.outcome,
+          cancellationReason: event.cancellationReason,
+          winnerId: event.winnerId,
+          winReason: event.winReason,
+          seed: event.seed,
+          replayHash: event.replayHash,
+        }),
+      )
+      .digest("hex");
   }
 
   private async emitDuelStart(event: DuelLifecycleEvent) {
@@ -1224,6 +1670,18 @@ export class GameClient {
       if (this.isRefundTerminal(lifecycleEvent)) {
         await this.emitDuelEnd(lifecycleEvent);
         this.lastCycleId = currentCycle.cycleId;
+      } else if (
+        currentCycle.phase === "ANNOUNCEMENT" &&
+        !currentCycle.rendererHealth.ready &&
+        !this.isTerminalEvent(lifecycleEvent)
+      ) {
+        // A signed cycle identity alone is not enough to publish a new market.
+        // Continue checkpointing valid feed frames, but defer the start callback
+        // until this same open cycle carries authoritative renderer readiness.
+        // Locked and terminal recovery remain independent so existing funds can
+        // always be reconciled after a keeper restart.
+        this.lastPhase = currentPhase;
+        return;
       } else {
         await this.emitDuelStart(lifecycleEvent);
         this.lastCycleId = currentCycle.cycleId;
@@ -1262,23 +1720,156 @@ export class GameClient {
     currentCycle: StreamingCycle,
   ): BettingFeedCheckpoint {
     const lifecycleEvent = normalizeLifecycleEvent(currentCycle);
+    const sameTerminalIdentity =
+      lifecycleEvent !== null &&
+      this.checkpoint?.terminal === true &&
+      this.checkpoint.duelId === currentCycle.duelId &&
+      this.checkpoint.competitiveSnapshotDigest ===
+        currentCycle.competitiveSnapshotDigest &&
+      this.checkpoint.terminalEventKey !== null;
+    const retainedTerminal =
+      lifecycleEvent === null &&
+      this.checkpoint?.terminal === true &&
+      this.checkpoint.duelId !== null &&
+      this.checkpoint.competitiveSnapshotDigest !== null &&
+      this.checkpoint.terminalEventKey !== null
+        ? this.checkpoint
+        : null;
+    const terminal = lifecycleEvent
+      ? this.isTerminalEvent(lifecycleEvent)
+      : true;
+    const retainedDuelEndTime =
+      retainedTerminal?.duelEndTime ??
+      (sameTerminalIdentity && this.checkpoint?.duelEndTime != null
+        ? this.checkpoint.duelEndTime
+        : currentCycle.duelEndTime);
     return {
       sourceEpoch: currentCycle.sourceEpoch,
       lastAppliedSeq: currentCycle.seq,
       lastEmittedAt: currentCycle.emittedAt,
-      duelId: currentCycle.duelId,
-      competitiveSnapshotDigest: currentCycle.competitiveSnapshotDigest,
+      // An identity-free IDLE frame is a transport observation, not proof that
+      // the immediately preceding terminal identity ceased to exist. Retain
+      // its fingerprint so a durable terminal frame that reappears after the
+      // scheduler handoff cannot reopen, relock, or refinalize that duel.
+      duelId: retainedTerminal?.duelId ?? currentCycle.duelId,
+      competitiveSnapshotDigest:
+        retainedTerminal?.competitiveSnapshotDigest ??
+        currentCycle.competitiveSnapshotDigest,
+      betOpenTime: retainedTerminal?.betOpenTime ?? currentCycle.betOpenTime,
+      betCloseTime: retainedTerminal?.betCloseTime ?? currentCycle.betCloseTime,
+      fightStartTime:
+        retainedTerminal?.fightStartTime ?? currentCycle.fightStartTime,
+      duelEndTime: retainedDuelEndTime,
       phase: currentCycle.phase,
-      terminal: lifecycleEvent ? this.isTerminalEvent(lifecycleEvent) : true,
+      terminal,
+      terminalEventKey:
+        lifecycleEvent && terminal
+          ? this.resolutionEventKey({
+              ...lifecycleEvent,
+              duelEndTime: retainedDuelEndTime,
+            })
+          : (retainedTerminal?.terminalEventKey ?? null),
       degradedReason: null,
       updatedAt: Date.now(),
     };
   }
 
+  private validateTimelineContinuity(currentCycle: StreamingCycle): void {
+    const checkpoint = this.checkpoint;
+    if (
+      !checkpoint ||
+      checkpoint.duelId === null ||
+      checkpoint.duelId !== currentCycle.duelId
+    ) {
+      return;
+    }
+
+    const immutableTimes = [
+      ["betOpenTime", checkpoint.betOpenTime, currentCycle.betOpenTime],
+      ["betCloseTime", checkpoint.betCloseTime, currentCycle.betCloseTime],
+      [
+        "fightStartTime",
+        checkpoint.fightStartTime,
+        currentCycle.fightStartTime,
+      ],
+      ["duelEndTime", checkpoint.duelEndTime, currentCycle.duelEndTime],
+    ] as const;
+    for (const [field, retained, observed] of immutableTimes) {
+      // Undefined/null retained values are the only legal migration/phase
+      // transition: an old checkpoint can learn the timeline, and start/end
+      // can become known once. A known timestamp can never move or disappear.
+      // The producer's durable terminal frame can be recaptured from its
+      // authoritative cycle with sub-tick millisecond variance. Once a
+      // terminal fingerprint exists, retain the first accepted duelEndTime;
+      // pre-terminal timing boundaries remain exact and immutable.
+      if (
+        retained != null &&
+        observed !== retained &&
+        !(
+          field === "duelEndTime" &&
+          checkpoint.terminal &&
+          checkpoint.terminalEventKey !== null &&
+          currentCycle.outcome !== null &&
+          observed !== null
+        )
+      ) {
+        throw new BettingFeedContinuityError(
+          `${field} changed for active duel ${checkpoint.duelId}`,
+        );
+      }
+    }
+  }
+
+  private validatePreviouslyAppliedTerminal(
+    currentCycle: StreamingCycle,
+  ): boolean {
+    const checkpoint = this.checkpoint;
+    if (
+      !checkpoint?.terminal ||
+      checkpoint.duelId === null ||
+      checkpoint.duelId !== currentCycle.duelId ||
+      checkpoint.competitiveSnapshotDigest !==
+        currentCycle.competitiveSnapshotDigest
+    ) {
+      return false;
+    }
+
+    const lifecycleEvent = normalizeLifecycleEvent(currentCycle);
+    if (!lifecycleEvent || !this.isTerminalEvent(lifecycleEvent)) {
+      throw new BettingFeedContinuityError(
+        `terminal duel ${checkpoint.duelId} reverted to a non-terminal state`,
+      );
+    }
+
+    const terminalEventKey = this.resolutionEventKey({
+      ...lifecycleEvent,
+      // Preserve the first accepted producer timestamp across a recaptured
+      // copy of the same terminal truth. All outcome evidence remains part of
+      // the fingerprint, and a changed winner/reason/seed/replay still fails.
+      duelEndTime: checkpoint.duelEndTime ?? lifecycleEvent.duelEndTime,
+    });
+    if (checkpoint.terminalEventKey === null) {
+      throw new BettingFeedContinuityError(
+        `terminal checkpoint for duel ${checkpoint.duelId} is missing its event fingerprint`,
+      );
+    }
+    if (checkpoint.terminalEventKey !== terminalEventKey) {
+      throw new BettingFeedContinuityError(
+        `terminal event changed after completion for duel ${checkpoint.duelId}`,
+      );
+    }
+
+    this.lastCycleId = currentCycle.cycleId;
+    this.lastPhase = currentCycle.phase;
+    this.lastLockedCycleId = currentCycle.cycleId;
+    this.lastResolutionEventKey = terminalEventKey;
+    return true;
+  }
+
   private persistCycleCheckpoint(currentCycle: StreamingCycle): void {
     const next = this.checkpointForCycle(currentCycle);
     this.checkpoint = this.checkpointStore
-      ? this.checkpointStore.saveBettingFeedCheckpoint(next)
+      ? this.checkpointStore.saveBettingFeedCheckpoint(next, currentCycle)
       : next;
   }
 
@@ -1322,6 +1913,7 @@ export class GameClient {
     allowReplay: boolean,
   ): Promise<void> {
     this.validateSourceEpoch(currentCycle);
+    this.validateTimelineContinuity(currentCycle);
     const checkpoint = this.checkpoint;
     if (checkpoint && currentCycle.sourceEpoch === checkpoint.sourceEpoch) {
       if (
@@ -1364,8 +1956,12 @@ export class GameClient {
       }
     }
 
+    const terminalAlreadyApplied =
+      this.validatePreviouslyAppliedTerminal(currentCycle);
     await this.emitStateFrame(currentCycle);
-    await this.applyLifecycleCycle(currentCycle);
+    if (!terminalAlreadyApplied) {
+      await this.applyLifecycleCycle(currentCycle);
+    }
     this.persistCycleCheckpoint(currentCycle);
     this.runtimeBootstrapped = true;
   }
@@ -1412,7 +2008,9 @@ export class GameClient {
               `betting feed replay gap exceeded source retention after sequence ${checkpoint.lastAppliedSeq}`,
             );
           }
-          const replayCycle = normalizeBettingFeedCycle(message.payload);
+          const replayCycle = normalizeBettingFeedCycle(message.payload, {
+            allowDiagnosticSnapshot: this.allowDiagnosticSnapshot,
+          });
           if (!replayCycle) {
             throw new BettingFeedContinuityError(
               "betting feed replay contained an invalid schema-v3 frame",
@@ -1466,13 +2064,18 @@ export class GameClient {
       }
 
       const data = (await res.json()) as BettingFeedStateUpdate;
-      const currentCycle = normalizeBettingFeedCycle(data);
+      const currentCycle = normalizeBettingFeedCycle(data, {
+        allowDiagnosticSnapshot: this.allowDiagnosticSnapshot,
+      });
       if (!currentCycle) {
         throw new BettingFeedContinuityError(
           "betting feed state was not a valid schema-v3 frame",
         );
       }
       await this.processCycle(currentCycle, true);
+      if (this.onSourceObservationCb) {
+        await this.onSourceObservationCb(currentCycle);
+      }
       this.resetPollFailures();
     } catch (err) {
       if (err instanceof BettingFeedContinuityError) {
@@ -1504,6 +2107,12 @@ export class GameClient {
     callback: (data: StreamingCycle) => void | Promise<void>,
   ) {
     this.onStateFrameCb = callback;
+  }
+
+  public onSourceObservation(
+    callback: (data: StreamingCycle) => void | Promise<void>,
+  ) {
+    this.onSourceObservationCb = callback;
   }
 
   public onBettingLocked(

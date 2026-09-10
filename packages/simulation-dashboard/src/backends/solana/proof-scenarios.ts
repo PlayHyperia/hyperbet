@@ -1,8 +1,8 @@
 import { LAMPORTS_PER_SOL } from "@solana/web3.js";
 
-import type { AgentActionTrace } from "@hyperbet/mm-core";
+import type { AgentActionTrace } from "../../solana-scenario-types.js";
 
-import type { ScenarioPreset } from "../../scenario-catalog.js";
+import type { ScenarioPreset } from "../../solana-scenario-catalog.js";
 import type { SolanaActorSnapshot, SolanaProofOutcome } from "./types.js";
 import {
   SIDE_ASK,

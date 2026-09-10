@@ -70,7 +70,7 @@ function getCopy(locale: UiLocale) {
 
 function actionButtonStyle(disabled: boolean): CSSProperties {
   return {
-    minHeight: 40,
+    minHeight: 44,
     padding: "9px 12px",
     borderRadius: "var(--hm-radius)",
     border: "1px solid rgba(96,165,250,0.48)",
@@ -134,10 +134,19 @@ export const SolanaManagedOrderConfirmationDialog = forwardRef<
       aria-labelledby="solana-managed-order-confirmation-title"
       aria-describedby="solana-managed-order-confirmation-help"
       data-testid="solana-managed-order-confirmation"
+      onKeyDown={(event) => {
+        if (event.key === "Escape" && !submitting) {
+          event.preventDefault();
+          event.stopPropagation();
+          onBack();
+        }
+      }}
       style={{
         width: "min(100%, 460px)",
-        maxHeight: "min(90vh, 720px)",
+        maxHeight: "min(calc(100dvh - 32px), 720px)",
         overflowY: "auto",
+        overscrollBehavior: "contain",
+        boxSizing: "border-box",
         display: "grid",
         gap: 14,
         padding: compact ? 16 : 20,
@@ -233,6 +242,7 @@ export const SolanaManagedOrderConfirmationDialog = forwardRef<
       >
         <button
           type="button"
+          autoFocus
           data-testid="solana-managed-order-confirmation-back"
           disabled={submitting}
           onClick={onBack}
@@ -246,7 +256,6 @@ export const SolanaManagedOrderConfirmationDialog = forwardRef<
         </button>
         <button
           type="button"
-          autoFocus
           data-testid="solana-managed-order-confirmation-submit"
           disabled={submitting}
           onClick={onConfirm}

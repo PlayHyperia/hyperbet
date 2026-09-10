@@ -1,4 +1,4 @@
-import { useState, ReactNode } from "react";
+import { useId, useState, type ReactNode, type Ref } from "react";
 import { getUiCopy, resolveUiLocale, type UiLocale } from "@hyperbet/ui/i18n";
 import {
   LineChart,
@@ -29,7 +29,10 @@ interface PredictionMarketPanelProps {
   amountInput: string;
   setAmountInput: (val: string) => void;
   amountLabel?: string;
-  onPlaceBet: () => void;
+  amountHelpText?: string;
+  amountError?: string | null;
+  onPlaceBet: (trigger: HTMLButtonElement) => void;
+  submitButtonRef?: Ref<HTMLButtonElement>;
   isWalletReady: boolean;
   programsReady: boolean;
   isSubmitting?: boolean;
@@ -50,6 +53,7 @@ interface PredictionMarketPanelProps {
   onViewAgent2?: () => void;
   compactHeader?: ReactNode;
   readOnly?: boolean;
+  readOnlyMessage?: string;
   /** Sidebar compact mode: single-column layout, hides chart/orderbook/trades columns. */
   compact?: boolean;
 }
@@ -64,7 +68,10 @@ export function PredictionMarketPanel({
   amountInput,
   setAmountInput,
   amountLabel,
+  amountHelpText,
+  amountError = null,
   onPlaceBet,
+  submitButtonRef,
   isWalletReady,
   programsReady,
   isSubmitting = false,
@@ -85,8 +92,18 @@ export function PredictionMarketPanel({
   onViewAgent2,
   compactHeader,
   readOnly = false,
+  readOnlyMessage = "Spectator mode · transaction controls disabled",
   compact = false,
 }: PredictionMarketPanelProps) {
+  const amountInputId = useId();
+  const amountHelpId = useId();
+  const amountErrorId = useId();
+  const amountDescriptionIds = [
+    amountHelpText ? amountHelpId : null,
+    amountError ? amountErrorId : null,
+  ]
+    .filter((value): value is string => value !== null)
+    .join(" ");
   const resolvedLocale = resolveUiLocale(locale);
   const copy = getUiCopy(resolvedLocale);
   const [activeTab, setActiveTab] = useState<"buy" | "sell">("buy");
@@ -172,6 +189,7 @@ export function PredictionMarketPanel({
               <button
                 type="button"
                 aria-pressed={yesSelected}
+                disabled={readOnly}
                 onClick={() => setSide("YES")}
                 data-testid="prediction-select-yes"
                 className="gm-btn gm-btn-agent1"
@@ -183,7 +201,7 @@ export function PredictionMarketPanel({
                     ? C_YES_ACTIVE_BORDER
                     : "1px solid var(--hm-panel-card-border, rgba(255,255,255,0.1))",
                   color: "#fff",
-                  cursor: "pointer",
+                  cursor: readOnly ? "not-allowed" : "pointer",
                   textAlign: "center",
                   transition: "all 0.15s cubic-bezier(0.4, 0, 0.2, 1)",
                   overflow: "hidden",
@@ -299,6 +317,7 @@ export function PredictionMarketPanel({
               <button
                 type="button"
                 aria-pressed={noSelected}
+                disabled={readOnly}
                 onClick={() => setSide("NO")}
                 data-testid="prediction-select-no"
                 className="gm-btn gm-btn-agent2"
@@ -310,7 +329,7 @@ export function PredictionMarketPanel({
                     ? "1px solid var(--hm-sell-border, rgba(232,65,66,0.4))"
                     : "1px solid var(--hm-panel-card-border, rgba(255,255,255,0.1))",
                   color: "#fff",
-                  cursor: "pointer",
+                  cursor: readOnly ? "not-allowed" : "pointer",
                   textAlign: "center",
                   transition: "all 0.15s cubic-bezier(0.4, 0, 0.2, 1)",
                   overflow: "hidden",
@@ -456,7 +475,7 @@ export function PredictionMarketPanel({
                 textTransform: "uppercase",
               }}
             >
-              Spectator mode · transaction controls disabled
+              {readOnlyMessage}
             </div>
           ) : null}
 
@@ -566,29 +585,49 @@ export function PredictionMarketPanel({
                 }}
               >
                 <div>
-                  {compact ? (
-                    <div
-                      style={{
-                        marginBottom: 5,
-                        fontSize: 9,
-                        fontWeight: 800,
-                        letterSpacing: 0.9,
-                        textTransform: "uppercase",
-                        color: "var(--hm-text-muted, rgba(255,255,255,0.48))",
-                        fontFamily: "var(--hm-font-display)",
-                      }}
-                    >
-                      {amountLabel ?? copy.betAmountLabel(currencySymbol)}
-                    </div>
-                  ) : null}
+                  <label
+                    htmlFor={amountInputId}
+                    style={
+                      compact
+                        ? {
+                            display: "block",
+                            marginBottom: 5,
+                            fontSize: 9,
+                            fontWeight: 800,
+                            letterSpacing: 0.9,
+                            textTransform: "uppercase",
+                            color:
+                              "var(--hm-text-muted, rgba(255,255,255,0.48))",
+                            fontFamily: "var(--hm-font-display)",
+                          }
+                        : {
+                            position: "absolute",
+                            width: 1,
+                            height: 1,
+                            padding: 0,
+                            margin: -1,
+                            overflow: "hidden",
+                            clip: "rect(0, 0, 0, 0)",
+                            whiteSpace: "nowrap",
+                            border: 0,
+                          }
+                    }
+                  >
+                    {amountLabel ?? copy.betAmountLabel(currencySymbol)}
+                  </label>
                   <div style={{ position: "relative" }}>
                     <input
+                      id={amountInputId}
+                      name="orderAmountSol"
                       type="number"
-                      min="0"
+                      min="0.000001"
                       step="0.000001"
                       inputMode="decimal"
-                      aria-label={
-                        amountLabel ?? copy.betAmountLabel(currencySymbol)
+                      autoComplete="off"
+                      aria-describedby={amountDescriptionIds || undefined}
+                      aria-invalid={amountError ? "true" : "false"}
+                      aria-errormessage={
+                        amountError ? amountErrorId : undefined
                       }
                       data-testid="prediction-amount-input"
                       placeholder="0.00"
@@ -597,12 +636,14 @@ export function PredictionMarketPanel({
                       className="gm-amount-input"
                       style={{
                         width: "100%",
+                        minHeight: 44,
                         padding: compact
                           ? "8px 52px 8px 11px"
                           : "9px 44px 9px 12px",
                         borderRadius: 10,
-                        border:
-                          "1px solid var(--hm-chip-border, rgba(232,65,66,0.18))",
+                        border: amountError
+                          ? "1px solid rgba(248,113,113,0.68)"
+                          : "1px solid var(--hm-chip-border, rgba(232,65,66,0.18))",
                         color: "var(--hm-accent-gold)",
                         boxSizing: "border-box",
                         fontSize: compact ? 14 : 15,
@@ -637,14 +678,47 @@ export function PredictionMarketPanel({
                       {currencySymbol}
                     </div>
                   </div>
+                  {amountHelpText ? (
+                    <span
+                      id={amountHelpId}
+                      style={{
+                        display: "block",
+                        marginTop: 5,
+                        color: "var(--hm-text-muted, rgba(255,255,255,0.48))",
+                        fontFamily: "var(--hm-font-body)",
+                        fontSize: 10,
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      {amountHelpText}
+                    </span>
+                  ) : null}
+                  {amountError ? (
+                    <span
+                      id={amountErrorId}
+                      role="alert"
+                      style={{
+                        display: "block",
+                        marginTop: 5,
+                        color: "#fca5a5",
+                        fontFamily: "var(--hm-font-body)",
+                        fontSize: 10,
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      {amountError}
+                    </span>
+                  ) : null}
                 </div>
                 <button
+                  ref={submitButtonRef}
                   disabled={!canBet}
-                  onClick={onPlaceBet}
+                  onClick={(event) => onPlaceBet(event.currentTarget)}
                   data-testid="prediction-submit"
                   className="gm-btn-submit"
                   style={{
                     width: "100%",
+                    minHeight: 44,
                     padding: compact ? "10px 10px" : "10px 6px",
                     borderRadius: compact ? 12 : 10,
                     border: canBet

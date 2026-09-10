@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node", "bun-types"]
+  },
+  "include": [
+    "../../scripts/ci-gate-scenarios.ts",
+    "src/scenario-evaluator.ts",
+    "src/solana-scenario-catalog.test.ts",
+    "src/solana-scenario-catalog.ts",
+    "src/solana-scenario-types.ts",
+    "src/backends/solana/normalize.test.ts",
+    "src/backends/solana/normalize.ts",
+    "src/backends/solana/program-runtime.ts",
+    "src/backends/solana/proof-scenarios.ts",
+    "src/backends/solana/types.ts",
+    "src/backends/solana/validator.ts"
+  ]
+}

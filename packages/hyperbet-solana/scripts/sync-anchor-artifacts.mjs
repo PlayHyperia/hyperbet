@@ -20,7 +20,7 @@ const artifactTargets = [
   {
     label: "hyperbet-ui",
     dir: path.join(rootDir, "..", "hyperbet-ui", "src", "idl"),
-    copyTypes: false,
+    copyTypes: true,
   },
   {
     label: "market-maker-bot",

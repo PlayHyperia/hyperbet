@@ -27,72 +27,93 @@ jobs:
   fund-solana-devnet-wallets:
     name: Fund Solana devnet launch wallets
     if: ${{ inputs.confirmation == 'FUND_SOLANA_DEVNET_WALLETS' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: solana-devnet
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Solana CLI
         uses: ./.github/actions/setup-hyperbet
         with:
           install-solana: "true"
 
-      - name: Validate and fund recipients
+      - name: Validate every recipient before exposing the funding signer
         env:
           RECIPIENTS: ${{ inputs.recipients }}
+        run: |
+          set -euo pipefail
+          umask 077
+          funding_plan_file="$(mktemp "${RUNNER_TEMP}/hyperbet-devnet-funding-plan.XXXXXX")"
+          node scripts/ci-solana-devnet-funding-policy.mjs \
+            --recipients "${RECIPIENTS}" >"${funding_plan_file}"
+
+          while IFS= read -r address; do
+            solana balance "${address}" --url devnet >/dev/null
+          done < <(jq -r '.recipients[].address' "${funding_plan_file}")
+
+          echo "SOLANA_DEVNET_FUNDING_PLAN=${funding_plan_file}" >>"${GITHUB_ENV}"
+
+      - name: Fund the prevalidated recipient plan
+        env:
           TESTNET_SOLANA_DEPLOYER_KEYPAIR: ${{ secrets.TESTNET_SOLANA_DEPLOYER_KEYPAIR }}
         run: |
           set -euo pipefail
+          umask 077
+          if [[ -z "${SOLANA_DEVNET_FUNDING_PLAN:-}" || ! -f "${SOLANA_DEVNET_FUNDING_PLAN}" ]]; then
+            echo "Missing prevalidated Solana devnet funding plan" >&2
+            exit 1
+          fi
+          case "${SOLANA_DEVNET_FUNDING_PLAN}" in
+            "${RUNNER_TEMP%/}"/hyperbet-devnet-funding-plan.*) ;;
+            *)
+              echo "Refusing an unexpected Solana devnet funding-plan path" >&2
+              exit 1
+              ;;
+          esac
+
+          wallet_root=""
+          cleanup_funding_material() {
+            if [[ -n "${wallet_root}" ]]; then
+              case "${wallet_root}" in
+                "${RUNNER_TEMP%/}"/hyperbet-devnet-funder.*)
+                  find "${wallet_root}" -depth -mindepth 1 -delete
+                  rmdir "${wallet_root}"
+                  ;;
+                *)
+                  echo "Refusing to clean an unexpected funding-key path" >&2
+                  return 1
+                  ;;
+              esac
+            fi
+            find "${SOLANA_DEVNET_FUNDING_PLAN}" -delete
+          }
+          trap cleanup_funding_material EXIT
+
           if [[ -z "$TESTNET_SOLANA_DEPLOYER_KEYPAIR" ]]; then
             echo "Missing TESTNET_SOLANA_DEPLOYER_KEYPAIR" >&2
             exit 1
           fi
 
-          wallet_file="$(mktemp)"
-          trap 'rm -f "$wallet_file"' EXIT
+          wallet_root="$(mktemp -d "${RUNNER_TEMP}/hyperbet-devnet-funder.XXXXXX")"
+          wallet_file="${wallet_root}/deployer.json"
           printf '%s' "$TESTNET_SOLANA_DEPLOYER_KEYPAIR" >"$wallet_file"
           chmod 600 "$wallet_file"
           solana-keygen pubkey "$wallet_file" >/dev/null
 
-          IFS=',' read -r -a targets <<<"$RECIPIENTS"
-          if [[ "${#targets[@]}" -lt 1 || "${#targets[@]}" -gt 12 ]]; then
-            echo "Provide between 1 and 12 recipients" >&2
-            exit 1
-          fi
-
-          for target in "${targets[@]}"; do
-            address="${target%%=*}"
-            amount="${target#*=}"
-            address="${address//[[:space:]]/}"
-            amount="${amount//[[:space:]]/}"
-            if [[ "$amount" == "$target" ]] || [[ ! "$address" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]]; then
-              echo "Invalid recipient pair: $target" >&2
-              exit 1
-            fi
-            if [[ ! "$amount" =~ ^(0|[1-9][0-9]*)(\.[0-9]{1,9})?$ ]]; then
-              echo "Invalid SOL amount for $address" >&2
-              exit 1
-            fi
-            awk -v amount="$amount" 'BEGIN { if (amount <= 0 || amount > 10) exit 1 }' || {
-              echo "Amount for $address must be greater than 0 and at most 10 SOL" >&2
-              exit 1
-            }
-          done
-
-          for target in "${targets[@]}"; do
-            address="${target%%=*}"
-            amount="${target#*=}"
-            address="${address//[[:space:]]/}"
-            amount="${amount//[[:space:]]/}"
-            solana transfer "$address" "$amount" \
+          while IFS=$'\t' read -r address amount; do
+            solana transfer "${address}" "${amount}" \
               --url devnet \
-              --keypair "$wallet_file" \
+              --keypair "${wallet_file}" \
               --allow-unfunded-recipient
-          done
+          done < <(
+            jq -r '.recipients[] | [.address, .amountSol] | @tsv' \
+              "${SOLANA_DEVNET_FUNDING_PLAN}"
+          )
 
-          for target in "${targets[@]}"; do
-            address="${target%%=*}"
-            address="${address//[[:space:]]/}"
-            solana balance "$address" --url devnet
-          done
+          jq -r '.recipients[].address' "${SOLANA_DEVNET_FUNDING_PLAN}" |
+            while IFS= read -r address; do
+              solana balance "${address}" --url devnet
+            done

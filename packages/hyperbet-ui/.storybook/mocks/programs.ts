@@ -1,4 +1,9 @@
 import { PublicKey } from "@solana/web3.js";
+import {
+  DUEL_WINNER_MARKET_KIND,
+  findDuelStatePda,
+  findMarketStatePda,
+} from "../../src/lib/pdas";
 
 const ORACLE_PROGRAM_ID = new PublicKey(
   "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
@@ -6,18 +11,35 @@ const ORACLE_PROGRAM_ID = new PublicKey(
 const CLOB_PROGRAM_ID = new PublicKey(
   "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy",
 );
-const MARKET_STATE = new PublicKey(
-  "3e8TxCCftPmKCML7rHZJM21ebFkzohnSEP7Z8mb7Cvzv",
-);
 const STORY_WALLET = new PublicKey(
   "9YQ6U3b1i3Qxb38nSxrdbidKdvUSsfx8bVsgcuyo6edS",
+);
+const DUEL_KEY_HEX =
+  "1f1e1d1c1b1a19181716151413121110f1e2d3c4b5a697887766554433221100";
+const DUEL_KEY = Uint8Array.from(Buffer.from(DUEL_KEY_HEX, "hex"));
+const DUEL_STATE = findDuelStatePda(ORACLE_PROGRAM_ID, DUEL_KEY);
+const MARKET_STATE = findMarketStatePda(
+  CLOB_PROGRAM_ID,
+  DUEL_STATE,
+  DUEL_WINNER_MARKET_KIND,
 );
 
 function createProgramFacade() {
   const marketConfig = {
-    config: {},
+    authority: STORY_WALLET,
+    marketOperator: STORY_WALLET,
+    treasury: STORY_WALLET,
+    marketMaker: STORY_WALLET,
+    tradeTreasuryFeeBps: 10,
+    tradeMarketMakerFeeBps: 15,
+    winningsMarketMakerFeeBps: 100,
+    orderPlacementPaused: false,
   };
   const marketState = {
+    duelKey: DUEL_KEY,
+    duelState: DUEL_STATE,
+    marketKind: DUEL_WINNER_MARKET_KIND,
+    authority: STORY_WALLET,
     status: { open: {} },
     winner: { none: {} },
     nextOrderId: 42n,
@@ -137,7 +159,7 @@ export function createReadonlyPrograms() {
       programId: ORACLE_PROGRAM_ID,
       account: {
         duelState: {
-          fetchNullable: async () => ({ active: true }),
+          fetchNullable: async () => ({ status: { active: {} } }),
         },
       },
     },

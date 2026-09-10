@@ -1,81 +1,99 @@
-# Quote Disablement And Safe Restart
+# SOL Quote Disablement And Safe Restart
 
-## Symptoms
+This procedure applies only to the dedicated Solana duel bot. The retired
+multi-chain market-maker service and its database are not part of the launch
+topology.
 
-- MM quotes are stale, crossed, or obviously out of line with duel state
-- `/api/keeper/bot-health` shows repeated failures, drawdown halts, or persistent restart loops
-- `/status` is healthy but quote state is not converging
+## Trigger conditions
 
-## Detection
+- quotes are stale, crossed, outside the approved price/exposure policy, or
+  inconsistent with the canonical duel phase;
+- `/ready` or bot health reports RPC, configuration, funding, discovery,
+  recovery, or market drift;
+- the duel bot is restarting repeatedly or cannot reconcile its owned orders.
+
+## Read-only detection
+
+Capture these responses before stopping anything. Do not include an RPC URL,
+cookie, bearer token, or private environment value in the incident bundle.
 
 ```bash
-curl -fsSL "$KEEPER_URL/status" | jq
-curl -fsSL "$KEEPER_URL/api/keeper/bot-health" | jq
-curl -fsSL "$KEEPER_URL/api/arena/prediction-markets/active" | jq
-bun run --cwd packages/market-maker-bot verify:chains
-psql "$MM_DATABASE_URL" -c "select status, count(*) from orders group by 1 order by 1;"
-psql "$MM_DATABASE_URL" -c "select cursor_key, cursor_value, updated_at from reconciliation_cursors order by updated_at desc limit 10;"
-psql "$MM_DATABASE_URL" -c "select backlog_key, status, attempts, next_attempt_at, last_error from claim_backlog where status <> 'RESOLVED' order by next_attempt_at asc limit 20;"
+curl -sS "$KEEPER_URL/health" | jq
+curl -sS "$KEEPER_URL/ready" | jq
+curl -sS "$KEEPER_URL/status" | jq
+curl -sS "$KEEPER_URL/api/keeper/bot-health" | jq
+curl -sS "$KEEPER_URL/api/arena/prediction-markets/active" | jq
+bun run --cwd packages/hyperbet-solana/keeper terminal-ops feed-status --db "$KEEPER_DB_PATH"
+bun run --cwd packages/hyperbet-solana/keeper terminal-ops list --db "$KEEPER_DB_PATH" --status PENDING PROCESSING MANUAL_REVIEW DEAD_LETTER
 ```
 
-## Immediate Containment
+Record the release SHA, Solana cluster/genesis identity, both program IDs,
+market and duel keys, last healthy timestamp, source epoch/sequence, and every
+owned order ID.
 
-1. Stop the external MM bot process for the affected chain set.
-2. If the keeper bot is contributing bad liquidity, restart the keeper with bot execution disabled or paused by env/config.
-3. Do not reopen quote traffic until `/api/keeper/bot-health` reports coherent market state and no active recovery reason.
-4. Preserve the current `orders`, `reconciliation_cursors`, `claim_backlog`, and `outbox` rows before any restart drill or manual cleanup.
+## Immediate containment
 
-## Recovery Steps
+1. Stop only the dedicated duel-bot service through the approved deployment
+   platform. Keep the read-only HTTP service available if it remains accurate.
+2. Confirm `/ready` is failed and the public application no longer enables new
+   orders. Do not preserve quoting merely to preserve uptime.
+3. Do not edit SQLite, delete an order account, synthesize a lifecycle event,
+   force a result, reuse a broad admin key, or run a retired service.
+4. Preserve bot/service logs and an approved consistent snapshot of the keeper
+   database and volume before any restart or configuration change.
+5. If an on-chain order-placement pause is required, use only the rehearsed,
+   separately approved cold-authority procedure after simulation and
+   independent review. If that procedure or signer is unavailable, keep the bot
+   stopped and escalate; a runbook is not authority to improvise a transaction.
 
-1. Verify RPC and chain reachability with `verify:chains`.
-2. Confirm the durable store is reachable and bootstrapped:
+## Recovery
+
+1. Classify the fault: authoritative feed, Solana RPC, program/config identity,
+   signer/funding, risk policy, owned-order graph, terminal custody, or service
+   release.
+2. Run the read-only verifier for the configured cluster. Choose exactly one:
+
    ```bash
-   bun run --cwd packages/market-maker-bot storage:migrate
-   psql "$MM_DATABASE_URL" -c "select order_key, chain_key, duel_key, status, last_seen_on_chain_at, last_reconciled_at from orders order by placed_at desc limit 20;"
-   psql "$MM_DATABASE_URL" -c "select id, topic, status, attempts, available_at, last_error from outbox order by available_at asc limit 20;"
-   ```
-3. Confirm canonical lifecycle state on `/api/arena/prediction-markets/active` and capture the on-chain open-order snapshot for the affected markets.
-4. Restart the keeper service and wait for:
-   - `/status.ok == true`
-   - `/api/keeper/bot-health.ok == true`
-   - market records present for the affected chain
-   - logs show startup reconciliation completed or quarantined the mismatched markets
-5. Restart the external MM bot only after keeper health is stable, the store snapshot matches chain truth, and any ambiguous markets are still quarantined or reduce-only.
-6. Re-check that quote state, persisted order state, and lifecycle state agree:
-   ```bash
-   curl -fsSL "$KEEPER_URL/api/keeper/bot-health" | jq
-   psql "$MM_DATABASE_URL" -c "select status, count(*) from orders group by 1 order by 1;"
-   psql "$MM_DATABASE_URL" -c "select backlog_key, status, attempts, last_error from claim_backlog where status <> 'RESOLVED' order by next_attempt_at asc limit 20;"
+   bun run --cwd packages/hyperbet-solana verify:deployment:devnet
+   bun run --cwd packages/hyperbet-solana verify:deployment:testnet
+   bun run --cwd packages/hyperbet-solana verify:deployment:mainnet
    ```
 
-## Success Criteria
+   Never substitute a different cluster to make verification pass.
 
-- `/status` is healthy
-- `/api/keeper/bot-health` shows coherent market state with no unresolved recovery reason
-- canonical prediction-market records are present and not regressing
-- quotes resume only on open markets
-- persisted `orders` rows reflect the post-reconciliation chain truth
-- orphan orders are cancelled or explicitly quarantined before quote resume
-- unresolved claim backlog is zero or intentionally bounded with visible retry state
+3. Inspect every nonterminal terminal operation with `terminal-ops inspect`.
+   Requeue only `MANUAL_REVIEW` or `DEAD_LETTER` work whose canonical chain and
+   feed evidence has been independently verified, using the exact fingerprint,
+   operator identity, and reason required by `terminal-ops requeue`.
+4. Correct the approved configuration or upstream dependency. Do not mutate
+   persisted facts to match the desired answer.
+5. Start the dedicated duel bot once. Require startup discovery to reconcile
+   every configured market and owned order without creating a duplicate market,
+   order, terminal operation, or fee release.
+6. Wait for current bot health, feed continuity, program/config verification,
+   zero active recovery reasons, and canonical active-market agreement. A green
+   process alone is insufficient.
+7. Re-enable public transaction availability only after a bounded valueless or
+   tightly controlled staged action and exact balance/order reconciliation.
 
-## Escalation
+## Success criteria
 
-Escalate if:
+- the one configured Solana cluster, programs, config, feed checkpoint, duel,
+  market, and stream identity agree;
+- every owned order is canonical, safely cancelled/reclaimed, or explicitly
+  quarantined;
+- terminal custody and execution-fee escrow reconcile exactly;
+- `/health`, `/ready`, `/status`, and bot health are current and coherent;
+- no duplicate market, order, terminal event, fee release, refund, or claim was
+  created;
+- quote resume has an approval identity, UTC timestamp, release SHA, and retained
+  before/after evidence.
 
-- repeated restart loops continue after quote disablement
-- the keeper recreates or duplicates market state
-- claimability or lifecycle status diverges after restart
-- store rows cannot be reconciled with on-chain open orders or positions
-- quote resume would require bypassing quarantine or reduce-only protections
+## Escalate and remain stopped when
 
-## Evidence To Capture
-
-- `/status` payload
-- `/api/keeper/bot-health` payload
-- `/api/arena/prediction-markets/active` payload
-- SQL snapshots for `orders`, `reconciliation_cursors`, `claim_backlog`, and `outbox`
-- MM boot logs showing durable-store bootstrap plus reconciliation decisions
-- before/after open-order snapshots for each affected chain
-- restart-drill artifact bundle with timestamps for stop, restart, reconciliation complete, and quote resume
-- MM bot logs
-- keeper logs
+- program/config identity, genesis hash, role separation, or fees do not match;
+- chain truth cannot be reconciled with the feed checkpoint or keeper ledger;
+- an ambiguous signature cannot be proven confirmed or failed;
+- the bot recreates work, hot-loops, or requires a database edit;
+- recovery would require an unrehearsed signer, pause, cancellation, or release
+  operation.

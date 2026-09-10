@@ -38,6 +38,12 @@ type MarketContext = {
   marketAccount: any;
 };
 
+// Anchor 0.30.1's root declaration drops the inherited NodeWallet constructor
+// under TypeScript's bundler resolution even though the runtime class accepts
+// a Keypair. Preserve that exact runtime contract without weakening the
+// provider wallet type.
+type AnchorWalletConstructor = new (payer: Keypair) => AnchorProvider["wallet"];
+
 function assertRpcUrl(value: string): string {
   let url: URL;
   try {
@@ -266,7 +272,7 @@ export class HyperbetSolanaClient {
     this.fightOracleProgramId = new PublicKey(fightOracleProgramId);
     this.provider = new AnchorProvider(
       this.connection,
-      new Wallet(this.wallet),
+      new (Wallet as unknown as AnchorWalletConstructor)(this.wallet),
       {
         commitment: "confirmed",
         preflightCommitment: "confirmed",

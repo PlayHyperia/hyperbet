@@ -4,21 +4,54 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$(cd "$APP_DIR/.." && pwd)"
 ANCHOR_DIR="$DEMO_DIR/anchor"
+SOLANA_ACTIVE_RELEASE_BIN="${SOLANA_ACTIVE_RELEASE_BIN:-$HOME/.local/share/solana/install/active_release/bin}"
+if [[ -d "$SOLANA_ACTIVE_RELEASE_BIN" ]]; then
+  export PATH="$SOLANA_ACTIVE_RELEASE_BIN:$PATH"
+fi
+LOCAL_DEMO_OWNS_CARGO_TARGET=0
+CARGO_TARGET_DIR="${LOCAL_DEMO_CARGO_TARGET_DIR:-}"
+if [[ -z "$CARGO_TARGET_DIR" ]]; then
+  CARGO_TARGET_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hyperbet-solana-local-demo-cargo.XXXXXX")"
+  LOCAL_DEMO_OWNS_CARGO_TARGET=1
+fi
+export CARGO_TARGET_DIR
 LEDGER_DIR="$ANCHOR_DIR/.local-demo-ledger"
 VALIDATOR_LOG="$APP_DIR/.local-demo-validator.log"
-PROGRAM_ORACLE_ID="B5mRCRDJk9BrnH7regMWW5mpTQ8QG1CcCGSnDxMt8hmo"
-PROGRAM_DUEL_MARKET_ID="DYtd7AoyTX2tbmZ8vpC3mxZgqTpyaDei4TFXZukWBJEf"
+PROGRAM_ORACLE_ID="FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu"
+PROGRAM_DUEL_MARKET_ID="7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
 APP_PORT="${APP_PORT:-4179}"
 RPC_URL="http://127.0.0.1:8899"
 WALLET_PATH=""
 
 VALIDATOR_PID=""
 
+cleanup_cargo_target() {
+  if [[ "$LOCAL_DEMO_OWNS_CARGO_TARGET" != "1" || ! -d "$CARGO_TARGET_DIR" ]]; then
+    return 0
+  fi
+  case "$(basename "$CARGO_TARGET_DIR")" in
+    hyperbet-solana-local-demo-cargo.*)
+      rm -rf -- "$CARGO_TARGET_DIR"
+      ;;
+    *)
+      echo "[local-demo] refusing to remove unexpected Cargo temp path: $CARGO_TARGET_DIR" >&2
+      ;;
+  esac
+}
+
+for required_solana_command in solana-keygen solana-test-validator; do
+  if ! command -v "$required_solana_command" >/dev/null 2>&1; then
+    echo "[local-demo] missing $required_solana_command; set SOLANA_ACTIVE_RELEASE_BIN to the pinned Solana CLI bin directory" >&2
+    exit 1
+  fi
+done
+
 cleanup() {
   if [[ -n "$VALIDATOR_PID" ]] && kill -0 "$VALIDATOR_PID" >/dev/null 2>&1; then
     kill "$VALIDATOR_PID" >/dev/null 2>&1 || true
     wait "$VALIDATOR_PID" >/dev/null 2>&1 || true
   fi
+  cleanup_cargo_target
 }
 trap cleanup EXIT
 

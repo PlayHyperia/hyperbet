@@ -1,14 +1,15 @@
+import { PublicKey } from "@solana/web3.js";
+
+import type { SolanaCluster } from "./solanaConfig";
 import { isSolanaTransactionExpiredError } from "./solanaRpc";
 
 export type SolanaTransactionStage =
-  | "preparing"
-  | "signing"
-  | "sending"
-  | "confirming";
+  "preparing" | "signing" | "sending" | "confirming";
 
 export type SolanaTransactionErrorKind =
   | "QUOTE_STALE"
   | "USER_REJECTED"
+  | "WALLET_INTEGRITY_FAILED"
   | "WALLET_DISCONNECTED"
   | "INSUFFICIENT_FUNDS"
   | "EXPIRED"
@@ -18,9 +19,7 @@ export type SolanaTransactionErrorKind =
   | "UNKNOWN";
 
 export type SolanaTransactionRetryMode =
-  | "REVIEW_AND_RETRY"
-  | "CHECK_STATUS_FIRST"
-  | "BLOCKED";
+  "REVIEW_AND_RETRY" | "CHECK_STATUS_FIRST" | "BLOCKED";
 
 export class SolanaTransactionFlowError extends Error {
   readonly stage: SolanaTransactionStage;
@@ -46,6 +45,137 @@ export type SolanaTransactionRecovery = {
   retryMode: SolanaTransactionRetryMode;
   detail: string;
 };
+
+const SOLANA_TRANSACTION_CONTEXT_VERSION =
+  "hyperbet-solana-transaction-context-v2";
+const SOLANA_TRANSACTION_CLUSTERS = new Set<string>([
+  "localnet",
+  "devnet",
+  "testnet",
+  "mainnet-beta",
+]);
+
+function canonicalTransactionContextString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() === value && value.length > 0
+    ? value
+    : null;
+}
+
+function canonicalTransactionContextPublicKey(value: unknown): string | null {
+  const normalized = canonicalTransactionContextString(value);
+  if (!normalized) return null;
+  try {
+    return new PublicKey(normalized).toBase58() === normalized
+      ? normalized
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function canonicalTransactionContextRpcEndpoint(value: unknown): string | null {
+  const normalized = canonicalTransactionContextString(value);
+  if (!normalized) return null;
+  try {
+    const rpcUrl = new URL(normalized);
+    if (
+      (rpcUrl.protocol !== "http:" && rpcUrl.protocol !== "https:") ||
+      rpcUrl.username ||
+      rpcUrl.password ||
+      rpcUrl.hash
+    ) {
+      return null;
+    }
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
+export function buildSolanaTransactionContextKey(input: {
+  cluster: SolanaCluster;
+  rpcEndpoint: string;
+  fightOracleProgramId: string;
+  duelMarketProgramId: string;
+  walletAddress: string | null | undefined;
+  duelKeyHex: string | null | undefined;
+  advertisedMarketAddress: string | null | undefined;
+  loadedMarketAddress: string | null | undefined;
+}): string | null {
+  if (!SOLANA_TRANSACTION_CLUSTERS.has(input.cluster)) return null;
+  const rpcEndpoint = canonicalTransactionContextRpcEndpoint(input.rpcEndpoint);
+  if (!rpcEndpoint) return null;
+  const fightOracleProgramId = canonicalTransactionContextPublicKey(
+    input.fightOracleProgramId,
+  );
+  const duelMarketProgramId = canonicalTransactionContextPublicKey(
+    input.duelMarketProgramId,
+  );
+  const walletAddress = canonicalTransactionContextPublicKey(
+    input.walletAddress,
+  );
+  if (!fightOracleProgramId || !duelMarketProgramId || !walletAddress) {
+    return null;
+  }
+
+  const duelKeyHex =
+    input.duelKeyHex === null || input.duelKeyHex === undefined
+      ? null
+      : typeof input.duelKeyHex === "string" &&
+          /^[0-9a-fA-F]{64}$/.test(input.duelKeyHex)
+        ? input.duelKeyHex.toLowerCase()
+        : null;
+  if (input.duelKeyHex != null && duelKeyHex === null) return null;
+  const advertisedMarketAddress =
+    input.advertisedMarketAddress === null ||
+    input.advertisedMarketAddress === undefined
+      ? null
+      : canonicalTransactionContextPublicKey(input.advertisedMarketAddress);
+  if (
+    input.advertisedMarketAddress != null &&
+    advertisedMarketAddress === null
+  ) {
+    return null;
+  }
+  const loadedMarketAddress =
+    input.loadedMarketAddress === null ||
+    input.loadedMarketAddress === undefined
+      ? null
+      : canonicalTransactionContextPublicKey(input.loadedMarketAddress);
+  if (input.loadedMarketAddress != null && loadedMarketAddress === null) {
+    return null;
+  }
+
+  return JSON.stringify([
+    SOLANA_TRANSACTION_CONTEXT_VERSION,
+    input.cluster,
+    rpcEndpoint,
+    fightOracleProgramId,
+    duelMarketProgramId,
+    walletAddress,
+    duelKeyHex
+      ? "duel"
+      : advertisedMarketAddress || loadedMarketAddress
+        ? "market"
+        : "wallet",
+    duelKeyHex,
+    advertisedMarketAddress,
+    loadedMarketAddress,
+  ]);
+}
+
+export function isSolanaMarketLoadedForDuel(input: {
+  loadedDuelKeyHex: string | null | undefined;
+  currentDuelKeyHex: string | null | undefined;
+}): boolean {
+  const loadedDuelKeyHex = input.loadedDuelKeyHex?.trim().toLowerCase() ?? "";
+  const currentDuelKeyHex = input.currentDuelKeyHex?.trim().toLowerCase() ?? "";
+  return Boolean(
+    loadedDuelKeyHex &&
+    currentDuelKeyHex &&
+    loadedDuelKeyHex === currentDuelKeyHex,
+  );
+}
 
 function errorChain(error: unknown): unknown[] {
   const chain: unknown[] = [];
@@ -93,7 +223,7 @@ export function classifySolanaTransactionError(
   if (
     stage === "preparing" &&
     !signature &&
-    /(?:order book|market fee snapshots?|quote).*(?:changed|stale)|(?:changed|stale).*quote/i.test(
+    /(?:order book|market (?:fee snapshots?|configuration|identity)|quote).*(?:changed|stale)|(?:changed|stale).*quote/i.test(
       searchable,
     )
   ) {
@@ -102,6 +232,19 @@ export function classifySolanaTransactionError(
       stage,
       signature,
       retryMode: "REVIEW_AND_RETRY",
+      detail,
+    };
+  }
+  if (
+    /wallet transaction integrity|wallet returned a transaction without a signature/i.test(
+      searchable,
+    )
+  ) {
+    return {
+      kind: "WALLET_INTEGRITY_FAILED",
+      stage,
+      signature,
+      retryMode: "BLOCKED",
       detail,
     };
   }

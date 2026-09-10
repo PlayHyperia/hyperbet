@@ -381,8 +381,13 @@ describe("managed order closure planning", () => {
       planManagedOrderClosure({
         marketIsOpen: true,
         orderId: 8,
+        orderBehavior: 0,
+        remainingAmount: 1_000,
         previousOrderId: 7,
         nextOrderId: 9,
+        priceLevelHeadOrderId: 7,
+        priceLevelTailOrderId: 9,
+        priceLevelTotalOpen: 3_000,
         continuationPending: false,
       }),
     ).toEqual({ instruction: "cancel", adjacentOrderIds: [7, 9] });
@@ -393,11 +398,61 @@ describe("managed order closure planning", () => {
       planManagedOrderClosure({
         marketIsOpen: false,
         orderId: 8,
+        orderBehavior: 0,
+        remainingAmount: 1_000,
         previousOrderId: 0,
         nextOrderId: 9,
+        priceLevelHeadOrderId: 8,
+        priceLevelTailOrderId: 9,
+        priceLevelTotalOpen: 2_000,
         continuationPending: false,
       }),
     ).toEqual({ instruction: "reclaim", adjacentOrderIds: [9] });
+  });
+
+  test("plans nonmonotonic continued-order links from reciprocal queue position", () => {
+    expect(
+      planManagedOrderClosure({
+        marketIsOpen: false,
+        orderId: 52,
+        orderBehavior: 0,
+        remainingAmount: 1_000,
+        previousOrderId: 54,
+        nextOrderId: 0,
+        priceLevelHeadOrderId: 54,
+        priceLevelTailOrderId: 52,
+        priceLevelTotalOpen: 2_000,
+        continuationPending: false,
+      }),
+    ).toEqual({ instruction: "reclaim", adjacentOrderIds: [54] });
+    expect(
+      planManagedOrderClosure({
+        marketIsOpen: false,
+        orderId: 54,
+        orderBehavior: 0,
+        remainingAmount: 1_000,
+        previousOrderId: 0,
+        nextOrderId: 52,
+        priceLevelHeadOrderId: 54,
+        priceLevelTailOrderId: 52,
+        priceLevelTotalOpen: 2_000,
+        continuationPending: false,
+      }),
+    ).toEqual({ instruction: "reclaim", adjacentOrderIds: [52] });
+    expect(
+      planManagedOrderClosure({
+        marketIsOpen: false,
+        orderId: 52,
+        orderBehavior: 0,
+        remainingAmount: 1_000,
+        previousOrderId: 54,
+        nextOrderId: 0,
+        priceLevelHeadOrderId: 52,
+        priceLevelTailOrderId: 52,
+        priceLevelTotalOpen: 1_000,
+        continuationPending: false,
+      }),
+    ).toEqual({ instruction: "reclaim", adjacentOrderIds: [] });
   });
 
   test("fails closed on corrupt links and omits links only for continuations", () => {
@@ -405,8 +460,13 @@ describe("managed order closure planning", () => {
       planManagedOrderClosure({
         marketIsOpen: false,
         orderId: 8,
+        orderBehavior: 0,
+        remainingAmount: 1_000,
         previousOrderId: 0,
         nextOrderId: 0,
+        priceLevelHeadOrderId: 0,
+        priceLevelTailOrderId: 0,
+        priceLevelTotalOpen: 0,
         continuationPending: true,
       }),
     ).toEqual({ instruction: "reclaim", adjacentOrderIds: [] });
@@ -414,8 +474,13 @@ describe("managed order closure planning", () => {
       planManagedOrderClosure({
         marketIsOpen: true,
         orderId: 8,
+        orderBehavior: 0,
+        remainingAmount: 1_000,
         previousOrderId: 8,
         nextOrderId: 0,
+        priceLevelHeadOrderId: 8,
+        priceLevelTailOrderId: 8,
+        priceLevelTotalOpen: 1_000,
         continuationPending: false,
       }),
     ).toThrow("invalid adjacent book links");
@@ -423,8 +488,13 @@ describe("managed order closure planning", () => {
       planManagedOrderClosure({
         marketIsOpen: true,
         orderId: 8,
+        orderBehavior: 0,
+        remainingAmount: 1_000,
         previousOrderId: 7,
         nextOrderId: 0,
+        priceLevelHeadOrderId: 0,
+        priceLevelTailOrderId: 0,
+        priceLevelTotalOpen: 0,
         continuationPending: true,
       }),
     ).toThrow("unexpected book links");

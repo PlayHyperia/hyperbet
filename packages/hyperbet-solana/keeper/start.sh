@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
-# start.sh — launches the SOL-only read/API service.
 set -euo pipefail
 
-KEEPER_PID=""
+case "${NODE_ENV:-}" in
+  production|staging)
+    if [[ -z "${HYPERBET_RUNTIME_ROLE:-}" ]]; then
+      echo "[start] HYPERBET_RUNTIME_ROLE is required in production and staging" >&2
+      exit 64
+    fi
+    ;;
+esac
 
-cleanup() {
-  echo "[start] shutting down..."
-  [ -n "$KEEPER_PID" ] && kill "$KEEPER_PID" 2>/dev/null || true
-  wait
-  exit 0
-}
-trap cleanup SIGTERM SIGINT
+export HYPERBET_RUNTIME_ROLE="${HYPERBET_RUNTIME_ROLE:-service}"
 
-echo "[start] launching keeper service"
-bun --bun src/service.ts &
-KEEPER_PID=$!
-
-wait "$KEEPER_PID"
+case "${HYPERBET_RUNTIME_ROLE}" in
+  service)
+    echo "[start] launching read-only SOL keeper API"
+    exec bun --bun src/service.ts
+    ;;
+  duel-bot)
+    echo "[start] launching dedicated SOL duel lifecycle bot"
+    exec bun --bun src/duelBot.ts --no-once
+    ;;
+  *)
+    echo "[start] HYPERBET_RUNTIME_ROLE must be service or duel-bot" >&2
+    exit 64
+    ;;
+esac

@@ -1,74 +1,77 @@
 name: Deploy Hyperbet Solana Keeper
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "packages/hyperbet-solana/keeper/**"
-      - "packages/hyperbet-solana/deployments/**"
-      - "scripts/ci-env-audit-solana-v1.ts"
-      - "scripts/ci-solana-v1-scope.ts"
-      - "scripts/stage-deploy-workspace.ts"
-      - ".github/actions/setup-hyperbet/**"
-      - ".github/workflows/deploy-solana-keeper.yml"
-      - "docs/hyperbet-production-deploy.md"
-      - "package.json"
-      - "bun.lock"
   workflow_dispatch:
     inputs:
       environment:
         description: "Deployment target"
         required: true
-        default: production
+        default: staging
         type: choice
         options:
-          - production
           - staging
+          - production
+      production_confirmation:
+        description: Type DEPLOY_SOL_PRODUCTION for a production deployment
+        required: false
+        default: ""
+        type: string
+      production_commit_sha:
+        description: Full main-branch commit SHA approved for production
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
+env:
+  RAILWAY_CLI_VERSION: "5.45.0"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
     name: Deploy hyperbet-solana keeper
-    runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging' && 'staging' || 'production' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment == 'production' && 'production' || 'staging' }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
           fetch-depth: 0
 
-      - name: Resolve deployment target
+      - name: Verify production promotion request
+        env:
+          REQUESTED_ENVIRONMENT: ${{ inputs.environment }}
+          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+          PRODUCTION_COMMIT_SHA: ${{ inputs.production_commit_sha }}
         run: |
-          deploy_target="production"
-          keeper_url="${{ vars.HYPERBET_SOLANA_KEEPER_URL != '' && vars.HYPERBET_SOLANA_KEEPER_URL || 'https://api.hyperbet.win' }}"
-          railway_project_id="${{ vars.HYPERBET_SOLANA_RAILWAY_PROJECT_ID != '' && vars.HYPERBET_SOLANA_RAILWAY_PROJECT_ID || 'e5f5ba11-0380-4d71-aa0b-343d89a58c0d' }}"
-          railway_environment_id="${{ vars.HYPERBET_SOLANA_RAILWAY_PRODUCTION_ENVIRONMENT_ID != '' && vars.HYPERBET_SOLANA_RAILWAY_PRODUCTION_ENVIRONMENT_ID || '194f3565-ba2f-4c98-87d2-85dfc3a5110b' }}"
-          railway_service_id="${{ vars.HYPERBET_SOLANA_RAILWAY_KEEPER_SERVICE_ID != '' && vars.HYPERBET_SOLANA_RAILWAY_KEEPER_SERVICE_ID || '330ea18e-b215-4cf9-9fe2-4bb09fc2ec63' }}"
+          node packages/hyperbet-solana/scripts/verify-production-promotion.mjs \
+            --environment "$REQUESTED_ENVIRONMENT" \
+            --confirmation "$PRODUCTION_CONFIRMATION" \
+            --expected-sha "$PRODUCTION_COMMIT_SHA" \
+            --ref "$GITHUB_REF" \
+            --actual-sha "$GITHUB_SHA"
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.environment }}" = "staging" ]; then
-            deploy_target="staging"
-            keeper_url="${{ vars.HYPERBET_SOLANA_KEEPER_STAGING_URL }}"
-            railway_project_id="${{ vars.HYPERBET_SOLANA_RAILWAY_STAGING_PROJECT_ID != '' && vars.HYPERBET_SOLANA_RAILWAY_STAGING_PROJECT_ID || vars.HYPERBET_SOLANA_RAILWAY_PROJECT_ID }}"
-            railway_environment_id="${{ vars.HYPERBET_SOLANA_RAILWAY_STAGING_ENVIRONMENT_ID }}"
-            railway_service_id="${{ vars.HYPERBET_SOLANA_RAILWAY_STAGING_KEEPER_SERVICE_ID }}"
-          fi
-
-          if [ -z "${keeper_url}" ] || [ -z "${railway_project_id}" ] || [ -z "${railway_environment_id}" ] || [ -z "${railway_service_id}" ]; then
-            echo "Missing Solana keeper staging/prod configuration for ${deploy_target}" >&2
-            exit 1
-          fi
-
-          echo "DEPLOY_TARGET=${deploy_target}" >> "${GITHUB_ENV}"
-          echo "HYPERBET_KEEPER_URL=${keeper_url}" >> "${GITHUB_ENV}"
-          echo "RAILWAY_PROJECT_ID=${railway_project_id}" >> "${GITHUB_ENV}"
-          echo "RAILWAY_ENVIRONMENT_ID=${railway_environment_id}" >> "${GITHUB_ENV}"
-          echo "RAILWAY_KEEPER_SERVICE_ID=${railway_service_id}" >> "${GITHUB_ENV}"
+      - name: Resolve deployment target
+        run: node scripts/ci-solana-keeper-deploy-target.mjs >> "$GITHUB_ENV"
+        env:
+          REQUESTED_ENVIRONMENT: ${{ inputs.environment }}
+          HYPERBET_SOLANA_MAINNET_PROGRAM_VERIFICATION_SHA256: ${{ vars.HYPERBET_SOLANA_MAINNET_PROGRAM_VERIFICATION_SHA256 }}
+          HYPERBET_SOLANA_KEEPER_URL: ${{ vars.HYPERBET_SOLANA_KEEPER_URL }}
+          HYPERBET_SOLANA_RAILWAY_PROJECT_ID: ${{ vars.HYPERBET_SOLANA_RAILWAY_PROJECT_ID }}
+          HYPERBET_SOLANA_RAILWAY_PRODUCTION_ENVIRONMENT_ID: ${{ vars.HYPERBET_SOLANA_RAILWAY_PRODUCTION_ENVIRONMENT_ID }}
+          HYPERBET_SOLANA_RAILWAY_KEEPER_SERVICE_ID: ${{ vars.HYPERBET_SOLANA_RAILWAY_KEEPER_SERVICE_ID }}
+          HYPERBET_SOLANA_RAILWAY_DUEL_BOT_SERVICE_ID: ${{ vars.HYPERBET_SOLANA_RAILWAY_DUEL_BOT_SERVICE_ID }}
+          HYPERBET_SOLANA_KEEPER_STAGING_URL: ${{ vars.HYPERBET_SOLANA_KEEPER_STAGING_URL }}
+          HYPERBET_SOLANA_RAILWAY_STAGING_PROJECT_ID: ${{ vars.HYPERBET_SOLANA_RAILWAY_STAGING_PROJECT_ID }}
+          HYPERBET_SOLANA_RAILWAY_STAGING_ENVIRONMENT_ID: ${{ vars.HYPERBET_SOLANA_RAILWAY_STAGING_ENVIRONMENT_ID }}
+          HYPERBET_SOLANA_RAILWAY_STAGING_KEEPER_SERVICE_ID: ${{ vars.HYPERBET_SOLANA_RAILWAY_STAGING_KEEPER_SERVICE_ID }}
+          HYPERBET_SOLANA_RAILWAY_STAGING_DUEL_BOT_SERVICE_ID: ${{ vars.HYPERBET_SOLANA_RAILWAY_STAGING_DUEL_BOT_SERVICE_ID }}
 
       - name: Setup Hyperbet toolchain
         uses: ./.github/actions/setup-hyperbet
@@ -94,7 +97,7 @@ jobs:
           fi
           printf '%s\n' "$changed_files"
 
-          keeper_change_pattern='^(packages/hyperbet-solana/keeper/|packages/hyperbet-solana/deployments/|scripts/(ci-env-audit-solana-v1|ci-solana-v1-scope|stage-deploy-workspace)\.ts|\.github/actions/setup-hyperbet/)'
+          keeper_change_pattern='^(packages/hyperbet-solana/keeper/|packages/hyperbet-solana/deployments/|packages/hyperbet-solana/railway\.json|scripts/(ci-env-audit-solana-v1|ci-keeper-runtime-env-solana-v1(-policy)?(\.test)?|ci-solana-v1-scope|stage-deploy-workspace)\.ts|scripts/(ci-solana-keeper-deploy-target|ci-solana-railway-config|solana-deployment-evidence|verify-solana-keeper-deployment)(\.test)?\.mjs|scripts/run-railway-with-scoped-auth(\.test)?\.(sh|mjs)|\.github/actions/setup-hyperbet/)'
           keeper_source_changed=false
           if printf '%s\n' "$changed_files" | grep -Eq "${keeper_change_pattern}"; then
             keeper_source_changed=true
@@ -111,17 +114,21 @@ jobs:
         env:
           CI_AUDIT_REQUIRE_RUNTIME: "true"
           RAILWAY_ENVIRONMENT_ID: ${{ env.RAILWAY_ENVIRONMENT_ID }}
-          SOLANA_RPC_URL: https://api.mainnet-beta.solana.com
+          SOLANA_CLUSTER: ${{ env.DEPLOY_SOLANA_CLUSTER }}
+          SOLANA_RPC_URL: ${{ env.DEPLOY_SOLANA_RPC_URL }}
 
       - name: Run keeper tests
         run: |
           bun run --cwd packages/hyperbet-solana/keeper test:launch
+          node scripts/ci-solana-railway-config.mjs
           bun run ci:scope:solana
 
       - name: Smoke test keeper service
         run: |
           PORT=18080 \
-          SOLANA_RPC_URL=https://api.mainnet-beta.solana.com \
+          HYPERBET_RELEASE_SHA="$GITHUB_SHA" \
+          SOLANA_CLUSTER="${DEPLOY_SOLANA_CLUSTER}" \
+          SOLANA_RPC_URL="${DEPLOY_SOLANA_RPC_URL}" \
           bun --bun packages/hyperbet-solana/keeper/src/service.ts >/tmp/hyperbet-solana-keeper.log 2>&1 &
           KEEPER_PID=$!
           trap 'kill "$KEEPER_PID" >/dev/null 2>&1 || true' EXIT
@@ -132,7 +139,17 @@ jobs:
             fi
             sleep 1
           done
-          curl -fsSL http://127.0.0.1:18080/ | grep -F 'hyperbet-solana backend online'
+          curl -fsSL http://127.0.0.1:18080/status | jq -e \
+            --arg sha "$GITHUB_SHA" \
+            --arg cluster "$DEPLOY_SOLANA_CLUSTER" \
+            --arg fight "$DEPLOY_FIGHT_ORACLE_PROGRAM_ID" \
+            --arg market "$DEPLOY_DUEL_MARKET_PROGRAM_ID" \
+            '.release.commitSha == $sha and
+             .release.source == "environment" and
+             .runtime.role == "service" and
+             .runtime.cluster == $cluster and
+             .runtime.fightOracleProgramId == $fight and
+             .runtime.duelMarketProgramId == $market'
           for retired_path in /api/perps/markets /api/models/markets /api/proxy/evm/rpc; do
             status_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080${retired_path}")"
             test "$status_code" = "404"
@@ -140,45 +157,76 @@ jobs:
 
       - name: Install Railway CLI
         if: steps.keeper_changes.outputs.keeper_source_changed == 'true'
-        run: bun add -g @railway/cli
+        run: |
+          bun add -g "@railway/cli@${RAILWAY_CLI_VERSION}"
+          test "$(railway --version)" = "railway ${RAILWAY_CLI_VERSION}"
 
-      - name: Write Railway keeper context
+      - name: Link and audit protected Railway service environments
         if: steps.keeper_changes.outputs.keeper_source_changed == 'true'
         working-directory: packages/hyperbet-solana/keeper
         run: |
-          keeper_path="$(pwd)"
-          mkdir -p "${HOME}/.railway"
-          cat > "${HOME}/.railway/config.json" <<EOF
-          {
-            "projects": {
-              "${keeper_path}": {
-                "projectPath": "${keeper_path}",
-                "name": "hyperbet",
-                "project": "${RAILWAY_PROJECT_ID}",
-                "environment": "${RAILWAY_ENVIRONMENT_ID}",
-                "environmentName": "${DEPLOY_TARGET}",
-                "service": "${RAILWAY_KEEPER_SERVICE_ID}"
+          ../../../scripts/run-railway-with-scoped-auth.sh \
+            bash -euo pipefail -c '
+              umask 077
+              audit_dir="$(mktemp -d "${RUNNER_TEMP}/hyperbet-runtime-env.XXXXXX")"
+              service_env_file="${audit_dir}/service.json"
+              duel_bot_env_file="${audit_dir}/duel-bot.json"
+              cleanup_runtime_env() {
+                find "${audit_dir}" -type f -delete
+                rmdir "${audit_dir}"
               }
-            },
-            "user": {
-              "token": "${RAILWAY_TOKEN}"
-            }
-          }
-          EOF
+              trap cleanup_runtime_env EXIT
+
+              railway link \
+                --project "${RAILWAY_PROJECT_ID}" \
+                --environment "${RAILWAY_ENVIRONMENT_ID}" \
+                --service "${RAILWAY_KEEPER_SERVICE_ID}" \
+                --json >/dev/null
+              test -d .railway
+              railway variable list \
+                --service "${RAILWAY_KEEPER_SERVICE_ID}" \
+                --environment "${RAILWAY_ENVIRONMENT_ID}" \
+                --json > "${service_env_file}"
+              railway variable list \
+                --service "${RAILWAY_DUEL_BOT_SERVICE_ID}" \
+                --environment "${RAILWAY_ENVIRONMENT_ID}" \
+                --json > "${duel_bot_env_file}"
+
+              unset RAILWAY_TOKEN
+              node --import tsx ../../../scripts/ci-keeper-runtime-env-solana-v1.ts \
+                --deployment="${DEPLOY_TARGET}" \
+                --service-env-file="${service_env_file}" \
+                --duel-bot-env-file="${duel_bot_env_file}"
+            '
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
       - name: Stage keeper workspace context
         if: steps.keeper_changes.outputs.keeper_source_changed == 'true'
-        run: node --import tsx scripts/stage-deploy-workspace.ts --target=keeper:solana
+        run: node --import tsx scripts/stage-deploy-workspace.ts --target=keeper:solana --release-sha="$GITHUB_SHA"
+
+      - name: Deploy dedicated duel bot
+        if: steps.keeper_changes.outputs.keeper_source_changed == 'true'
+        working-directory: packages/hyperbet-solana/keeper
+        run: |
+          ../../../scripts/run-railway-with-scoped-auth.sh railway up . \
+            --path-as-root \
+            --ci \
+            --project "${RAILWAY_PROJECT_ID}" \
+            --service "${RAILWAY_DUEL_BOT_SERVICE_ID}" \
+            --environment "${RAILWAY_ENVIRONMENT_ID}"
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          CI: "true"
 
       - name: Deploy keeper
         if: steps.keeper_changes.outputs.keeper_source_changed == 'true'
         working-directory: packages/hyperbet-solana/keeper
         run: |
-          railway up . \
+          ../../../scripts/run-railway-with-scoped-auth.sh railway up . \
             --path-as-root \
-            --detach \
+            --ci \
+            --project "${RAILWAY_PROJECT_ID}" \
             --service "${RAILWAY_KEEPER_SERVICE_ID}" \
             --environment "${RAILWAY_ENVIRONMENT_ID}"
         env:
@@ -186,22 +234,16 @@ jobs:
           CI: "true"
 
       - name: Verify keeper endpoints
+        id: verify_deployment
         if: steps.keeper_changes.outputs.keeper_source_changed == 'true'
-        run: |
-          for attempt in $(seq 1 20); do
-            readiness_payload="$(curl -fsSL "${HYPERBET_KEEPER_URL}/ready" || true)"
-            if [ -n "$readiness_payload" ] && echo "$readiness_payload" | jq -e '.ok == true and .readiness.ready == true' >/dev/null; then
-              break
-            fi
-            sleep 15
-          done
+        run: node scripts/verify-solana-keeper-deployment.mjs --output="${RUNNER_TEMP}/hyperbet-solana-keeper-deployment-evidence.json"
 
-          curl -fsSL "${HYPERBET_KEEPER_URL}/status" | jq -e '.ok == true'
-          curl -fsSL "${HYPERBET_KEEPER_URL}/api/arena/prediction-markets/active" | jq -e '.duel != null and .markets != null'
-          curl -fsSL "${HYPERBET_KEEPER_URL}/api/keeper/bot-health" | jq -e '.ok == true and .health.markets != null'
-          curl -fsSL "${HYPERBET_KEEPER_URL}/api/streaming/duel-context" | jq -e '.type == "STREAMING_DUEL_CONTEXT"'
-          curl -fsSL "${HYPERBET_KEEPER_URL}/api/streaming/leaderboard/details" | jq -e '.leaderboard != null and .cycle != null'
-          for retired_path in /api/perps/markets /api/models/markets /api/proxy/evm/rpc; do
-            status_code="$(curl -sS -o /dev/null -w '%{http_code}' "${HYPERBET_KEEPER_URL}${retired_path}")"
-            test "$status_code" = "404"
-          done
+      - name: Upload keeper deployment evidence
+        if: ${{ steps.verify_deployment.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hyperbet-solana-keeper-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/hyperbet-solana-keeper-deployment-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

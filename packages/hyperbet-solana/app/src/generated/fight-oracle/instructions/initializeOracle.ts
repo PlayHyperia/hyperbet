@@ -14,7 +14,7 @@ export const INITIALIZE_ORACLE_DISCRIMINATOR: ReadonlyUint8Array = new Uint8Arra
 
 export function getInitializeOracleDiscriminatorBytes(): ReadonlyUint8Array { return fixEncoderSize(getBytesEncoder(), 8).encode(INITIALIZE_ORACLE_DISCRIMINATOR); }
 
-export type InitializeOracleInstruction<TProgram extends string = typeof FIGHT_ORACLE_PROGRAM_ADDRESS, TAccountAuthority extends string | AccountMeta<string> = string, TAccountOracleConfig extends string | AccountMeta<string> = string, TAccountProgram extends string | AccountMeta<string> = "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM", TAccountProgramData extends string | AccountMeta<string> = string, TAccountSystemProgram extends string | AccountMeta<string> = "11111111111111111111111111111111", TRemainingAccounts extends readonly AccountMeta<string>[] = []> =
+export type InitializeOracleInstruction<TProgram extends string = typeof FIGHT_ORACLE_PROGRAM_ADDRESS, TAccountAuthority extends string | AccountMeta<string> = string, TAccountOracleConfig extends string | AccountMeta<string> = string, TAccountProgram extends string | AccountMeta<string> = "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu", TAccountProgramData extends string | AccountMeta<string> = string, TAccountSystemProgram extends string | AccountMeta<string> = "11111111111111111111111111111111", TRemainingAccounts extends readonly AccountMeta<string>[] = []> =
 Instruction<TProgram> & InstructionWithData<ReadonlyUint8Array> & InstructionWithAccounts<[TAccountAuthority extends string ? WritableSignerAccount<TAccountAuthority> & AccountSignerMeta<TAccountAuthority> : TAccountAuthority, TAccountOracleConfig extends string ? WritableAccount<TAccountOracleConfig> : TAccountOracleConfig, TAccountProgram extends string ? ReadonlyAccount<TAccountProgram> : TAccountProgram, TAccountProgramData extends string ? ReadonlyAccount<TAccountProgramData> : TAccountProgramData, TAccountSystemProgram extends string ? ReadonlyAccount<TAccountSystemProgram> : TAccountSystemProgram, ...TRemainingAccounts]>;
 
 export type InitializeOracleInstructionData = { discriminator: ReadonlyUint8Array; reporter: Address; finalizer: Address; challenger: Address; disputeWindowSecs: bigint;  };
@@ -63,7 +63,7 @@ if (!accounts.oracleConfig.value) {
 accounts.oracleConfig.value = await getProgramDerivedAddress({ programAddress, seeds: [getBytesEncoder().encode(new Uint8Array([111, 114, 97, 99, 108, 101, 95, 99, 111, 110, 102, 105, 103]))] });
 }
 if (!accounts.program.value) {
-accounts.program.value = 'GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM' as Address<'GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM'>;
+accounts.program.value = 'FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu' as Address<'FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu'>;
 }
 if (!accounts.systemProgram.value) {
 accounts.systemProgram.value = '11111111111111111111111111111111' as Address<'11111111111111111111111111111111'>;
@@ -100,7 +100,7 @@ const args = { ...input,  };
 
 // Resolve default values.
 if (!accounts.program.value) {
-accounts.program.value = 'GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM' as Address<'GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM'>;
+accounts.program.value = 'FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu' as Address<'FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu'>;
 }
 if (!accounts.systemProgram.value) {
 accounts.systemProgram.value = '11111111111111111111111111111111' as Address<'11111111111111111111111111111111'>;

@@ -38,12 +38,12 @@ describe("oracle invariants (solana parity)", () => {
       authority.publicKey,
       authority.publicKey,
       3600,
+      false,
     );
   });
 
   it("PM16: rejects initialize_oracle with zero addresses (bootstrap removal)", async () => {
     const configPda = deriveOracleConfigPda(fightProgram.programId);
-    await ensureOracleReady(fightProgram, authority);
 
     try {
       await fightProgram.methods
@@ -106,6 +106,67 @@ describe("oracle invariants (solana parity)", () => {
     }
   });
 
+  it("requires the oracle config to be permanently frozen before betting opens", async () => {
+    const duelKey = uniqueDuelKey("mutable-config-betting-open");
+    const duelStatePda = deriveDuelStatePda(fightProgram.programId, duelKey);
+    const now = Math.floor(Date.now() / 1000);
+
+    try {
+      await upsertDuel(fightProgram, authority, duelKey, {
+        status: duelStatusBettingOpen(),
+        betOpenTs: now - 10,
+        betCloseTs: now + 120,
+        duelStartTs: now + 180,
+      });
+      assert.fail("allowed betting to open against a mutable oracle config");
+    } catch (error: unknown) {
+      assert.ok(
+        hasProgramError(error, "ConfigNotFrozen"),
+        `expected ConfigNotFrozen, got ${String(error)}`,
+      );
+    }
+
+    assert.strictEqual(
+      await fightProgram.account.duelState.fetchNullable(duelStatePda),
+      null,
+      "failed activation must not create a duel account",
+    );
+  });
+
+  it("permanently freezes the oracle config before launch lifecycle tests", async () => {
+    const configPda = await ensureOracleReady(
+      fightProgram,
+      authority,
+      authority.publicKey,
+      authority.publicKey,
+      authority.publicKey,
+      60,
+      true,
+    );
+    const config = await fightProgram.account.oracleConfig.fetch(configPda);
+    assert.strictEqual(config.configFrozen, true);
+
+    try {
+      await fightProgram.methods
+        .updateOracleConfig(
+          authority.publicKey,
+          authority.publicKey,
+          authority.publicKey,
+          authority.publicKey,
+          new BN(120),
+        )
+        .accountsPartial({
+          authority: authority.publicKey,
+          oracleConfig: configPda,
+        })
+        .signers([authority])
+        .rpc();
+      assert.fail("allowed a permanently frozen oracle config to change");
+    } catch (error: unknown) {
+      assert.ok(hasProgramError(error, "ConfigFrozen"));
+    }
+  });
+
   describe("terminal state preservation", () => {
     let terminalDuelKey: number[];
     let terminalDuelPda: PublicKey;
@@ -158,6 +219,41 @@ describe("oracle invariants (solana parity)", () => {
   });
 
   describe("state regression prevention", () => {
+    it("keeps the duel start timestamp immutable once betting opens", async () => {
+      const duelKey = uniqueDuelKey("immutable-duel-start");
+      const now = Math.floor(Date.now() / 1000);
+      const betOpenTs = now - 30;
+      const betCloseTs = now + 300;
+      const originalDuelStartTs = now + 360;
+      const duelStatePda = await upsertDuel(fightProgram, authority, duelKey, {
+        status: duelStatusBettingOpen(),
+        betOpenTs,
+        betCloseTs,
+        duelStartTs: originalDuelStartTs,
+      });
+
+      try {
+        await upsertDuel(fightProgram, authority, duelKey, {
+          status: duelStatusBettingOpen(),
+          betOpenTs,
+          betCloseTs,
+          duelStartTs: originalDuelStartTs + 60,
+        });
+        assert.fail(
+          "allowed the duel start timestamp to move after betting opened",
+        );
+      } catch (error: unknown) {
+        assert.ok(
+          hasProgramError(error, "TimingImmutable"),
+          `expected TimingImmutable, got ${String(error)}`,
+        );
+      }
+
+      const duelState =
+        await fightProgram.account.duelState.fetch(duelStatePda);
+      assert.strictEqual(Number(duelState.duelStartTs), originalDuelStartTs);
+    });
+
     it("prevents moving into Locked before bet close time", async () => {
       const duelKey = uniqueDuelKey("early-lock");
       const now = Math.floor(Date.now() / 1000);

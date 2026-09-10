@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { type AccountInfo, PublicKey, SystemProgram } from "@solana/web3.js";
 
 import {
   BPF_LOADER_UPGRADEABLE_PROGRAM_ID,
   deriveProgramDataAddress,
+  resolveClusterExpectedUpgradeAuthority,
   resolveExpectedUpgradeAuthority,
   verifyUpgradeableProgramIdentity,
 } from "./solanaProgramIdentity";
@@ -133,14 +135,14 @@ describe("Solana launch program identity", () => {
     ).toThrow("does not match");
   });
 
-  test("requires an explicit mainnet authority policy and rejects the zero key", () => {
+  test("requires an explicit authority policy when requested and rejects the zero key", () => {
     expect(() =>
       resolveExpectedUpgradeAuthority({
         value: undefined,
         required: true,
         label: "fight oracle",
       }),
-    ).toThrow("required on mainnet");
+    ).toThrow("required for this launch rail");
     expect(
       resolveExpectedUpgradeAuthority({
         value: "immutable",
@@ -155,5 +157,62 @@ describe("Solana launch program identity", () => {
         label: "fight oracle",
       }),
     ).toThrow("cannot be zero");
+  });
+
+  test("permits an unchecked authority only on exact localnet", () => {
+    expect(
+      resolveClusterExpectedUpgradeAuthority({
+        cluster: " localnet ",
+        value: undefined,
+        label: "fight oracle",
+      }),
+    ).toBeUndefined();
+
+    const authority = key(11);
+    for (const cluster of ["devnet", "testnet", "mainnet", "mainnet-beta"]) {
+      expect(() =>
+        resolveClusterExpectedUpgradeAuthority({
+          cluster,
+          value: undefined,
+          label: "fight oracle",
+        }),
+      ).toThrow("required for this launch rail");
+      expect(
+        resolveClusterExpectedUpgradeAuthority({
+          cluster,
+          value: authority.toBase58(),
+          label: "fight oracle",
+        }),
+      ).toEqual(authority);
+      expect(
+        resolveClusterExpectedUpgradeAuthority({
+          cluster,
+          value: "immutable",
+          label: "fight oracle",
+        }),
+      ).toBeNull();
+    }
+  });
+
+  test("rejects unknown program-identity rails", () => {
+    expect(() =>
+      resolveClusterExpectedUpgradeAuthority({
+        cluster: "solana",
+        value: key(12).toBase58(),
+        label: "fight oracle",
+      }),
+    ).toThrow("Unsupported Solana program-identity cluster");
+  });
+
+  test("wires both runtime programs through the cluster-aware authority policy", () => {
+    for (const relativePath of ["./duelBot.ts", "./service.ts"]) {
+      const source = readFileSync(
+        new URL(relativePath, import.meta.url),
+        "utf8",
+      );
+      expect(
+        source.match(/resolveClusterExpectedUpgradeAuthority\(\{/g),
+      ).toHaveLength(2);
+    }
   });
 });

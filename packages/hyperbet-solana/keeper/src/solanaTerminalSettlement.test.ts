@@ -339,6 +339,192 @@ describe("wallet-market terminal settlement reconciliation", () => {
     });
   });
 
+  test("allocates a valid zero-payout claim across every winning entitlement", () => {
+    const fixture = resolvedFacts();
+    const claimEnvelope = fixture.facts.find(
+      ({ fact }) => fact.kind === "CLAIM_PAYOUT",
+    )!;
+    claimEnvelope.fact = {
+      ...claimEnvelope.fact,
+      amountLamports: "0",
+      feeLamports: "6000",
+    };
+
+    const settlements = reconcileWalletMarketTerminalSettlements({
+      facts: fixture.facts,
+      recordedBets: [
+        baseline({
+          betId: "winner-maker",
+          signatureSeed: 11,
+          marketPda: fixture.marketPda,
+          wallet: fixture.wallet,
+          orderId: "1",
+          side: 1,
+          limitPrice: 600,
+          orderAmountUnits: "3000",
+        }),
+        baseline({
+          betId: "winner-taker",
+          signatureSeed: 12,
+          marketPda: fixture.marketPda,
+          wallet: fixture.wallet,
+          orderId: "2",
+          side: 1,
+          limitPrice: 600,
+          orderAmountUnits: "2000",
+        }),
+      ],
+    });
+
+    expect(settlements).toHaveLength(1);
+    expect(settlements[0]).toMatchObject({
+      kind: "CLAIM_PAYOUT",
+      grossEntitlementLamports: "6000",
+      payoutLamports: "0",
+      feeLamports: "6000",
+      allocations: [
+        {
+          betId: "winner-maker",
+          grossEntitlementLamports: "3000",
+          payoutLamports: "0",
+          feeLamports: "3000",
+        },
+        {
+          betId: "winner-taker",
+          grossEntitlementLamports: "2000",
+          payoutLamports: "0",
+          feeLamports: "2000",
+        },
+      ],
+    });
+  });
+
+  test("records an exact losing-balance cleanup without inventing payout value", () => {
+    const marketPda = key(61);
+    const wallet = key(62);
+    const counterpart = key(63);
+    const facts: IndexedLifecycleFact[] = [
+      envelope(61, 0, {
+        kind: "ORDER_PLACED",
+        marketPda,
+        orderId: "1",
+        wallet,
+        side: 2,
+        price: 400,
+        amountUnits: "4000",
+      }),
+      envelope(62, 0, {
+        kind: "ORDER_PLACED",
+        marketPda,
+        orderId: "2",
+        wallet: counterpart,
+        side: 1,
+        price: 500,
+        amountUnits: "4000",
+      }),
+      envelope(63, 0, {
+        kind: "ORDER_MATCHED",
+        marketPda,
+        makerOrderId: "1",
+        takerOrderId: "2",
+        price: 400,
+        amountUnits: "4000",
+      }),
+      envelope(63, 1, {
+        kind: "TAKER_EXECUTION",
+        marketPda,
+        orderId: "2",
+        wallet: counterpart,
+        side: 1,
+        price: 500,
+        amountUnits: "4000",
+        releasedAmountUnits: "0",
+        amountLamports: "1600",
+        feeLamports: "0",
+        refundLamports: "0",
+      }),
+      envelope(64, 0, {
+        kind: "LOSING_BALANCE_CLOSED",
+        marketPda,
+        wallet,
+        side: 2,
+        amountUnits: "4000",
+        amountLamports: "2400",
+        status: "resolved",
+        winner: "a",
+      }),
+    ];
+
+    expect(
+      reconcileWalletMarketTerminalSettlements({
+        facts,
+        recordedBets: [
+          baseline({
+            betId: "loser-only",
+            signatureSeed: 61,
+            marketPda,
+            wallet,
+            orderId: "1",
+            side: 2,
+            limitPrice: 400,
+            orderAmountUnits: "4000",
+          }),
+        ],
+      }),
+    ).toEqual([
+      {
+        claimSignature: signature(64),
+        marketPda,
+        wallet,
+        kind: "LOSER_CLEANUP",
+        status: "resolved",
+        winner: "a",
+        grossEntitlementLamports: "0",
+        payoutLamports: "0",
+        feeLamports: "0",
+        eligibleOrderCount: 1,
+        recordedBetCount: 1,
+        allocations: [
+          {
+            betId: "loser-only",
+            orderId: "1",
+            side: 2,
+            matchedAmountUnits: "4000",
+            grossEntitlementLamports: "0",
+            payoutLamports: "0",
+            feeLamports: "0",
+          },
+        ],
+      },
+    ]);
+
+    expect(() =>
+      reconcileWalletMarketTerminalSettlements({
+        facts: facts.map((entry) =>
+          entry.fact.kind === "LOSING_BALANCE_CLOSED"
+            ? {
+                ...entry,
+                fact: { ...entry.fact, amountLamports: "2399" },
+              }
+            : entry,
+        ),
+        recordedBets: [],
+      }),
+    ).toThrow("contradicts indexed order custody");
+    expect(() =>
+      reconcileWalletMarketTerminalSettlements({
+        facts: [
+          ...facts,
+          {
+            ...facts.at(-1)!,
+            signature: signature(65),
+          },
+        ],
+        recordedBets: [],
+      }),
+    ).toThrow("terminal settlement is duplicated");
+  });
+
   test("allocates a cancellation refund from exact matched collateral", () => {
     const marketPda = key(41);
     const wallet = key(42);

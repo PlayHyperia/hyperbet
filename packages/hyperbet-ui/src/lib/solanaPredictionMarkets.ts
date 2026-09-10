@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { PublicKey } from "@solana/web3.js";
 import {
   normalizeSolanaPredictionMarketDuelKeyHex as normalizePredictionMarketDuelKeyHexFromRegistry,
   normalizeSolanaPredictionMarketLifecycleRecord as normalizePredictionMarketLifecycleRecord,
@@ -16,6 +17,8 @@ const ACTIVE_PREDICTION_MARKETS_URL = `${GAME_API_URL.replace(/\/$/, "")}/api/ar
 const OVERVIEW_PREDICTION_MARKETS_URL = `${GAME_API_URL.replace(/\/$/, "")}/api/arena/prediction-markets/overview`;
 const SYNC_STATUS_URL = `${GAME_API_URL.replace(/\/$/, "")}/api/sync/status`;
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
+const PREDICTION_MARKETS_MAX_FRESHNESS_MS = 30_000;
+const PREDICTION_MARKETS_STREAM_MAX_FRESHNESS_MS = 15_000;
 
 export type PredictionMarketsDuelSnapshot = {
   duelKey: string | null;
@@ -23,6 +26,7 @@ export type PredictionMarketsDuelSnapshot = {
   phase: string | null;
   winner: PredictionMarketWinner;
   betCloseTime: number | null;
+  syncedAt: number | null;
   agent1Name: string | null;
   agent2Name: string | null;
 };
@@ -78,6 +82,68 @@ function normalizePredictionMarketInteger(value: unknown): number | null {
 export const normalizePredictionMarketDuelKeyHex =
   normalizePredictionMarketDuelKeyHexFromRegistry;
 
+function isCanonicalPredictionMarketPublicKey(value: string | null): boolean {
+  if (value === null) return true;
+  try {
+    return new PublicKey(value).toBase58() === value;
+  } catch {
+    return false;
+  }
+}
+
+function predictionMarketLifecycleIsCoherent(
+  duel: PredictionMarketsDuelSnapshot,
+  markets: readonly PredictionMarketLifecycleRecord[],
+): boolean {
+  if (markets.length > 1) return false;
+  const market = markets[0];
+  if (!market) return true;
+
+  const requiresCompleteIdentity =
+    market.lifecycleStatus !== "PENDING" &&
+    market.lifecycleStatus !== "UNKNOWN";
+  const resolvedWithWinner =
+    market.lifecycleStatus === "RESOLVED"
+      ? market.winner !== "NONE"
+      : market.winner === "NONE";
+  const winnerIsCoherent = (() => {
+    if (market.lifecycleStatus === "RESOLVED") {
+      return market.winner !== "NONE" && market.winner === duel.winner;
+    }
+    if (market.winner !== "NONE") return false;
+
+    // The duel feed can publish its observed combat winner while the financial
+    // market is locked, proposed, or challenged. The market must continue to
+    // expose NONE until final resolution; treating those two truth domains as
+    // identical would discard the authoritative dispute-window lifecycle.
+    if (["LOCKED", "PROPOSED", "CHALLENGED"].includes(market.lifecycleStatus)) {
+      return true;
+    }
+    return duel.winner === "NONE";
+  })();
+
+  return (
+    market.duelKey === duel.duelKey &&
+    market.duelId === duel.duelId &&
+    market.betCloseTime === duel.betCloseTime &&
+    market.marketId === market.marketRef &&
+    market.contractAddress === null &&
+    isCanonicalPredictionMarketPublicKey(market.marketId) &&
+    isCanonicalPredictionMarketPublicKey(market.marketRef) &&
+    isCanonicalPredictionMarketPublicKey(market.programId) &&
+    resolvedWithWinner &&
+    winnerIsCoherent &&
+    (!requiresCompleteIdentity ||
+      (market.duelKey !== null &&
+        market.duelId !== null &&
+        market.duelId.trim() === market.duelId &&
+        market.duelId.length > 0 &&
+        market.marketRef !== null &&
+        market.programId !== null &&
+        market.betCloseTime !== null))
+  );
+}
+
 export function parsePredictionMarketsResponse(
   payload: unknown,
 ): PredictionMarketsResponse | null {
@@ -87,25 +153,61 @@ export function parsePredictionMarketsResponse(
     return null;
   }
 
+  const duelSnapshot: PredictionMarketsDuelSnapshot = {
+    duelKey: normalizePredictionMarketDuelKeyHex(
+      typeof duel.duelKey === "string" ? duel.duelKey : null,
+    ),
+    duelId: typeof duel.duelId === "string" ? duel.duelId : null,
+    phase: typeof duel.phase === "string" ? duel.phase : null,
+    winner: normalizePredictionMarketWinner(duel.winner),
+    betCloseTime: normalizePredictionMarketTimestamp(duel.betCloseTime),
+    syncedAt: normalizePredictionMarketTimestamp(duel.syncedAt),
+    agent1Name: typeof duel.agent1Name === "string" ? duel.agent1Name : null,
+    agent2Name: typeof duel.agent2Name === "string" ? duel.agent2Name : null,
+  };
+  const markets = candidate.markets
+    .map((market) => normalizePredictionMarketLifecycleRecord(market))
+    .filter(
+      (market): market is PredictionMarketLifecycleRecord => market !== null,
+    );
+  if (!predictionMarketLifecycleIsCoherent(duelSnapshot, markets)) return null;
+
   return {
-    duel: {
-      duelKey: normalizePredictionMarketDuelKeyHex(
-        typeof duel.duelKey === "string" ? duel.duelKey : null,
-      ),
-      duelId: typeof duel.duelId === "string" ? duel.duelId : null,
-      phase: typeof duel.phase === "string" ? duel.phase : null,
-      winner: normalizePredictionMarketWinner(duel.winner),
-      betCloseTime: normalizePredictionMarketTimestamp(duel.betCloseTime),
-      agent1Name: typeof duel.agent1Name === "string" ? duel.agent1Name : null,
-      agent2Name: typeof duel.agent2Name === "string" ? duel.agent2Name : null,
-    },
-    markets: candidate.markets
-      .map((market) => normalizePredictionMarketLifecycleRecord(market))
-      .filter(
-        (market): market is PredictionMarketLifecycleRecord => market !== null,
-      ),
+    duel: duelSnapshot,
+    markets,
     updatedAt: normalizePredictionMarketTimestamp(candidate.updatedAt),
   };
+}
+
+function predictionMarketsResponseIsFresh(
+  response: PredictionMarketsResponse,
+  observedAt: number,
+): boolean {
+  const updatedAt = response.updatedAt;
+  if (
+    updatedAt === null ||
+    Math.abs(updatedAt - observedAt) > PREDICTION_MARKETS_MAX_FRESHNESS_MS
+  ) {
+    return false;
+  }
+  const oldestAcceptedAt = observedAt - PREDICTION_MARKETS_MAX_FRESHNESS_MS;
+  if (
+    response.duel.syncedAt === null ||
+    response.duel.syncedAt <
+      observedAt - PREDICTION_MARKETS_STREAM_MAX_FRESHNESS_MS ||
+    response.duel.syncedAt > updatedAt
+  ) {
+    return false;
+  }
+  return response.markets.every((market) => {
+    if (market.syncedAt === null) {
+      return (
+        market.lifecycleStatus === "PENDING" ||
+        market.lifecycleStatus === "UNKNOWN"
+      );
+    }
+    return market.syncedAt >= oldestAcceptedAt && market.syncedAt <= updatedAt;
+  });
 }
 
 export function parsePredictionMarketsOverviewResponse(
@@ -196,7 +298,7 @@ export async function fetchActivePredictionMarkets(
   }
 
   const parsed = parsePredictionMarketsResponse(await response.json());
-  if (!parsed) {
+  if (!parsed || !predictionMarketsResponseIsFresh(parsed, Date.now())) {
     throw new Error("prediction markets response was invalid");
   }
 
@@ -280,18 +382,27 @@ export function usePredictionMarketLifecycle(
   const [data, setData] = useState<PredictionMarketsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const requestRevisionRef = useRef(0);
 
   const refresh = useCallback(
     async (signal?: AbortSignal) => {
       if (disabled || !chainKey) return null;
+      const requestRevision = ++requestRevisionRef.current;
       setIsLoading(true);
       try {
         const nextData = await fetchActivePredictionMarkets(signal);
+        if (signal?.aborted || requestRevision !== requestRevisionRef.current) {
+          return null;
+        }
         setData(nextData);
         setError(null);
         return nextData;
       } catch (refreshError) {
-        if (!signal?.aborted) {
+        if (
+          !signal?.aborted &&
+          requestRevision === requestRevisionRef.current
+        ) {
+          setData(null);
           setError(
             refreshError instanceof Error
               ? refreshError.message
@@ -300,7 +411,10 @@ export function usePredictionMarketLifecycle(
         }
         return null;
       } finally {
-        if (!signal?.aborted) {
+        if (
+          !signal?.aborted &&
+          requestRevision === requestRevisionRef.current
+        ) {
           setIsLoading(false);
         }
       }
@@ -310,24 +424,23 @@ export function usePredictionMarketLifecycle(
 
   useEffect(() => {
     if (disabled || !chainKey) {
+      requestRevisionRef.current += 1;
       setData(null);
       setError(null);
       setIsLoading(false);
       return;
     }
 
-    const controller = new AbortController();
-    let activePollController: AbortController | null = null;
-    void refresh(controller.signal);
+    let activePollController = new AbortController();
+    void refresh(activePollController.signal);
     const intervalId = window.setInterval(() => {
-      activePollController?.abort();
+      activePollController.abort();
       activePollController = new AbortController();
       void refresh(activePollController.signal);
     }, pollIntervalMs);
 
     return () => {
-      controller.abort();
-      activePollController?.abort();
+      activePollController.abort();
       window.clearInterval(intervalId);
     };
   }, [chainKey, disabled, pollIntervalMs, refresh]);

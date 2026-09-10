@@ -1,5 +1,5 @@
 {
-  "address": "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy",
+  "address": "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG",
   "metadata": {
     "name": "duel_market",
     "version": "0.1.0",
@@ -55,6 +55,10 @@
         },
         {
           "name": "price_level",
+          "docs": [
+            "continuation-pending order. Existing levels are owner/discriminator,",
+            "identity, and bump checked in the instruction before any book mutation."
+          ],
           "writable": true
         },
         {
@@ -252,6 +256,67 @@
           "type": "u16"
         }
       ]
+    },
+    {
+      "name": "close_empty_user_balance",
+      "docs": [
+        "Returns an empty UserBalance PDA's rent to its owner. Resting-order",
+        "placement initializes this account before any match occurs, so a user",
+        "who later cancels or reclaims only unmatched liquidity can otherwise be",
+        "left with a permanently empty account. This instruction is deliberately",
+        "valid once matching has stopped and cannot move market custody. Keeping",
+        "it unavailable while open prevents an active maker order from losing",
+        "the balance account required by a later fill."
+      ],
+      "discriminator": [
+        143,
+        212,
+        24,
+        6,
+        221,
+        46,
+        27,
+        56
+      ],
+      "accounts": [
+        {
+          "name": "market_state"
+        },
+        {
+          "name": "user_balance",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  108,
+                  97,
+                  110,
+                  99,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market_state"
+              },
+              {
+                "kind": "account",
+                "path": "user"
+              }
+            ]
+          }
+        },
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        }
+      ],
+      "args": []
     },
     {
       "name": "close_filled_order",
@@ -592,7 +657,7 @@
         },
         {
           "name": "program",
-          "address": "3QUVoaKJqo1rg9eXe7vyFewJrY75NWdtH8JZfvTb79Uy"
+          "address": "7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG"
         },
         {
           "name": "program_data"
@@ -920,6 +985,10 @@
         },
         {
           "name": "price_level",
+          "docs": [
+            "continuation-pending order. Existing levels are owner/discriminator,",
+            "identity, and bump checked in the instruction before any book mutation."
+          ],
           "writable": true
         },
         {
@@ -1276,6 +1345,19 @@
         187,
         224,
         236
+      ]
+    },
+    {
+      "name": "EmptyUserBalanceClosed",
+      "discriminator": [
+        174,
+        21,
+        99,
+        167,
+        59,
+        135,
+        73,
+        177
       ]
     },
     {
@@ -1700,6 +1782,11 @@
       "code": 6052,
       "name": "InvalidUserBalance",
       "msg": "The supplied user balance is not canonical"
+    },
+    {
+      "code": 6053,
+      "name": "UserBalanceNotEmpty",
+      "msg": "User balance still contains shares, collateral, or fee custody"
     }
   ],
   "types": [
@@ -1895,6 +1982,23 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "competitive_snapshot_version",
+            "type": "u32"
+          },
+          {
+            "name": "competitive_snapshot_digest",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "account_schema_version",
+            "type": "u16"
           }
         ]
       }
@@ -1924,6 +2028,22 @@
           },
           {
             "name": "Cancelled"
+          }
+        ]
+      }
+    },
+    {
+      "name": "EmptyUserBalanceClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market_key",
+            "type": "pubkey"
+          },
+          {
+            "name": "user",
+            "type": "pubkey"
           }
         ]
       }

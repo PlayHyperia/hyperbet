@@ -60,8 +60,7 @@ function loadRecoveryWindowElapsedPayload(): HyperiaCancellationPayload {
       name === "cancel-competitive-snapshot-recovery-window-elapsed",
   );
   const payload = fixtureCase?.payload as
-    | Partial<HyperiaCancellationPayload>
-    | undefined;
+    Partial<HyperiaCancellationPayload> | undefined;
   if (
     payload?.schemaVersion !== 3 ||
     !Number.isSafeInteger(payload.sourceEpoch) ||
@@ -89,19 +88,39 @@ function loadRecoveryWindowElapsedPayload(): HyperiaCancellationPayload {
 
 const hyperiaTerminalEvent = loadRecoveryWindowElapsedPayload();
 
-function cancellationInput(): TerminalOperationInput {
+function cancellationInput(batchIndex = 0): TerminalOperationInput {
+  const suffix = batchIndex === 0 ? "" : `-batch-${batchIndex}`;
+  const duelId = `${hyperiaTerminalEvent.duelId}${suffix}`;
+  const duelKey =
+    batchIndex === 0
+      ? hyperiaTerminalEvent.duelKey
+      : (batchIndex + 16).toString(16).padStart(2, "0").repeat(32);
+  const competitiveSnapshotDigest =
+    batchIndex === 0
+      ? hyperiaTerminalEvent.competitiveSnapshotDigest
+      : (batchIndex + 32).toString(16).padStart(2, "0").repeat(32);
+  const event: HyperiaCancellationPayload = {
+    ...hyperiaTerminalEvent,
+    seq: hyperiaTerminalEvent.seq + batchIndex,
+    emittedAt: hyperiaTerminalEvent.emittedAt + batchIndex,
+    duelId,
+    duelKey,
+    competitiveSnapshotDigest,
+    agent1: { id: `${hyperiaTerminalEvent.agent1.id}${suffix}` },
+    agent2: { id: `${hyperiaTerminalEvent.agent2.id}${suffix}` },
+  };
   return {
-    duelId: hyperiaTerminalEvent.duelId,
-    duelKey: hyperiaTerminalEvent.duelKey,
+    duelId,
+    duelKey,
     outcome: "CANCELLED",
     winnerSide: null,
-    participantAId: hyperiaTerminalEvent.agent1.id,
-    participantBId: hyperiaTerminalEvent.agent2.id,
+    participantAId: event.agent1.id,
+    participantBId: event.agent2.id,
     winnerId: null,
-    reason: hyperiaTerminalEvent.cancellationReason,
+    reason: event.cancellationReason,
     seed: null,
     replayHash: null,
-    event: hyperiaTerminalEvent,
+    event,
   };
 }
 
@@ -155,6 +174,61 @@ async function waitForDurableWorkerState(input: {
   );
 }
 
+async function waitForDurableWorkerBatch(input: {
+  child: ReturnType<typeof Bun.spawn>;
+  dbPath: string;
+  operations: readonly TerminalOperationRecord[];
+  timeoutMs?: number;
+}): Promise<TerminalOperationRecord[]> {
+  const deadline = Date.now() + (input.timeoutMs ?? 3_000);
+  let lastObserved = "no terminal operations";
+  while (Date.now() < deadline) {
+    const observer = new TerminalLedger(input.dbPath);
+    try {
+      const operations = input.operations.map((operation) =>
+        observer.getByDuelId(operation.duelId),
+      );
+      lastObserved = JSON.stringify(
+        operations.map((operation) => ({
+          duelId: operation?.duelId ?? null,
+          status: operation?.status ?? null,
+          attempts: operation?.attempts ?? null,
+          leaseOwner: operation?.leaseOwner ?? null,
+          leaseExpiresAt: operation?.leaseExpiresAt ?? null,
+        })),
+      );
+      if (
+        operations.every(
+          (operation, index): operation is TerminalOperationRecord =>
+            operation?.id === input.operations[index].id &&
+            operation.fingerprint === input.operations[index].fingerprint &&
+            operation.status === "PROCESSING" &&
+            operation.attempts === 1 &&
+            operation.leaseOwner === "crashed-child" &&
+            operation.leaseExpiresAt === 2_000,
+        )
+      ) {
+        return operations;
+      }
+    } finally {
+      observer.close();
+    }
+    if (input.child.exitCode !== null) {
+      const stderr =
+        input.child.stderr instanceof ReadableStream
+          ? (await new Response(input.child.stderr).text()).trim()
+          : "stderr was not piped";
+      throw new Error(
+        `terminal crash worker exited with code ${input.child.exitCode} before its batch was durable: ${stderr}`,
+      );
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error(
+    `timed out waiting for terminal crash worker batch; last observed ${lastObserved}`,
+  );
+}
+
 describe("terminal recovery across an actual process kill", () => {
   let tempDir: string;
   let dbPath: string;
@@ -194,6 +268,7 @@ describe("terminal recovery across an actual process kill", () => {
     });
     expect(ready.operation).toMatchObject({
       id: queued.id,
+      correlationId: queued.correlationId,
       fingerprint: queued.fingerprint,
       status: "PROCESSING",
       attempts: 1,
@@ -207,6 +282,7 @@ describe("terminal recovery across an actual process kill", () => {
       competitiveSnapshotDigest: hyperiaTerminalEvent.competitiveSnapshotDigest,
       phase: "FIGHTING",
       terminal: false,
+      terminalEventKey: null,
     });
 
     child.kill("SIGKILL");
@@ -216,6 +292,7 @@ describe("terminal recovery across an actual process kill", () => {
     const recoveredLedger = new TerminalLedger(dbPath);
     expect(recoveredLedger.getByDuelId(queued.duelId)).toMatchObject({
       id: queued.id,
+      correlationId: queued.correlationId,
       fingerprint: queued.fingerprint,
       status: "PROCESSING",
       attempts: 1,
@@ -238,6 +315,7 @@ describe("terminal recovery across an actual process kill", () => {
     const replayed = recoveredLedger.enqueue(cancellationInput(), 1_500);
     expect(replayed).toMatchObject({
       id: queued.id,
+      correlationId: queued.correlationId,
       fingerprint: queued.fingerprint,
       status: "PROCESSING",
       attempts: 1,
@@ -259,6 +337,7 @@ describe("terminal recovery across an actual process kill", () => {
     });
     expect(recovered).toMatchObject({
       id: queued.id,
+      correlationId: queued.correlationId,
       fingerprint: queued.fingerprint,
       status: "PROCESSING",
       attempts: 2,
@@ -272,6 +351,7 @@ describe("terminal recovery across an actual process kill", () => {
     const verifiedLedger = new TerminalLedger(dbPath);
     expect(verifiedLedger.getByDuelId(queued.duelId)).toMatchObject({
       id: queued.id,
+      correlationId: queued.correlationId,
       fingerprint: queued.fingerprint,
       status: "SUCCEEDED",
       attempts: 2,
@@ -284,6 +364,119 @@ describe("terminal recovery across an actual process kill", () => {
       PENDING: 0,
       PROCESSING: 0,
       SUCCEEDED: 1,
+      MANUAL_REVIEW: 0,
+      DEAD_LETTER: 0,
+    });
+    verifiedLedger.close();
+  });
+
+  test("recovers a simultaneous terminal batch exactly once after SIGKILL", async () => {
+    const inputs = [1, 2, 3, 4].map((batchIndex) =>
+      cancellationInput(batchIndex),
+    );
+    const seedLedger = new TerminalLedger(dbPath);
+    const queued = inputs.map((input) => seedLedger.enqueue(input, 900));
+    seedLedger.close();
+
+    child = Bun.spawn(
+      [process.execPath, crashWorkerFixturePath, dbPath, String(queued.length)],
+      {
+        cwd: path.dirname(crashWorkerFixturePath),
+        env: process.env,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+      },
+    );
+    const leased = await waitForDurableWorkerBatch({
+      child,
+      dbPath,
+      operations: queued,
+    });
+    expect(leased.map((operation) => operation.id)).toEqual(
+      queued.map((operation) => operation.id),
+    );
+
+    child.kill("SIGKILL");
+    expect(await child.exited).not.toBe(0);
+
+    const recoveredLedger = new TerminalLedger(dbPath);
+    for (let index = 0; index < queued.length; index += 1) {
+      const operation = queued[index];
+      expect(recoveredLedger.getByDuelId(operation.duelId)).toMatchObject({
+        id: operation.id,
+        fingerprint: operation.fingerprint,
+        status: "PROCESSING",
+        attempts: 1,
+        leaseOwner: "crashed-child",
+        leaseExpiresAt: 2_000,
+        event: inputs[index].event,
+      });
+      expect(recoveredLedger.enqueue(inputs[index], 1_500)).toMatchObject({
+        id: operation.id,
+        fingerprint: operation.fingerprint,
+        status: "PROCESSING",
+        attempts: 1,
+      });
+    }
+    expect(recoveredLedger.getSummary()).toEqual({
+      PENDING: 0,
+      PROCESSING: 4,
+      SUCCEEDED: 0,
+      MANUAL_REVIEW: 0,
+      DEAD_LETTER: 0,
+    });
+    expect(
+      recoveredLedger.claimDue({
+        ownerId: "replacement-child",
+        now: 1_999,
+        leaseMs: 1_000,
+        limit: 10,
+      }),
+    ).toEqual([]);
+
+    const recovered = recoveredLedger.claimDue({
+      ownerId: "replacement-child",
+      now: 2_000,
+      leaseMs: 1_000,
+      limit: 10,
+    });
+    expect(recovered.map((operation) => operation.id)).toEqual(
+      queued.map((operation) => operation.id),
+    );
+    for (const operation of recovered) {
+      expect(operation).toMatchObject({
+        status: "PROCESSING",
+        attempts: 2,
+        leaseOwner: "replacement-child",
+        leaseExpiresAt: 3_000,
+      });
+      recoveredLedger.markSucceeded(
+        operation.id,
+        "replacement-child",
+        2_100 + operation.id,
+      );
+    }
+    recoveredLedger.close();
+
+    const verifiedLedger = new TerminalLedger(dbPath);
+    for (let index = 0; index < queued.length; index += 1) {
+      const operation = queued[index];
+      expect(verifiedLedger.getByDuelId(operation.duelId)).toMatchObject({
+        id: operation.id,
+        fingerprint: operation.fingerprint,
+        status: "SUCCEEDED",
+        attempts: 2,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        completedAt: 2_100 + operation.id,
+        event: inputs[index].event,
+      });
+    }
+    expect(verifiedLedger.getSummary()).toEqual({
+      PENDING: 0,
+      PROCESSING: 0,
+      SUCCEEDED: 4,
       MANUAL_REVIEW: 0,
       DEAD_LETTER: 0,
     });

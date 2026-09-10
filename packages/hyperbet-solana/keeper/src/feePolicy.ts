@@ -9,9 +9,13 @@ export type LaunchFeePolicy = {
 
 export type ApprovedLaunchFeePolicyInput = {
   approval: string | undefined;
-  tradeTreasuryFeeBps: string | undefined;
-  tradeMarketMakerFeeBps: string | undefined;
-  winningsMarketMakerFeeBps: string | undefined;
+  tradeTreasuryFeeBps: string | number | undefined;
+  tradeMarketMakerFeeBps: string | number | undefined;
+  winningsMarketMakerFeeBps: string | number | undefined;
+};
+
+export type ClusterLaunchFeePolicyInput = ApprovedLaunchFeePolicyInput & {
+  cluster: string;
 };
 
 function parseBasisPoints(
@@ -76,7 +80,7 @@ export function resolveApprovedLaunchFeePolicy(
 ): LaunchFeePolicy {
   if (input.approval?.trim() !== "true") {
     throw new Error(
-      "SOLANA_LAUNCH_FEE_POLICY_APPROVED must be exactly 'true' on mainnet",
+      "SOLANA_LAUNCH_FEE_POLICY_APPROVED must be exactly 'true' on every non-local launch rail",
     );
   }
   for (const [name, value] of [
@@ -84,9 +88,29 @@ export function resolveApprovedLaunchFeePolicy(
     ["TRADE_MARKET_MAKER_FEE_BPS", input.tradeMarketMakerFeeBps],
     ["WINNINGS_MARKET_MAKER_FEE_BPS", input.winningsMarketMakerFeeBps],
   ] as const) {
-    if (!value?.trim()) {
-      throw new Error(`${name} must be explicitly configured on mainnet`);
+    if (value === undefined || String(value).trim() === "") {
+      throw new Error(
+        `${name} must be explicitly configured on every non-local launch rail`,
+      );
     }
   }
   return resolveLaunchFeePolicy(input);
+}
+
+export function resolveClusterLaunchFeePolicy(
+  input: ClusterLaunchFeePolicyInput,
+): LaunchFeePolicy {
+  const cluster = input.cluster.trim().toLowerCase();
+  if (cluster === "localnet") {
+    return resolveLaunchFeePolicy(input);
+  }
+  if (
+    cluster !== "devnet" &&
+    cluster !== "testnet" &&
+    cluster !== "mainnet" &&
+    cluster !== "mainnet-beta"
+  ) {
+    throw new Error(`Unsupported Solana fee-policy cluster '${input.cluster}'`);
+  }
+  return resolveApprovedLaunchFeePolicy(input);
 }

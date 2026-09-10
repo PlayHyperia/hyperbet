@@ -34,6 +34,16 @@ import {
   reconcileWalletMarketTerminalSettlements,
   type SolanaTerminalSettlementKind,
 } from "./solanaTerminalSettlement";
+import {
+  applyKeeperLegacyMigration,
+  initializeKeeperLaunchSchemaVersion,
+  inspectKeeperDatabaseCompatibility,
+  type ApplyKeeperLegacyMigrationInput,
+  type KeeperDatabaseCompatibilityAudit,
+  type KeeperLegacyMigrationResult,
+} from "./legacyDatabasePolicy";
+import { buildDuelCorrelationId } from "./duelCorrelation";
+import { ensureTerminalSettlementLedgerSchema } from "./terminalSettlementSchema";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = process.env.KEEPER_DB_PATH?.trim()
@@ -42,6 +52,8 @@ const DB_PATH = process.env.KEEPER_DB_PATH?.trim()
 
 export type DbBetRecord = {
   id: string;
+  cluster: DbSolanaCluster;
+  programId: string;
   bettorWallet: string;
   chain: RecordedBetChain;
   sourceAsset: "SOL";
@@ -56,6 +68,9 @@ export type DbBetRecord = {
   externalBetRef: string | null;
   recordedAt: number;
 };
+
+export type DbSolanaCluster =
+  "localnet" | "devnet" | "testnet" | "mainnet-beta";
 
 export type DbBetExecutionRecord = {
   orderId: string;
@@ -178,6 +193,7 @@ export type DbSolanaWalletBetHistoryEntry = {
   marketPda: string;
   duelKey: string | null;
   duelId: string | null;
+  correlationId: string | null;
   placeSignature: string;
   recordedAt: number;
   orderId: string;
@@ -197,6 +213,9 @@ export type DbSolanaWalletBetHistoryEntry = {
   winner: "none" | "a" | "b" | null;
   orderState: DbSolanaBetOrderState;
   settlementState: DbSolanaBetSettlementState;
+  terminalKind: SolanaTerminalSettlementKind | null;
+  terminalStatus: "resolved" | "cancelled" | null;
+  terminalWinner: "none" | "a" | "b" | null;
   claimSignature: string | null;
   terminalGrossLamports: string;
   terminalPayoutLamports: string;
@@ -216,6 +235,7 @@ export type DbSolanaWalletBetHistory = {
 // ── DB singleton ──────────────────────────────────────────────────────────────
 
 const db = new Database(DB_PATH, { create: true });
+db.run("PRAGMA busy_timeout = 5000");
 db.run("PRAGMA journal_mode = WAL");
 db.run("PRAGMA synchronous = NORMAL");
 db.run("PRAGMA foreign_keys = ON");
@@ -262,6 +282,13 @@ try {
 } catch {
   // Column already exists.
 }
+
+db.run(`CREATE TABLE IF NOT EXISTS bet_deployment_identities (
+  bet_id TEXT PRIMARY KEY REFERENCES bets(id) ON DELETE CASCADE,
+  cluster TEXT NOT NULL,
+  program_id TEXT NOT NULL,
+  bound_at INTEGER NOT NULL
+)`);
 
 function tableHasColumn(tableName: string, columnName: string): boolean {
   const rows = db.query(`PRAGMA table_info(${tableName})`).all() as Array<{
@@ -507,11 +534,11 @@ db.run(`CREATE TABLE IF NOT EXISTS solana_terminal_settlements (
   market_pda TEXT NOT NULL,
   wallet TEXT NOT NULL,
   claim_signature TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('CLAIM_PAYOUT', 'CANCELLATION_REFUND')),
+  kind TEXT NOT NULL CHECK (kind IN ('CLAIM_PAYOUT', 'CANCELLATION_REFUND', 'LOSER_CLEANUP')),
   status TEXT NOT NULL CHECK (status IN ('resolved', 'cancelled')),
   winner TEXT NOT NULL CHECK (winner IN ('none', 'a', 'b')),
-  gross_entitlement_lamports INTEGER NOT NULL CHECK (gross_entitlement_lamports > 0),
-  payout_lamports INTEGER NOT NULL CHECK (payout_lamports > 0),
+  gross_entitlement_lamports INTEGER NOT NULL CHECK (gross_entitlement_lamports >= 0),
+  payout_lamports INTEGER NOT NULL CHECK (payout_lamports >= 0),
   fee_lamports INTEGER NOT NULL CHECK (fee_lamports >= 0),
   eligible_order_count INTEGER NOT NULL CHECK (eligible_order_count > 0),
   recorded_bet_count INTEGER NOT NULL CHECK (recorded_bet_count >= 0),
@@ -528,7 +555,7 @@ db.run(`CREATE TABLE IF NOT EXISTS bet_terminal_settlements (
   order_id TEXT NOT NULL,
   side INTEGER NOT NULL CHECK (side IN (1, 2)),
   claim_signature TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('CLAIM_PAYOUT', 'CANCELLATION_REFUND')),
+  kind TEXT NOT NULL CHECK (kind IN ('CLAIM_PAYOUT', 'CANCELLATION_REFUND', 'LOSER_CLEANUP')),
   status TEXT NOT NULL CHECK (status IN ('resolved', 'cancelled')),
   winner TEXT NOT NULL CHECK (winner IN ('none', 'a', 'b')),
   matched_amount_units TEXT NOT NULL,
@@ -537,6 +564,8 @@ db.run(`CREATE TABLE IF NOT EXISTS bet_terminal_settlements (
   fee_lamports INTEGER NOT NULL CHECK (fee_lamports >= 0),
   settled_at INTEGER NOT NULL
 )`);
+
+ensureTerminalSettlementLedgerSchema(db);
 
 db.run(`CREATE INDEX IF NOT EXISTS idx_bet_terminal_settlements_wallet_market
   ON bet_terminal_settlements (wallet, market_pda, settled_at DESC)`);
@@ -595,6 +624,29 @@ db.run(`CREATE TABLE IF NOT EXISTS invited_wallets (
   PRIMARY KEY (referrer, invitee)
 )`);
 
+db.run(`CREATE TABLE IF NOT EXISTS keeper_legacy_rows (
+  source_table TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  row_json TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  archived_at INTEGER NOT NULL,
+  migration_id INTEGER,
+  PRIMARY KEY (source_table, source_key)
+)`);
+
+db.run(`CREATE TABLE IF NOT EXISTS keeper_legacy_migrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  schema_version INTEGER NOT NULL,
+  backup_sha256 TEXT NOT NULL UNIQUE,
+  release_sha TEXT NOT NULL,
+  cluster TEXT NOT NULL,
+  archived_row_count INTEGER NOT NULL CHECK (archived_row_count >= 0),
+  renamed_table_count INTEGER NOT NULL CHECK (renamed_table_count >= 0),
+  applied_at INTEGER NOT NULL
+)`);
+
+initializeKeeperLaunchSchemaVersion(db);
+
 // ── Prepared statements ───────────────────────────────────────────────────────
 
 const insertBet = db.prepare(`INSERT OR IGNORE INTO bets
@@ -602,6 +654,11 @@ const insertBet = db.prepare(`INSERT OR IGNORE INTO bets
    fee_bps, tx_signature, market_pda, duel_key, duel_id, invite_code, external_bet_ref, recorded_at)
   VALUES ($id, $bettorWallet, $chain, $sourceAsset, $sourceAmountLamports, $feeAmountLamports,
           $feeBps, $txSignature, $marketPda, $duelKey, $duelId, $inviteCode, $externalBetRef, $recordedAt)`);
+
+const insertBetDeploymentIdentity = db.prepare(
+  `INSERT INTO bet_deployment_identities (bet_id, cluster, program_id, bound_at)
+   VALUES ($betId, $cluster, $programId, $boundAt)`,
+);
 
 const insertBetExecution = db.prepare(`INSERT INTO bet_executions (
   bet_id, order_id, side, limit_price, order_behavior, order_amount_units,
@@ -686,6 +743,7 @@ const loadBetExecutionBaselinesStatement = db.prepare(`SELECT
   bets.bettor_wallet AS wallet,
   bets.tx_signature AS txSignature,
   bets.market_pda AS marketPda,
+  bets.recorded_at AS recordedAt,
   COALESCE(bets.external_bet_ref, bets.tx_signature, bets.id) AS referenceId,
   executions.order_id AS orderId,
   executions.side,
@@ -703,6 +761,10 @@ const loadBetExecutionBaselinesStatement = db.prepare(`SELECT
   lifecycle.through_signature AS lifecycleThroughSignature
 FROM bets
 JOIN bet_executions AS executions ON executions.bet_id = bets.id
+JOIN bet_deployment_identities AS deployment
+  ON deployment.bet_id = bets.id
+ AND deployment.cluster = ?
+ AND deployment.program_id = ?
 LEFT JOIN bet_lifecycle_accounting AS lifecycle ON lifecycle.bet_id = bets.id
 WHERE UPPER(bets.chain) = 'SOLANA'
   AND UPPER(bets.source_asset) = 'SOL'
@@ -869,12 +931,23 @@ SELECT
   market.payloadJson AS marketStatePayloadJson,
   terminal.claim_signature AS claimSignature,
   terminal.kind AS terminalKind,
+  terminal.status AS terminalStatus,
+  terminal.winner AS terminalWinner,
+  terminal.market_pda AS terminalMarketPda,
+  terminal.wallet AS terminalWallet,
+  terminal.order_id AS terminalOrderId,
+  terminal.side AS terminalSide,
+  terminal.matched_amount_units AS terminalMatchedAmountUnits,
   CAST(terminal.gross_entitlement_lamports AS TEXT) AS terminalGrossLamports,
   CAST(terminal.payout_lamports AS TEXT) AS terminalPayoutLamports,
   CAST(terminal.fee_lamports AS TEXT) AS terminalFeeLamports,
   terminal.settled_at AS settledAt
 FROM bets
 JOIN bet_executions AS executions ON executions.bet_id = bets.id
+JOIN bet_deployment_identities AS deployment
+  ON deployment.bet_id = bets.id
+ AND deployment.cluster = ?
+ AND deployment.program_id = ?
 LEFT JOIN bet_lifecycle_accounting AS lifecycle ON lifecycle.bet_id = bets.id
 LEFT JOIN bet_terminal_settlements AS terminal
   ON terminal.bet_id = bets.id
@@ -891,6 +964,10 @@ const countSolanaWalletBetHistoryStatement =
   db.prepare(`SELECT COUNT(*) AS total
 FROM bets
 JOIN bet_executions AS executions ON executions.bet_id = bets.id
+JOIN bet_deployment_identities AS deployment
+  ON deployment.bet_id = bets.id
+ AND deployment.cluster = ?
+ AND deployment.program_id = ?
 WHERE bets.bettor_wallet = ?
   AND (? IS NULL OR bets.market_pda = ?)`);
 
@@ -943,19 +1020,27 @@ export function loadAll(betLimit = 5000): HydratedState {
   const bets = (
     db
       .prepare(
-        `SELECT id, bettor_wallet, chain, source_asset,
+        `SELECT bets.id, deployment.cluster, deployment.program_id,
+          bettor_wallet, chain, source_asset,
           ${legacySourceAmountSelect} AS legacy_source_amount,
           CAST(source_amount_lamports AS TEXT) AS source_amount_lamports,
           CAST(fee_amount_lamports AS TEXT) AS fee_amount_lamports,
           fee_bps, tx_signature, market_pda, duel_key, duel_id, invite_code, external_bet_ref, recorded_at
          FROM bets
+         JOIN bet_deployment_identities AS deployment
+           ON deployment.bet_id = bets.id
          WHERE UPPER(chain) = 'SOLANA' AND UPPER(source_asset) = 'SOL'
          ORDER BY recorded_at DESC LIMIT ?`,
       )
       .all(betLimit) as Array<Record<string, unknown>>
-  ).map(
-    (row): DbBetRecord => ({
+  ).map((row): DbBetRecord => {
+    const deployment = normalizeIndexerIdentity({
+      cluster: String(row.cluster),
+      programId: String(row.program_id),
+    });
+    return {
       id: String(row.id),
+      ...deployment,
       bettorWallet: String(row.bettor_wallet),
       chain: String(row.chain) as DbBetRecord["chain"],
       sourceAsset: "SOL",
@@ -975,8 +1060,8 @@ export function loadAll(betLimit = 5000): HydratedState {
       externalBetRef:
         row.external_bet_ref != null ? String(row.external_bet_ref) : null,
       recordedAt: Number(row.recorded_at),
-    }),
-  );
+    };
+  });
 
   const walletDisplay = new Map<string, string>();
   for (const row of db
@@ -1006,21 +1091,19 @@ export function loadAll(betLimit = 5000): HydratedState {
          ORDER BY created_at DESC, id DESC`,
       )
       .all() as Array<Record<string, unknown>>
-  ).map(
-    (row): DbPointsEventRecord => ({
-      id: Number(row.id),
-      wallet: String(row.wallet),
-      eventType: String(row.event_type),
-      status: String(row.status),
-      totalPoints: Number(row.total_points),
-      referenceType:
-        row.reference_type == null ? null : String(row.reference_type),
-      referenceId: row.reference_id == null ? null : String(row.reference_id),
-      relatedWallet:
-        row.related_wallet == null ? null : String(row.related_wallet),
-      createdAt: Number(row.created_at),
-    }),
-  );
+  ).map((row): DbPointsEventRecord => ({
+    id: Number(row.id),
+    wallet: String(row.wallet),
+    eventType: String(row.event_type),
+    status: String(row.status),
+    totalPoints: Number(row.total_points),
+    referenceType:
+      row.reference_type == null ? null : String(row.reference_type),
+    referenceId: row.reference_id == null ? null : String(row.reference_id),
+    relatedWallet:
+      row.related_wallet == null ? null : String(row.related_wallet),
+    createdAt: Number(row.created_at),
+  }));
 
   const inviteCodeByWallet = new Map<string, string>();
   const walletByInviteCode = new Map<string, string>();
@@ -1072,6 +1155,10 @@ export function saveBet(
   bet: DbBetRecord,
   execution: DbBetExecutionRecord | null = null,
 ): boolean {
+  if ((bet.duelKey === null) !== (bet.duelId === null)) {
+    throw new Error("bet duel identity is incomplete");
+  }
+  const deployment = normalizeIndexerIdentity(bet);
   const sourceAmountLamports = normalizeLamports(bet.sourceAmountLamports);
   const feeAmountLamports = normalizeLamports(bet.feeAmountLamports);
   if (!sourceAmountLamports || sourceAmountLamports === "0") {
@@ -1172,6 +1259,14 @@ export function saveBet(
       $recordedAt: bet.recordedAt,
     }) as { changes?: number };
     const inserted = Number(result.changes ?? 0) > 0;
+    if (inserted) {
+      insertBetDeploymentIdentity.run({
+        $betId: bet.id,
+        $cluster: deployment.cluster,
+        $programId: deployment.programId,
+        $boundAt: bet.recordedAt,
+      });
+    }
     if (inserted && execution && executionLamports) {
       insertBetExecution.run({
         $betId: bet.id,
@@ -1249,9 +1344,14 @@ export function saveInvitedWallet(referrer: string, invitee: string): void {
 function normalizeIndexerIdentity(input: {
   cluster: string;
   programId: string;
-}): { cluster: string; programId: string } {
+}): { cluster: DbSolanaCluster; programId: string } {
   const cluster = input.cluster.trim().toLowerCase();
-  if (!/^[a-z0-9-]+$/.test(cluster)) {
+  if (
+    cluster !== "localnet" &&
+    cluster !== "devnet" &&
+    cluster !== "testnet" &&
+    cluster !== "mainnet-beta"
+  ) {
     throw new Error("Solana indexer cluster is invalid");
   }
   let programId: string;
@@ -1514,9 +1614,15 @@ function canonicalPublicKey(value: string, label: string): string {
   return canonical;
 }
 
+const U64_MAX = 18_446_744_073_709_551_615n;
+
 function unsignedHistoryValue(value: unknown, label: string): bigint {
   const normalized = String(value);
-  if (!/^\d+$/.test(normalized)) {
+  if (
+    !/^(0|[1-9]\d*)$/.test(normalized) ||
+    normalized.length > 20 ||
+    BigInt(normalized) > U64_MAX
+  ) {
     throw new Error(`persisted ${label} is invalid`);
   }
   return BigInt(normalized);
@@ -1572,19 +1678,120 @@ function orderStateForHistory(input: {
 
 function settlementStateForHistory(input: {
   terminalKind: unknown;
+  terminalStatus: unknown;
+  terminalWinner: unknown;
+  terminalMarketPda: unknown;
+  terminalWallet: unknown;
+  terminalOrderId: unknown;
+  terminalSide: unknown;
+  terminalMatchedAmountUnits: unknown;
+  claimSignature: unknown;
+  settledAt: unknown;
   terminalGross: bigint;
+  terminalPayout: bigint;
+  terminalFee: bigint;
   marketStatus: "open" | "locked" | "resolved" | "cancelled" | null;
   winner: "none" | "a" | "b" | null;
+  marketPda: string;
+  wallet: string;
+  orderId: string;
   side: 1 | 2;
   matched: bigint;
   executedCost: bigint;
+  rewardEligible: bigint;
 }): DbSolanaBetSettlementState {
-  if (input.terminalKind === "CLAIM_PAYOUT") {
-    return input.terminalGross > 0n ? "PAID" : "LOST";
-  }
-  if (input.terminalKind === "CANCELLATION_REFUND") return "REFUNDED";
-  if (input.terminalKind !== null) {
+  if (
+    input.terminalKind !== null &&
+    input.terminalKind !== "CLAIM_PAYOUT" &&
+    input.terminalKind !== "CANCELLATION_REFUND" &&
+    input.terminalKind !== "LOSER_CLEANUP"
+  ) {
     throw new Error("persisted Solana terminal settlement kind is invalid");
+  }
+  if (input.terminalKind !== null) {
+    const terminalMatched = unsignedHistoryValue(
+      input.terminalMatchedAmountUnits,
+      "terminal matched amount",
+    );
+    if (
+      (input.terminalStatus !== "resolved" &&
+        input.terminalStatus !== "cancelled") ||
+      (input.terminalWinner !== "none" &&
+        input.terminalWinner !== "a" &&
+        input.terminalWinner !== "b") ||
+      input.terminalMarketPda !== input.marketPda ||
+      input.terminalWallet !== input.wallet ||
+      String(input.terminalOrderId) !== input.orderId ||
+      Number(input.terminalSide) !== input.side ||
+      terminalMatched !== input.matched ||
+      typeof input.claimSignature !== "string" ||
+      !isCanonicalSolanaTransactionSignature(input.claimSignature) ||
+      !Number.isSafeInteger(input.settledAt) ||
+      Number(input.settledAt) < 0 ||
+      input.terminalGross !== input.terminalPayout + input.terminalFee ||
+      (input.marketStatus !== null &&
+        (input.marketStatus !== input.terminalStatus ||
+          input.winner !== input.terminalWinner))
+    ) {
+      throw new Error("persisted Solana terminal settlement is contradictory");
+    }
+    if (input.terminalKind === "CLAIM_PAYOUT") {
+      const won =
+        (input.terminalWinner === "a" && input.side === 1) ||
+        (input.terminalWinner === "b" && input.side === 2);
+      const expectedGross = won ? input.matched : 0n;
+      if (
+        input.terminalStatus !== "resolved" ||
+        (input.terminalWinner !== "a" && input.terminalWinner !== "b") ||
+        input.terminalGross !== expectedGross
+      ) {
+        throw new Error("persisted Solana payout settlement is contradictory");
+      }
+      return input.terminalGross > 0n ? "PAID" : "LOST";
+    }
+    if (input.terminalKind === "LOSER_CLEANUP") {
+      const lost =
+        (input.terminalWinner === "a" && input.side === 2) ||
+        (input.terminalWinner === "b" && input.side === 1);
+      if (
+        input.terminalStatus !== "resolved" ||
+        (input.terminalWinner !== "a" && input.terminalWinner !== "b") ||
+        !lost ||
+        input.matched <= 0n ||
+        input.terminalGross !== 0n ||
+        input.terminalPayout !== 0n ||
+        input.terminalFee !== 0n
+      ) {
+        throw new Error(
+          "persisted Solana loser cleanup settlement is contradictory",
+        );
+      }
+      return "LOST";
+    }
+    if (
+      input.terminalStatus !== "cancelled" ||
+      input.terminalWinner !== "none" ||
+      input.terminalGross !== input.rewardEligible
+    ) {
+      throw new Error("persisted Solana refund settlement is contradictory");
+    }
+    return "REFUNDED";
+  }
+  if (
+    input.terminalStatus !== null ||
+    input.terminalWinner !== null ||
+    input.terminalMarketPda !== null ||
+    input.terminalWallet !== null ||
+    input.terminalOrderId !== null ||
+    input.terminalSide !== null ||
+    input.terminalMatchedAmountUnits !== null ||
+    input.claimSignature !== null ||
+    input.settledAt !== null ||
+    input.terminalGross !== 0n ||
+    input.terminalPayout !== 0n ||
+    input.terminalFee !== 0n
+  ) {
+    throw new Error("persisted Solana terminal settlement is incomplete");
   }
   if (input.marketStatus === "resolved") {
     if (input.matched === 0n) return "NO_ENTITLEMENT";
@@ -1630,6 +1837,8 @@ export function loadSolanaWalletBetHistory(input: {
     programId,
     cluster,
     programId,
+    cluster,
+    programId,
     wallet,
     marketPda,
     marketPda,
@@ -1637,6 +1846,21 @@ export function loadSolanaWalletBetHistory(input: {
     input.offset,
   ) as Array<Record<string, unknown>>;
   const entries = rows.map((row): DbSolanaWalletBetHistoryEntry => {
+    const rowWallet = canonicalPublicKey(
+      String(row.wallet),
+      "persisted Solana history wallet",
+    );
+    const rowMarketPda = canonicalPublicKey(
+      String(row.marketPda),
+      "persisted Solana history market",
+    );
+    const orderId = unsignedHistoryValue(row.orderId, "order ID").toString();
+    const placeSignature = String(row.placeSignature);
+    if (!isCanonicalSolanaTransactionSignature(placeSignature)) {
+      throw new Error(
+        "persisted Solana history placement signature is invalid",
+      );
+    }
     const side = Number(row.side) as 1 | 2;
     const limitPrice = Number(row.limitPrice);
     const orderAmount = unsignedHistoryValue(
@@ -1659,6 +1883,10 @@ export function loadSolanaWalletBetHistory(input: {
       row.initialCollateralLamports,
       "initial collateral",
     );
+    const sourceAmountLamports = unsignedHistoryValue(
+      row.sourceAmountLamports,
+      "source amount",
+    );
     const executedCost = unsignedHistoryValue(
       row.executedCostLamports,
       "executed cost",
@@ -1675,6 +1903,7 @@ export function loadSolanaWalletBetHistory(input: {
       limitPrice >= 1_000 ||
       orderAmount <= 0n ||
       matched + resting + released !== orderAmount ||
+      sourceAmountLamports !== initialCollateral + tradeFee ||
       rewardEligible !== executedCost + tradeFee
     ) {
       throw new Error("persisted Solana bet history accounting is invalid");
@@ -1707,25 +1936,73 @@ export function loadSolanaWalletBetHistory(input: {
     }
     const market = marketStateFromHistoryRow(row);
     const indexed = row.reconciledAt !== null;
+    const recordedAt = Number(row.recordedAt);
+    const reconciledAt = indexed ? Number(row.reconciledAt) : null;
+    const settledAt = row.settledAt === null ? null : Number(row.settledAt);
+    if (
+      !Number.isSafeInteger(recordedAt) ||
+      recordedAt < 0 ||
+      (reconciledAt !== null &&
+        (!Number.isSafeInteger(reconciledAt) || reconciledAt < 0)) ||
+      (settledAt !== null &&
+        (!Number.isSafeInteger(settledAt) || settledAt < 0)) ||
+      (reconciledAt !== null && reconciledAt < recordedAt) ||
+      (settledAt !== null &&
+        (settledAt < recordedAt ||
+          (reconciledAt !== null && settledAt > reconciledAt)))
+    ) {
+      throw new Error("persisted Solana history timestamp is invalid");
+    }
+    const duelKey = row.duelKey === null ? null : String(row.duelKey);
+    const duelId = row.duelId === null ? null : String(row.duelId);
+    if ((duelKey === null) !== (duelId === null)) {
+      throw new Error("persisted Solana bet duel identity is incomplete");
+    }
+    const correlationId =
+      duelKey === null || duelId === null
+        ? null
+        : buildDuelCorrelationId({ duelId, duelKey });
+    const settlementState = settlementStateForHistory({
+      terminalKind: row.terminalKind,
+      terminalStatus: row.terminalStatus,
+      terminalWinner: row.terminalWinner,
+      terminalMarketPda: row.terminalMarketPda,
+      terminalWallet: row.terminalWallet,
+      terminalOrderId: row.terminalOrderId,
+      terminalSide: row.terminalSide,
+      terminalMatchedAmountUnits: row.terminalMatchedAmountUnits,
+      claimSignature: row.claimSignature,
+      settledAt,
+      terminalGross,
+      terminalPayout,
+      terminalFee,
+      marketStatus: market.status,
+      winner: market.winner,
+      marketPda: rowMarketPda,
+      wallet: rowWallet,
+      orderId,
+      side,
+      matched,
+      executedCost,
+      rewardEligible,
+    });
     return {
       betId: String(row.betId),
-      wallet: String(row.wallet),
-      marketPda: String(row.marketPda),
-      duelKey: row.duelKey === null ? null : String(row.duelKey),
-      duelId: row.duelId === null ? null : String(row.duelId),
-      placeSignature: String(row.placeSignature),
-      recordedAt: Number(row.recordedAt),
-      orderId: String(row.orderId),
+      wallet: rowWallet,
+      marketPda: rowMarketPda,
+      duelKey,
+      duelId,
+      correlationId,
+      placeSignature,
+      recordedAt,
+      orderId,
       side,
       limitPrice,
       orderAmountUnits: orderAmount.toString(),
       matchedAmountUnits: matched.toString(),
       restingAmountUnits: resting.toString(),
       releasedAmountUnits: released.toString(),
-      sourceAmountLamports: unsignedHistoryValue(
-        row.sourceAmountLamports,
-        "source amount",
-      ).toString(),
+      sourceAmountLamports: sourceAmountLamports.toString(),
       collateralLamports: initialCollateral.toString(),
       executedCostLamports: executedCost.toString(),
       tradeFeeLamports: tradeFee.toString(),
@@ -1741,25 +2018,31 @@ export function loadSolanaWalletBetHistory(input: {
         resting,
         released,
       }),
-      settlementState: settlementStateForHistory({
-        terminalKind: row.terminalKind,
-        terminalGross,
-        marketStatus: market.status,
-        winner: market.winner,
-        side,
-        matched,
-        executedCost,
-      }),
+      settlementState,
+      terminalKind:
+        row.terminalKind === null
+          ? null
+          : (row.terminalKind as SolanaTerminalSettlementKind),
+      terminalStatus:
+        row.terminalStatus === null
+          ? null
+          : (row.terminalStatus as "resolved" | "cancelled"),
+      terminalWinner:
+        row.terminalWinner === null
+          ? null
+          : (row.terminalWinner as "none" | "a" | "b"),
       claimSignature:
         row.claimSignature === null ? null : String(row.claimSignature),
       terminalGrossLamports: terminalGross.toString(),
       terminalPayoutLamports: terminalPayout.toString(),
       terminalFeeLamports: terminalFee.toString(),
-      reconciledAt: row.reconciledAt === null ? null : Number(row.reconciledAt),
-      settledAt: row.settledAt === null ? null : Number(row.settledAt),
+      reconciledAt,
+      settledAt,
     };
   });
   const count = countSolanaWalletBetHistoryStatement.get(
+    cluster,
+    programId,
     wallet,
     marketPda,
     marketPda,
@@ -1782,6 +2065,7 @@ export function reconcileSolanaBetLifecycleAccounting(input: {
 }): {
   reconciledBets: number;
   pendingBets: number;
+  oldestPendingBetRecordedAt: number | null;
   terminalSettlements: number;
   settledBets: number;
   changes: DbBetLifecycleReconciliationChange[];
@@ -1809,9 +2093,10 @@ export function reconcileSolanaBetLifecycleAccounting(input: {
     });
     factsByMarket.set(record.fact.marketPda, facts);
   }
-  const allBaselineRows = loadBetExecutionBaselinesStatement.all() as Array<
-    Record<string, unknown>
-  >;
+  const allBaselineRows = loadBetExecutionBaselinesStatement.all(
+    identity.cluster,
+    identity.programId,
+  ) as Array<Record<string, unknown>>;
   const baselines = allBaselineRows.filter((row) => {
     if (row.lifecycleThroughSlot === null) return true;
     const throughSlot = Number(row.lifecycleThroughSlot);
@@ -1827,6 +2112,7 @@ export function reconcileSolanaBetLifecycleAccounting(input: {
     const changes: DbBetLifecycleReconciliationChange[] = [];
     let reconciledBets = 0;
     let pendingBets = 0;
+    let oldestPendingBetRecordedAt: number | null = null;
     for (const row of baselines) {
       const baseline = betExecutionBaselineFromRow(row);
       const marketFacts = factsByMarket.get(baseline.marketPda) ?? [];
@@ -1845,7 +2131,15 @@ export function reconcileSolanaBetLifecycleAccounting(input: {
             `indexed recorded bet ${baseline.betId} has no order placement fact`,
           );
         }
+        const recordedAt = Number(row.recordedAt);
+        if (!Number.isSafeInteger(recordedAt) || recordedAt < 0) {
+          throw new Error("pending recorded bet timestamp is invalid");
+        }
         pendingBets += 1;
+        oldestPendingBetRecordedAt =
+          oldestPendingBetRecordedAt === null
+            ? recordedAt
+            : Math.min(oldestPendingBetRecordedAt, recordedAt);
         continue;
       }
       const result = reconcileBetExecutionFromIndexedFacts({
@@ -2164,6 +2458,7 @@ export function reconcileSolanaBetLifecycleAccounting(input: {
     return {
       reconciledBets,
       pendingBets,
+      oldestPendingBetRecordedAt,
       terminalSettlements,
       settledBets,
       changes,
@@ -2201,8 +2496,7 @@ export function commitSolanaIndexedTransaction(
     !Array.isArray(input.instructionNames) ||
     input.instructionNames.some(
       (name) => typeof name !== "string" || !/^[a-z][A-Za-z0-9]*$/.test(name),
-    ) ||
-    new Set(input.instructionNames).size !== input.instructionNames.length
+    )
   ) {
     throw new Error("Solana indexed transaction instruction names are invalid");
   }
@@ -2291,12 +2585,29 @@ export function commitSolanaIndexedTransaction(
 export function checkDatabaseHealth(): { ok: boolean; error: string | null } {
   try {
     const row = db.query("SELECT 1 AS ok").get() as { ok?: number } | null;
-    return row?.ok === 1
+    if (row?.ok !== 1) {
+      return { ok: false, error: "SQLite health probe returned no result" };
+    }
+    const compatibility = inspectKeeperDatabaseCompatibility(db);
+    return compatibility.compatible
       ? { ok: true, error: null }
-      : { ok: false, error: "SQLite health probe returned no result" };
+      : {
+          ok: false,
+          error: `Keeper database migration required (${compatibility.blockers.join("; ")})`,
+        };
   } catch {
     return { ok: false, error: "SQLite health probe failed" };
   }
+}
+
+export function auditKeeperDatabase(): KeeperDatabaseCompatibilityAudit {
+  return inspectKeeperDatabaseCompatibility(db);
+}
+
+export function migrateLegacyDatabase(
+  input: ApplyKeeperLegacyMigrationInput,
+): KeeperLegacyMigrationResult {
+  return applyKeeperLegacyMigration(db, input);
 }
 
 export function closeDb(): void {

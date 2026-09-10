@@ -4,15 +4,20 @@ import {
   resolveUiLocale,
   type UiLocale,
 } from "@hyperbet/ui/i18n";
-import { buildArenaWriteHeaders, GAME_API_URL } from "../lib/solanaConfig";
+import {
+  buildArenaWriteHeaders,
+  GAME_API_URL,
+  SOLANA_CLUSTER,
+} from "../lib/solanaConfig";
+import { createSolanaWalletActionProof } from "../lib/solanaWalletActionProof";
 
 type PointsSnapshot = {
   totalPoints: number;
-  referredBy: { wallet: string; code: string } | null;
+  referred: boolean;
 };
 
 type InviteSummary = {
-  inviteCode: string;
+  inviteCode: string | null;
   invitedWalletCount: number;
   activeReferralCount: number;
   pendingSignupBonuses: number;
@@ -45,6 +50,13 @@ function buildInviteLink(inviteCode: string): string {
   return url.toString();
 }
 
+function initialInviteCode(): string {
+  if (typeof window === "undefined") return "";
+  return (
+    new URLSearchParams(window.location.search).get("invite")?.trim() ?? ""
+  ).toUpperCase();
+}
+
 function getCopy(locale: UiLocale) {
   if (locale === "zh") {
     return {
@@ -56,7 +68,6 @@ function getCopy(locale: UiLocale) {
       pending: (count: number) => `${count} 待确认`,
       winBonus: (value: number) =>
         `邀请胜场积分 +${value.toLocaleString(getLocaleTag(locale))}`,
-      referredBy: (wallet: string) => `邀请人 ${wallet}`,
       copy: "复制链接",
       copied: "邀请链接已复制",
       copyFailed: "复制邀请链接失败",
@@ -66,6 +77,11 @@ function getCopy(locale: UiLocale) {
       redeemFailed: "邀请码兑换失败",
       redeemed: "邀请码已兑换",
       alreadyRedeemed: "该邀请码已兑换",
+      create: "创建邀请码",
+      creating: "正在创建...",
+      created: "邀请码已创建",
+      walletProofUnavailable: "此钱包不支持安全消息签名。",
+      referralActive: "邀请关系已启用",
     };
   }
   return {
@@ -77,7 +93,6 @@ function getCopy(locale: UiLocale) {
     pending: (count: number) => `${count} pending`,
     winBonus: (value: number) =>
       `Referral win points +${value.toLocaleString(getLocaleTag(locale))}`,
-    referredBy: (wallet: string) => `Referred by ${wallet}`,
     copy: "Copy Link",
     copied: "Invite link copied",
     copyFailed: "Failed to copy invite link",
@@ -87,21 +102,29 @@ function getCopy(locale: UiLocale) {
     redeemFailed: "Invite redemption failed",
     redeemed: "Invite code redeemed",
     alreadyRedeemed: "Invite code already redeemed",
+    create: "Create Code",
+    creating: "Creating...",
+    created: "Invite code created",
+    walletProofUnavailable:
+      "This wallet does not support secure message signing.",
+    referralActive: "Referral active",
   };
 }
 
 export function SolanaReferralPanel({
   solanaWallet,
+  signMessage,
   locale,
 }: {
   solanaWallet: string | null;
+  signMessage?: (message: Uint8Array) => Promise<Uint8Array>;
   locale?: UiLocale;
 }) {
   const resolvedLocale = resolveUiLocale(locale);
   const copy = useMemo(() => getCopy(resolvedLocale), [resolvedLocale]);
   const [points, setPoints] = useState<PointsSnapshot | null>(null);
   const [invite, setInvite] = useState<InviteSummary | null>(null);
-  const [redeemCode, setRedeemCode] = useState("");
+  const [redeemCode, setRedeemCode] = useState(initialInviteCode);
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -145,41 +168,86 @@ export function SolanaReferralPanel({
     return () => window.clearInterval(interval);
   }, [refresh]);
 
-  useEffect(() => {
-    const code = new URLSearchParams(window.location.search)
-      .get("invite")
-      ?.trim();
-    if (code) setRedeemCode(code.toUpperCase());
-  }, []);
-
   const redeem = useCallback(async () => {
     if (!solanaWallet) return;
+    if (!signMessage) {
+      setStatus(copy.walletProofUnavailable);
+      return;
+    }
     const inviteCode = extractInviteCode(redeemCode).toUpperCase();
     if (!inviteCode) return;
     setBusy(true);
     setStatus(copy.redeeming);
     try {
+      const proof = await createSolanaWalletActionProof({
+        action: "invite-redeem",
+        cluster: SOLANA_CLUSTER,
+        wallet: solanaWallet,
+        inviteCode,
+        signMessage,
+      });
       const response = await fetch(`${GAME_API_URL}/api/arena/invite/redeem`, {
         method: "POST",
         headers: buildArenaWriteHeaders(),
-        body: JSON.stringify({ wallet: solanaWallet, inviteCode }),
+        body: JSON.stringify({ wallet: solanaWallet, inviteCode, ...proof }),
       });
       const payload = (await response.json()) as {
         error?: string;
         result?: { alreadyRedeemed?: boolean };
       };
       if (!response.ok) throw new Error(payload.error || copy.redeemFailed);
-      setStatus(
-        payload.result?.alreadyRedeemed ? copy.alreadyRedeemed : copy.redeemed,
-      );
+      const completionStatus = payload.result?.alreadyRedeemed
+        ? copy.alreadyRedeemed
+        : copy.redeemed;
       setRedeemCode("");
       await refresh();
+      setStatus(completionStatus);
     } catch (cause) {
       setStatus(cause instanceof Error ? cause.message : copy.redeemFailed);
     } finally {
       setBusy(false);
     }
-  }, [copy, redeemCode, refresh, solanaWallet]);
+  }, [copy, redeemCode, refresh, signMessage, solanaWallet]);
+
+  const createInviteCode = useCallback(async () => {
+    if (!solanaWallet) return;
+    if (!signMessage) {
+      setStatus(copy.walletProofUnavailable);
+      return;
+    }
+    setBusy(true);
+    setStatus(copy.creating);
+    try {
+      const proof = await createSolanaWalletActionProof({
+        action: "invite-register",
+        cluster: SOLANA_CLUSTER,
+        wallet: solanaWallet,
+        inviteCode: null,
+        signMessage,
+      });
+      const response = await fetch(
+        `${GAME_API_URL}/api/arena/invite/register`,
+        {
+          method: "POST",
+          headers: buildArenaWriteHeaders(),
+          body: JSON.stringify({ wallet: solanaWallet, ...proof }),
+        },
+      );
+      const payload = (await response.json()) as {
+        error?: string;
+        inviteCode?: string;
+      };
+      if (!response.ok || !payload.inviteCode) {
+        throw new Error(payload.error || copy.unavailable);
+      }
+      await refresh();
+      setStatus(copy.created);
+    } catch (cause) {
+      setStatus(cause instanceof Error ? cause.message : copy.unavailable);
+    } finally {
+      setBusy(false);
+    }
+  }, [copy, refresh, signMessage, solanaWallet]);
 
   const copyLink = useCallback(async () => {
     if (!invite?.inviteCode) return;
@@ -203,9 +271,16 @@ export function SolanaReferralPanel({
         border: "1px solid rgba(255,255,255,0.08)",
       }}
     >
-      <div style={{ fontSize: 12, textTransform: "uppercase", opacity: 0.65 }}>
+      <h2
+        style={{
+          margin: 0,
+          fontSize: 12,
+          textTransform: "uppercase",
+          opacity: 0.65,
+        }}
+      >
         {copy.title}
-      </div>
+      </h2>
       {!solanaWallet ? (
         <div style={{ fontSize: 12, opacity: 0.65 }}>{copy.connect}</div>
       ) : (
@@ -213,12 +288,12 @@ export function SolanaReferralPanel({
           <div style={{ fontSize: 11, opacity: 0.65 }}>
             {shortWallet(solanaWallet)}
           </div>
-          {points?.referredBy ? (
+          {points?.referred ? (
             <div
               data-testid="referral-panel-referred-by"
               style={{ color: "#4ade80", fontSize: 11 }}
             >
-              {copy.referredBy(shortWallet(points.referredBy.wallet))}
+              {copy.referralActive}
             </div>
           ) : null}
           <div style={{ display: "flex", gap: 12, fontSize: 12 }}>
@@ -247,30 +322,49 @@ export function SolanaReferralPanel({
             >
               {invite?.inviteCode ?? "-"}
             </code>
-            <button
-              type="button"
-              onClick={() => void copyLink()}
-              disabled={!invite?.inviteCode}
-            >
-              {copy.copy}
-            </button>
+            {invite?.inviteCode ? (
+              <button
+                type="button"
+                onClick={() => void copyLink()}
+                style={{ minHeight: 44 }}
+              >
+                {copy.copy}
+              </button>
+            ) : (
+              <button
+                type="button"
+                data-testid="referral-panel-create-button"
+                onClick={() => void createInviteCode()}
+                disabled={!invite || !signMessage || busy}
+                style={{ minHeight: 44 }}
+              >
+                {busy ? copy.creating : copy.create}
+              </button>
+            )}
           </div>
+          {!signMessage ? (
+            <div style={{ fontSize: 11, color: "#fbbf24" }}>
+              {copy.walletProofUnavailable}
+            </div>
+          ) : null}
         </>
       )}
       <div style={{ display: "flex", gap: 8 }}>
         <input
           data-testid="referral-panel-redeem-input"
+          aria-label={copy.placeholder}
           value={redeemCode}
           onChange={(event) => setRedeemCode(event.target.value)}
           placeholder={copy.placeholder}
           disabled={!solanaWallet || busy}
-          style={{ flex: 1, padding: "10px 12px" }}
+          style={{ flex: 1, minHeight: 44, padding: "10px 12px" }}
         />
         <button
           type="button"
           data-testid="referral-panel-redeem-button"
           onClick={() => void redeem()}
-          disabled={!solanaWallet || busy || !redeemCode.trim()}
+          disabled={!solanaWallet || !signMessage || busy || !redeemCode.trim()}
+          style={{ minHeight: 44 }}
         >
           {copy.redeem}
         </button>

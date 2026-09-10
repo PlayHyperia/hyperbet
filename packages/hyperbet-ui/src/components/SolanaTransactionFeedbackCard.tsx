@@ -34,6 +34,7 @@ type SolanaTransactionFeedbackCardProps = {
   testId: string;
   signatureTestId: string;
   signatureLabel: string;
+  detailsLabel: string;
   receiptLabel: string;
   reviewLabel: string;
   checkStatusLabel: string;
@@ -47,6 +48,7 @@ export function SolanaTransactionFeedbackCard({
   testId,
   signatureTestId,
   signatureLabel,
+  detailsLabel,
   receiptLabel,
   reviewLabel,
   checkStatusLabel,
@@ -64,6 +66,33 @@ export function SolanaTransactionFeedbackCard({
     isError &&
     feedback.signature !== null &&
     feedback.recovery.retryMode === "CHECK_STATUS_FIRST";
+  const signatureProof = feedback.signature ? (
+    <div style={{ display: "grid", gap: 3 }}>
+      <span
+        style={{
+          color: "rgba(255,255,255,0.7)",
+          fontSize: 10,
+          fontWeight: 700,
+          letterSpacing: "0.05em",
+          textTransform: "uppercase",
+        }}
+      >
+        {signatureLabel}
+      </span>
+      <code
+        data-testid={signatureTestId}
+        style={{
+          color: "rgba(255,255,255,0.72)",
+          fontSize: 10,
+          lineHeight: 1.5,
+          overflowWrap: "anywhere",
+          userSelect: "all",
+        }}
+      >
+        {feedback.signature}
+      </code>
+    </div>
+  ) : null;
   const tone = isError
     ? {
         border: "rgba(248,113,113,0.42)",
@@ -138,33 +167,46 @@ export function SolanaTransactionFeedbackCard({
         </strong>
       </div>
 
-      {feedback.signature ? (
-        <div style={{ display: "grid", gap: 3 }}>
-          <span
+      {isConfirmed && signatureProof ? (
+        <details data-testid={`${testId}-details`}>
+          <summary
             style={{
-              color: "rgba(255,255,255,0.7)",
-              fontSize: 10,
+              display: "list-item",
+              minHeight: 44,
+              color: "#bfdbfe",
+              cursor: "pointer",
+              fontSize: 11,
               fontWeight: 700,
-              letterSpacing: "0.05em",
-              textTransform: "uppercase",
+              lineHeight: "44px",
             }}
           >
-            {signatureLabel}
-          </span>
-          <code
-            data-testid={signatureTestId}
-            style={{
-              color: "rgba(255,255,255,0.72)",
-              fontSize: 10,
-              lineHeight: 1.5,
-              overflowWrap: "anywhere",
-              userSelect: "all",
-            }}
-          >
-            {feedback.signature}
-          </code>
-        </div>
-      ) : null}
+            {detailsLabel}
+          </summary>
+          <div style={{ display: "grid", gap: 4, paddingBottom: 4 }}>
+            {signatureProof}
+            {explorerUrl ? (
+              <a
+                href={explorerUrl}
+                target="_blank"
+                rel="noreferrer"
+                aria-label={`${receiptLabel}: ${signatureLabel}`}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  minHeight: 44,
+                  color: "#bfdbfe",
+                  fontSize: 11,
+                  fontWeight: 700,
+                }}
+              >
+                {receiptLabel}
+              </a>
+            ) : null}
+          </div>
+        </details>
+      ) : (
+        signatureProof
+      )}
 
       {feedback.warning ? (
         <span
@@ -175,7 +217,7 @@ export function SolanaTransactionFeedbackCard({
         </span>
       ) : null}
 
-      {explorerUrl || isError ? (
+      {(!isConfirmed && explorerUrl) || isError ? (
         <div
           style={{
             display: "flex",
@@ -190,7 +232,15 @@ export function SolanaTransactionFeedbackCard({
               target="_blank"
               rel="noreferrer"
               aria-label={`${receiptLabel}: ${signatureLabel}`}
-              style={{ color: "#bfdbfe", fontSize: 11, fontWeight: 700 }}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                minHeight: 44,
+                padding: "6px 2px",
+                color: "#bfdbfe",
+                fontSize: 11,
+                fontWeight: 700,
+              }}
             >
               {receiptLabel}
             </a>
@@ -201,7 +251,7 @@ export function SolanaTransactionFeedbackCard({
               onClick={onReview}
               data-testid={`${testId}-action`}
               style={{
-                minHeight: 32,
+                minHeight: 44,
                 padding: "7px 10px",
                 borderRadius: "var(--hm-radius)",
                 border: "1px solid rgba(148,163,184,0.42)",

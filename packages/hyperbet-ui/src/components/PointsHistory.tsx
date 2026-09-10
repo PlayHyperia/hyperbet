@@ -82,6 +82,7 @@ function getHistoryCopy(locale: UiLocale) {
         page: (page: number, totalPages: number, total: number) =>
           `第 ${page} / ${totalPages} 页，共 ${total.toLocaleString(getLocaleTag(locale))} 条`,
         pts: "积分",
+        eventFilter: "历史事件筛选",
       }
     : {
         history: "History",
@@ -95,6 +96,7 @@ function getHistoryCopy(locale: UiLocale) {
         page: (page: number, totalPages: number, total: number) =>
           `Page ${page} of ${totalPages} (${total.toLocaleString(getLocaleTag(locale))} total)`,
         pts: "pts",
+        eventFilter: "History event filter",
       };
 }
 
@@ -215,6 +217,7 @@ export function PointsHistory({
     return (
       <div
         data-testid="points-history-placeholder"
+        role="status"
         style={{
           padding: "16px",
           borderRadius: 12,
@@ -248,8 +251,9 @@ export function PointsHistory({
           alignItems: "center",
         }}
       >
-        <div
+        <h2
           style={{
+            margin: 0,
             fontSize: 13,
             fontWeight: 700,
             textTransform: "uppercase",
@@ -258,10 +262,11 @@ export function PointsHistory({
           }}
         >
           {copy.history}
-        </div>
+        </h2>
 
         <select
           data-testid="points-history-filter"
+          aria-label={copy.eventFilter}
           value={eventFilter}
           onChange={(event) => setEventFilter(event.target.value)}
           style={{
@@ -285,6 +290,7 @@ export function PointsHistory({
 
       {loading && entries.length === 0 && (
         <div
+          role="status"
           style={{
             fontSize: 12,
             color: "rgba(255,255,255,0.3)",
@@ -298,6 +304,7 @@ export function PointsHistory({
 
       {!loading && entries.length === 0 && (
         <div
+          role={error ? "alert" : "status"}
           style={{
             fontSize: 12,
             color: error ? "#fca5a5" : "rgba(255,255,255,0.3)",
@@ -321,94 +328,102 @@ export function PointsHistory({
             overflow: "hidden",
           }}
         >
-          {entries.map((entry) => {
-            const meta = eventLabels[entry.eventType] ?? {
-              label: entry.eventType,
-              icon: "•",
-            };
-            const isPositive = entry.totalPoints > 0;
+          <div role="list" aria-label={copy.history}>
+            {entries.map((entry) => {
+              const meta = eventLabels[entry.eventType] ?? {
+                label: entry.eventType,
+                icon: "•",
+              };
+              const isPositive = entry.totalPoints > 0;
 
-            return (
-              <div
-                key={entry.id}
-                data-testid={`points-history-row-${entry.id}`}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  padding: "10px 14px",
-                  gap: 10,
-                  borderBottom: "1px solid rgba(255,255,255,0.03)",
-                  transition: "background 0.15s",
-                }}
-                onMouseEnter={(event) => {
-                  event.currentTarget.style.background =
-                    "rgba(255,255,255,0.03)";
-                }}
-                onMouseLeave={(event) => {
-                  event.currentTarget.style.background = "transparent";
-                }}
-              >
-                <span style={{ fontSize: 16, width: 24, textAlign: "center" }}>
-                  {meta.icon}
-                </span>
-
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      fontWeight: 600,
-                      color: "rgba(255,255,255,0.85)",
-                    }}
-                  >
-                    {meta.label}
-                  </div>
-                  <div
-                    style={{
-                      fontSize: 10,
-                      color: "rgba(255,255,255,0.35)",
-                      display: "flex",
-                      gap: 6,
-                    }}
-                  >
-                    <span>
-                      {formatTimestamp(entry.createdAt, resolvedLocale)}
-                    </span>
-                    {entry.relatedWallet ? (
-                      <span>
-                        &middot; {truncateWallet(entry.relatedWallet)}
-                      </span>
-                    ) : null}
-                    {entry.status !== "CONFIRMED" ? (
-                      <span
-                        style={{
-                          color:
-                            entry.status === "PENDING" ? "#facc15" : "#fca5a5",
-                        }}
-                      >
-                        &middot;{" "}
-                        {formatEntryStatus(entry.status, resolvedLocale)}
-                      </span>
-                    ) : null}
-                  </div>
-                </div>
-
+              return (
                 <div
+                  role="listitem"
+                  key={entry.id}
+                  data-testid={`points-history-row-${entry.id}`}
                   style={{
-                    fontSize: 13,
-                    fontWeight: 700,
-                    color: isPositive ? "#4ade80" : "#fca5a5",
-                    whiteSpace: "nowrap",
+                    display: "flex",
+                    alignItems: "center",
+                    padding: "10px 14px",
+                    gap: 10,
+                    borderBottom: "1px solid rgba(255,255,255,0.03)",
+                    transition: "background 0.15s",
+                  }}
+                  onMouseEnter={(event) => {
+                    event.currentTarget.style.background =
+                      "rgba(255,255,255,0.03)";
+                  }}
+                  onMouseLeave={(event) => {
+                    event.currentTarget.style.background = "transparent";
                   }}
                 >
-                  {isPositive ? "+" : ""}
-                  {entry.totalPoints.toLocaleString(
-                    getLocaleTag(resolvedLocale),
-                  )}{" "}
-                  {copy.pts}
+                  <span
+                    aria-hidden="true"
+                    style={{ fontSize: 16, width: 24, textAlign: "center" }}
+                  >
+                    {meta.icon}
+                  </span>
+
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 600,
+                        color: "rgba(255,255,255,0.85)",
+                      }}
+                    >
+                      {meta.label}
+                    </div>
+                    <div
+                      style={{
+                        fontSize: 10,
+                        color: "rgba(255,255,255,0.35)",
+                        display: "flex",
+                        gap: 6,
+                      }}
+                    >
+                      <span>
+                        {formatTimestamp(entry.createdAt, resolvedLocale)}
+                      </span>
+                      {entry.relatedWallet ? (
+                        <span>
+                          &middot; {truncateWallet(entry.relatedWallet)}
+                        </span>
+                      ) : null}
+                      {entry.status !== "CONFIRMED" ? (
+                        <span
+                          style={{
+                            color:
+                              entry.status === "PENDING"
+                                ? "#facc15"
+                                : "#fca5a5",
+                          }}
+                        >
+                          &middot;{" "}
+                          {formatEntryStatus(entry.status, resolvedLocale)}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: isPositive ? "#4ade80" : "#fca5a5",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {isPositive ? "+" : ""}
+                    {entry.totalPoints.toLocaleString(
+                      getLocaleTag(resolvedLocale),
+                    )}{" "}
+                    {copy.pts}
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
 
           <div
             style={{
@@ -424,6 +439,7 @@ export function PointsHistory({
               onClick={() => setPage((current) => Math.max(0, current - 1))}
               disabled={page === 0}
               style={{
+                minHeight: 44,
                 padding: "6px 14px",
                 borderRadius: 6,
                 border: "1px solid rgba(255,255,255,0.1)",
@@ -440,7 +456,11 @@ export function PointsHistory({
             >
               {copy.prev}
             </button>
-            <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>
+            <span
+              role="status"
+              aria-live="polite"
+              style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}
+            >
               {copy.page(page + 1, totalPages, total)}
             </span>
             <button
@@ -448,6 +468,7 @@ export function PointsHistory({
               onClick={() => setPage((current) => current + 1)}
               disabled={page + 1 >= totalPages}
               style={{
+                minHeight: 44,
                 padding: "6px 14px",
                 borderRadius: 6,
                 border: "1px solid rgba(255,255,255,0.1)",

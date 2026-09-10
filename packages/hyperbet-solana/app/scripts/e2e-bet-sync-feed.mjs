@@ -22,6 +22,35 @@ const canonicalWinReasons = new Set([
   "damage_advantage",
   "draw",
 ]);
+const strategyApproaches = new Set([
+  "aggressive",
+  "defensive",
+  "balanced",
+  "outlast",
+]);
+const strategyMacros = new Set([
+  "pressure",
+  "hold_range",
+  "kite",
+  "orbit",
+  "defensive_reset",
+  "finish",
+]);
+const strategyAttackStyles = new Set([
+  "accurate",
+  "aggressive",
+  "controlled",
+  "defensive",
+]);
+const strategyPrayers = new Set([
+  "superhuman_strength",
+  "rock_skin",
+  "hawk_eye",
+  "mystic_lore",
+]);
+const strategyRoles = new Set(["melee", "ranged", "mage"]);
+const strategySources = new Set(["model", "deterministic", "diagnostic"]);
+const safePolicyVersion = /^[a-z0-9][a-z0-9._-]{0,127}$/;
 
 function toNullableString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -31,7 +60,73 @@ function toNullableInteger(value) {
   return Number.isSafeInteger(value) ? value : null;
 }
 
-function normalizeAgent(value) {
+function hasExactKeys(value, expected) {
+  const actual = Object.keys(value).sort();
+  const canonical = [...expected].sort();
+  return (
+    actual.length === canonical.length &&
+    actual.every((key, index) => key === canonical[index])
+  );
+}
+
+function normalizeStrategySummary(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (
+    !hasExactKeys(value, [
+      "schemaVersion",
+      "approach",
+      "tacticalMacro",
+      "attackStyle",
+      "prayer",
+      "preferredCombatRole",
+      "foodThreshold",
+      "switchDefensiveAt",
+      "source",
+      "policyVersion",
+    ]) ||
+    value.schemaVersion !== 1 ||
+    !strategyApproaches.has(value.approach) ||
+    !strategyMacros.has(value.tacticalMacro) ||
+    !strategyAttackStyles.has(value.attackStyle) ||
+    !(value.prayer === null || strategyPrayers.has(value.prayer)) ||
+    !(
+      value.preferredCombatRole === null ||
+      strategyRoles.has(value.preferredCombatRole)
+    ) ||
+    !Number.isSafeInteger(value.foodThreshold) ||
+    value.foodThreshold < 20 ||
+    value.foodThreshold > 60 ||
+    !Number.isSafeInteger(value.switchDefensiveAt) ||
+    value.switchDefensiveAt < 20 ||
+    value.switchDefensiveAt > 40 ||
+    !strategySources.has(value.source) ||
+    typeof value.policyVersion !== "string" ||
+    !safePolicyVersion.test(value.policyVersion)
+  ) {
+    return null;
+  }
+  return { ...value };
+}
+
+function strategySummaryFromContestant(contestant) {
+  const preparation = contestant?.preparation;
+  const tacticalStrategy = preparation?.tacticalStrategy;
+  if (!preparation || !tacticalStrategy) return null;
+  return normalizeStrategySummary({
+    schemaVersion: 1,
+    approach: tacticalStrategy.approach,
+    tacticalMacro: tacticalStrategy.tacticalMacro,
+    attackStyle: tacticalStrategy.attackStyle,
+    prayer: tacticalStrategy.prayer,
+    preferredCombatRole: tacticalStrategy.preferredCombatRole,
+    foodThreshold: tacticalStrategy.foodThreshold,
+    switchDefensiveAt: tacticalStrategy.switchDefensiveAt,
+    source: preparation.planningSource,
+    policyVersion: preparation.planningPolicyVersion,
+  });
+}
+
+function normalizeAgent(value, contestant) {
   if (!value || typeof value !== "object") return null;
   const id = toNullableString(value.id);
   const name = toNullableString(value.name);
@@ -63,6 +158,13 @@ function normalizeAgent(value) {
   ) {
     return null;
   }
+  const strategySummary = Object.prototype.hasOwnProperty.call(
+    value,
+    "strategySummary",
+  )
+    ? normalizeStrategySummary(value.strategySummary)
+    : strategySummaryFromContestant(contestant);
+  if (!strategySummary) return null;
   return {
     id,
     name,
@@ -77,6 +179,7 @@ function normalizeAgent(value) {
     rank: value.rank,
     headToHeadWins: value.headToHeadWins,
     headToHeadLosses: value.headToHeadLosses,
+    strategySummary,
   };
 }
 
@@ -101,8 +204,25 @@ function toBetSyncState(streamState) {
       ? sourceWinReason
       : null;
   const emittedAt = toNullableInteger(streamState.emittedAt) ?? Date.now();
-  const agent1 = duelId ? normalizeAgent(cycle.agent1) : null;
-  const agent2 = duelId ? normalizeAgent(cycle.agent2) : null;
+  const contestants = Array.isArray(cycle.competitiveSnapshot?.contestants)
+    ? cycle.competitiveSnapshot.contestants
+    : [];
+  const agent1 = duelId
+    ? normalizeAgent(
+        cycle.agent1,
+        contestants.find(
+          (contestant) => contestant?.agentId === cycle.agent1?.id,
+        ),
+      )
+    : null;
+  const agent2 = duelId
+    ? normalizeAgent(
+        cycle.agent2,
+        contestants.find(
+          (contestant) => contestant?.agentId === cycle.agent2?.id,
+        ),
+      )
+    : null;
   const explicitOutcome = ["win", "draw", "cancelled"].includes(cycle.outcome)
     ? cycle.outcome
     : null;
@@ -116,6 +236,7 @@ function toBetSyncState(streamState) {
   const requestedFightStartTime = toNullableInteger(cycle.fightStartTime);
   const duelEndTime = toNullableInteger(cycle.duelEndTime);
   const fightStartTime = normalizeFightStartTime({
+    phase,
     scheduledFightStartTime: requestedFightStartTime,
     duelEndTime,
     emittedAt,

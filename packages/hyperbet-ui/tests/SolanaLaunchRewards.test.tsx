@@ -6,7 +6,7 @@ import { SolanaPointsDisplay } from "../src/components/SolanaPointsDisplay";
 import { SolanaReferralPanel } from "../src/components/SolanaReferralPanel";
 import { PointsHistory } from "../src/components/PointsHistory";
 import { PointsLeaderboard } from "../src/components/PointsLeaderboard";
-import { render } from "./render";
+import { getByTestId, render } from "./render";
 
 const originalFetch = globalThis.fetch;
 
@@ -18,6 +18,9 @@ async function flushEffects() {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  (
+    window as unknown as { happyDOM: { setURL: (url: string) => void } }
+  ).happyDOM.setURL("http://localhost/");
 });
 
 describe("Solana launch rewards UI", () => {
@@ -76,6 +79,104 @@ describe("Solana launch rewards UI", () => {
     expect(container.textContent).not.toContain("Link Wallets");
   });
 
+  it("creates and redeems invite codes only after an exact wallet signature", async () => {
+    const wallet = "11111111111111111111111111111111";
+    let inviteCode: string | null = null;
+    const signedMessages: string[] = [];
+    const postedBodies: Array<Record<string, unknown>> = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      if (init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        postedBodies.push(body);
+        if (url.endsWith("/api/arena/invite/register")) {
+          inviteCode = "HS12AB34CD";
+          return Response.json({ wallet, inviteCode });
+        }
+        return Response.json({
+          result: { alreadyRedeemed: false, signupBonus: 50 },
+        });
+      }
+      if (url.includes("/api/arena/invite/")) {
+        return Response.json({
+          inviteCode,
+          invitedWalletCount: 0,
+          activeReferralCount: 0,
+          pendingSignupBonuses: 0,
+          totalReferralWinPoints: 0,
+        });
+      }
+      return Response.json({ totalPoints: 0, referred: false });
+    }) as typeof fetch;
+
+    const signMessage = async (message: Uint8Array) => {
+      signedMessages.push(new TextDecoder().decode(message));
+      return new Uint8Array(64).fill(9);
+    };
+    const firstRender = render(
+      <SolanaReferralPanel solanaWallet={wallet} signMessage={signMessage} />,
+    );
+    let container = firstRender.container;
+    await flushEffects();
+
+    await act(async () => {
+      getByTestId(container, "referral-panel-create-button").click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await flushEffects();
+    expect(
+      getByTestId(container, "referral-panel-invite-code").textContent,
+    ).toBe("HS12AB34CD");
+    expect(getByTestId(container, "referral-panel-status").textContent).toBe(
+      "Invite code created",
+    );
+
+    firstRender.unmount();
+    (
+      window as unknown as { happyDOM: { setURL: (url: string) => void } }
+    ).happyDOM.setURL("http://localhost/?invite=HS12AB34CD");
+    const secondRender = render(
+      <SolanaReferralPanel solanaWallet={wallet} signMessage={signMessage} />,
+    );
+    container = secondRender.container;
+    await flushEffects();
+
+    const redeemInput = getByTestId(
+      container,
+      "referral-panel-redeem-input",
+    ) as HTMLInputElement;
+    expect(redeemInput.disabled).toBe(false);
+    expect(redeemInput.value).toBe("HS12AB34CD");
+    await flushEffects();
+    const redeemButton = getByTestId(
+      container,
+      "referral-panel-redeem-button",
+    ) as HTMLButtonElement;
+    expect(redeemButton.disabled).toBe(false);
+    await act(async () => {
+      redeemButton.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await flushEffects();
+
+    expect(signedMessages).toHaveLength(2);
+    expect(signedMessages[0]).toContain("Action: invite-register");
+    expect(signedMessages[0]).toContain("Invite Code: none");
+    expect(signedMessages[1]).toContain("Action: invite-redeem");
+    expect(signedMessages[1]).toContain("Invite Code: HS12AB34CD");
+    expect(postedBodies).toHaveLength(2);
+    expect(getByTestId(container, "referral-panel-status").textContent).toBe(
+      "Invite code redeemed",
+    );
+    for (const body of postedBodies) {
+      expect(body.wallet).toBe(wallet);
+      expect(body.issuedAtMs).toEqual(expect.any(Number));
+      expect(body.signature).toEqual(
+        expect.stringMatching(/^[A-Za-z0-9+/]{86}==$/u),
+      );
+    }
+  });
+
   it("renders every points event emitted by the SOL launch ledger", async () => {
     globalThis.fetch = (async () =>
       Response.json({
@@ -125,6 +226,15 @@ describe("Solana launch rewards UI", () => {
       "SIGNUP_REFERRER",
       "SIGNUP_REFEREE",
     ]);
+    expect(
+      container
+        .querySelector('[data-testid="points-history-filter"]')
+        ?.getAttribute("aria-label"),
+    ).toBe("History event filter");
+    expect(
+      container.querySelector('[role="list"]')?.getAttribute("aria-label"),
+    ).toBe("History");
+    expect(container.querySelectorAll('[role="listitem"]')).toHaveLength(2);
     expect(container.textContent).not.toContain("Staking");
     expect(container.textContent).not.toContain("Wallet Link");
   });
@@ -148,6 +258,16 @@ describe("Solana launch rewards UI", () => {
     expect(requestUrl.searchParams.get("scope")).toBeNull();
     expect(requestUrl.searchParams.get("window")).toBe("alltime");
     expect(container.textContent).toContain("1,250");
+    expect(
+      container.querySelector('[role="table"]')?.getAttribute("aria-label"),
+    ).toBe("Leaderboard");
+    expect(container.querySelectorAll('[role="rowgroup"]')).toHaveLength(2);
+    expect(container.querySelectorAll('[role="row"]')).toHaveLength(2);
+    expect(
+      container
+        .querySelector('[data-testid="points-leaderboard-window-alltime"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("true");
     expect(
       container.querySelector('[data-testid^="points-leaderboard-scope-"]'),
     ).toBeNull();

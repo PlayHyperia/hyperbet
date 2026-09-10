@@ -11,16 +11,24 @@ import {
 } from "@solana/web3.js";
 import {
   buildQuotePlan,
+  classifyManagedLiquiditySubmissionError,
   DEFAULT_MARKET_MAKER_CONFIG,
   evaluateQuoteDecision,
+  resolveManagedMarketMakerSettlement,
   type MarketSnapshot,
   type QuotePlan,
 } from "./solanaMarketMakerPolicy";
+import { createKeeperBotHeartbeat } from "./botHeartbeat";
+import {
+  buildDuelCorrelationId,
+  normalizeDuelCorrelationIds,
+} from "./duelCorrelation";
 import type {
   KeeperBotHealthSnapshot,
   KeeperMarketHealthRecord,
   KeeperRecoveryState,
 } from "./launchHealth";
+import { buildKeeperOperatorMetrics } from "./keeperOperatorMetrics";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 
@@ -29,6 +37,7 @@ import {
   duelKeyHexToBytes,
   DUEL_WINNER_MARKET_KIND,
   enumIs,
+  FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION,
   findClobVaultPda,
   findDuelStatePda,
   findMarketConfigPda,
@@ -38,20 +47,25 @@ import {
   findPriceLevelPda,
   findProposalRecordPda,
   findUserBalancePda,
-  ORDER_BEHAVIOR_GTC,
+  getRpcUrl,
+  ORDER_BEHAVIOR_POST_ONLY,
   SIDE_ASK,
   SIDE_BID,
   readKeypair,
   sanitizeErrorMessage,
 } from "./launchCommon";
 import {
+  resolveConfiguredLaunchWallet,
   resolveKeeperRoleRefs,
+  validateKeeperFeeTreasurySeparation,
   validateKeeperRoleSeparation,
 } from "./keeperRoles";
+import { resolveClusterLaunchFeePolicy } from "./feePolicy";
+import { resolveOracleDisputeWindowSeconds } from "./oracleDisputeWindowPolicy";
 import {
-  resolveApprovedLaunchFeePolicy,
-  resolveLaunchFeePolicy,
-} from "./feePolicy";
+  parseManagedLiquiditySolLamports,
+  resolveClusterManagedLiquidityRiskPolicy,
+} from "./managedLiquidityRiskPolicy";
 import {
   buildDuelCancellationMetadata,
   buildDuelLifecycleMetadata,
@@ -64,7 +78,10 @@ import {
   type OracleCancellationState,
   type DuelTerminalDisposition,
 } from "./duelTerminalPolicy";
-import { resolveDuelFeedConfig } from "./feedConfig";
+import {
+  resolveDuelFeedConfig,
+  resolveLocalDiagnosticDuelFeed,
+} from "./feedConfig";
 import type { PredictionMarketWinner } from "./solanaLifecycle";
 import { buildResultHash } from "./resultHash";
 import {
@@ -77,13 +94,16 @@ import { getExponentialBackoffMs } from "./retryBackoff";
 import {
   discoverDuelMarketRecovery,
   planManagedOrderClosure,
+  requiresRestartMarketReconciliation,
+  resolveManagedOrderClosurePriceLevel,
+  type ManagedOrderClosurePriceLevel,
   type MarketRecoveryIssue,
   type ProgramAccountSnapshot,
 } from "./marketRecovery";
 import {
   deriveProgramDataAddress,
   fetchUpgradeableProgramIdentity,
-  resolveExpectedUpgradeAuthority,
+  resolveClusterExpectedUpgradeAuthority,
 } from "./solanaProgramIdentity";
 import {
   buildClobQuotePlanningSnapshot,
@@ -92,30 +112,37 @@ import {
   quantizeClobOrderLamports,
   resolveManagedClobQuoteTiming,
 } from "./clobOrderSizing";
+import releaseManifest from "./release-manifest.json";
+import { resolveKeeperReleaseIdentity } from "./releaseIdentity";
+import {
+  resolveDuelBotHealthServerConfig,
+  startDuelBotHealthServer,
+} from "./botHealthServer";
+import {
+  assertDuelBotRuntimeRole,
+  isProtectedKeeperRuntimeEnvironment,
+} from "./runtimeRolePolicy";
+import { assertSolanaMarketCreationAllowed } from "./realValueLaunchPolicy";
+import { parseKeeperBotHealthSnapshot } from "./readiness";
+import { resolveKeeperRuntimeIdentity } from "./runtimeIdentity";
+import { ensureIdempotentAccountInitialized } from "./idempotentAccountInitialization";
+import { requireAccountU64, requireSafeAccountInteger } from "./accountInteger";
+import {
+  reconcileTerminalMarketCustody,
+  releaseResolvedTradeFeesFailClosed,
+} from "./terminalMarketCustody";
+import {
+  extractRecoverableTransactionSignature,
+  waitForConfirmedTransactionSignature,
+} from "./transactionRecovery";
 
-const DEFAULT_DISPUTE_WINDOW_SECS = 3600;
-
-function asNum(value: unknown, fallback = 0): number {
-  if (typeof value === "number") return value;
-  if (typeof value === "bigint") return Number(value);
-  if (value && typeof value === "object" && "toString" in value) {
-    const parsed = Number((value as { toString: () => string }).toString());
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return fallback;
-}
-
-function asAccountBigInt(value: unknown): bigint {
-  if (typeof value === "bigint") return value;
-  if (typeof value === "number" && Number.isSafeInteger(value)) {
-    return BigInt(value);
-  }
-  if (value && typeof value === "object" && "toString" in value) {
-    const text = (value as { toString: () => string }).toString();
-    if (/^\d+$/.test(text)) return BigInt(text);
-  }
-  throw new Error("market account contains an invalid lamport counter");
-}
+const PROTECTED_KEEPER_RUNTIME = isProtectedKeeperRuntimeEnvironment(
+  process.env.NODE_ENV,
+);
+assertDuelBotRuntimeRole({
+  production: PROTECTED_KEEPER_RUNTIME,
+  runtimeRole: process.env.HYPERBET_RUNTIME_ROLE,
+});
 
 function hashParticipant(
   agent: { id?: string; name?: string } | null,
@@ -144,27 +171,6 @@ function toByteArray32(value: unknown): number[] | null {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function extractTxSignature(error: unknown): string | null {
-  const message = (error as Error)?.message ?? "";
-  const match = message.match(/signature\s+([1-9A-HJ-NP-Za-km-z]{32,88})/i);
-  return match?.[1] ?? null;
-}
-
-function isIgnorableRaceError(error: unknown): boolean {
-  const message = (error as Error)?.message ?? "";
-  return (
-    message.includes("MarketNotOpen") ||
-    message.includes("BettingClosed") ||
-    message.includes("MarketAlreadyResolved") ||
-    message.includes("OracleNotResolved") ||
-    message.includes("MatchAlreadyResolved") ||
-    message.includes("BetWindowStillOpen") ||
-    message.includes("MarketAlreadyHasUserBets") ||
-    message.includes("LiquidityAlreadySeeded") ||
-    message.includes("SeedWindowNotReached")
-  );
 }
 
 function isFundingError(error: unknown): boolean {
@@ -199,31 +205,38 @@ async function waitForTxBySignature(
   signature: string,
   timeoutMs = 90_000,
 ): Promise<boolean> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const statuses = await connection.getSignatureStatuses([signature], {
-      searchTransactionHistory: true,
-    });
-    const status = statuses.value[0];
-    if (status) {
-      if (status.err) return false;
-      if (status.confirmationStatus) return true;
-    }
-    await sleep(2_000);
-  }
-  return false;
+  return waitForConfirmedTransactionSignature({
+    timeoutMs,
+    getStatus: async () => {
+      const statuses = await connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: true,
+      });
+      const status = statuses.value[0];
+      return status
+        ? {
+            err: status.err,
+            confirmationStatus: status.confirmationStatus ?? null,
+          }
+        : null;
+    },
+  });
 }
 
 async function runWithRecovery<T>(
   fn: () => Promise<T>,
   connection: Connection,
+  signatureRecoveryTimeoutMs = 90_000,
 ): Promise<T> {
   try {
     return await fn();
   } catch (error) {
-    const signature = extractTxSignature(error);
+    const signature = extractRecoverableTransactionSignature(error);
     if (!signature) throw error;
-    const ok = await waitForTxBySignature(connection, signature);
+    const ok = await waitForTxBySignature(
+      connection,
+      signature,
+      signatureRecoveryTimeoutMs,
+    );
     if (!ok) throw error;
     return undefined as T;
   }
@@ -257,17 +270,23 @@ const args = await yargs(hideBin(process.argv))
   })
   .option("trade-treasury-fee-bps", {
     type: "number",
-    default: Number(process.env.TRADE_TREASURY_FEE_BPS || 100),
+    default: process.env.TRADE_TREASURY_FEE_BPS?.trim()
+      ? Number(process.env.TRADE_TREASURY_FEE_BPS)
+      : undefined,
     describe: "Trade fee in basis points routed to treasury wallet",
   })
   .option("trade-market-maker-fee-bps", {
     type: "number",
-    default: Number(process.env.TRADE_MARKET_MAKER_FEE_BPS || 100),
+    default: process.env.TRADE_MARKET_MAKER_FEE_BPS?.trim()
+      ? Number(process.env.TRADE_MARKET_MAKER_FEE_BPS)
+      : undefined,
     describe: "Trade fee in basis points routed to market maker wallet",
   })
   .option("winnings-market-maker-fee-bps", {
     type: "number",
-    default: Number(process.env.WINNINGS_MARKET_MAKER_FEE_BPS || 200),
+    default: process.env.WINNINGS_MARKET_MAKER_FEE_BPS?.trim()
+      ? Number(process.env.WINNINGS_MARKET_MAKER_FEE_BPS)
+      : undefined,
     describe: "Winnings fee in basis points routed to market maker wallet",
   })
   .option("game-url", {
@@ -279,6 +298,11 @@ const args = await yargs(hideBin(process.argv))
   .parse();
 
 import { type DuelLifecycleEvent, GameClient } from "./game-client";
+import { resolveDuelLifecycleTiming } from "./duelLifecycleTiming";
+import {
+  isCurrentDuelRendererObservation,
+  resolveDuelMarketAdmission,
+} from "./marketCreationAdmission";
 
 import path from "node:path";
 import fs_node from "node:fs";
@@ -290,6 +314,7 @@ const botCluster = (
 )
   .toLowerCase()
   .trim();
+assertSolanaMarketCreationAllowed(botCluster);
 const keeperRoleRefs = resolveKeeperRoleRefs(process.env);
 const keeperFeePayerKeypair = readKeypair(keeperRoleRefs.feePayerKeypair);
 const oracleReporterKeypair = readKeypair(keeperRoleRefs.oracleReporterKeypair);
@@ -309,7 +334,7 @@ const clobConfigAuthorityKeypair = keeperRoleRefs.clobConfigAuthorityKeypair
 const oracleChallengerWallet = new PublicKey(
   keeperRoleRefs.oracleChallengerWallet,
 );
-validateKeeperRoleSeparation(botCluster, {
+const keeperRolePublicKeys = {
   feePayer: keeperFeePayerKeypair.publicKey,
   oracleReporter: oracleReporterKeypair.publicKey,
   oracleFinalizer: oracleFinalizerKeypair.publicKey,
@@ -318,16 +343,22 @@ validateKeeperRoleSeparation(botCluster, {
   marketMaker: marketMakerKeypair.publicKey,
   oracleConfigAuthority: oracleConfigAuthorityKeypair?.publicKey ?? null,
   clobConfigAuthority: clobConfigAuthorityKeypair?.publicKey ?? null,
-});
+};
+validateKeeperRoleSeparation(botCluster, keeperRolePublicKeys);
 const { connection, provider, fightOracle, duelMarket } = createLaunchPrograms(
   keeperFeePayerKeypair,
 );
 const fightProgram = fightOracle;
 const marketProgram = duelMarket;
-type DuelStatusArg = Parameters<typeof fightProgram.methods.upsertDuel>[7];
+const DUEL_BOT_RUNTIME_IDENTITY = resolveKeeperRuntimeIdentity({
+  role: "duel-bot",
+  cluster: botCluster,
+  fightOracleProgramId: fightProgram.programId.toBase58(),
+  duelMarketProgramId: marketProgram.programId.toBase58(),
+});
+type DuelStatusArg = Parameters<typeof fightProgram.methods.upsertDuel>[9];
 type OracleWinnerArg =
-  | { a: Record<string, never> }
-  | { b: Record<string, never> };
+  { a: Record<string, never> } | { b: Record<string, never> };
 
 function hasProgramMethod(
   program: { methods?: Record<string, unknown> },
@@ -340,6 +371,32 @@ const BOT_HEALTH_FILE = (
   process.env.KEEPER_BOT_HEALTH_FILE ||
   path.resolve(__dirname, "..", ".status", "keeper-bot-health.json")
 ).trim();
+const BOT_RELEASE_IDENTITY = resolveKeeperReleaseIdentity(
+  releaseManifest,
+  process.env.HYPERBET_RELEASE_SHA,
+);
+const DUEL_BOT_HEALTH_SERVER_ENABLED =
+  process.env.HYPERBET_RUNTIME_ROLE === "duel-bot" ||
+  process.env.DUEL_BOT_HEALTH_SERVER_ENABLED?.trim().toLowerCase() === "true";
+const DUEL_BOT_HEALTH_SERVER_CONFIG = DUEL_BOT_HEALTH_SERVER_ENABLED
+  ? resolveDuelBotHealthServerConfig({
+      production: PROTECTED_KEEPER_RUNTIME,
+      port: process.env.BOT_HEALTH_PORT ?? process.env.PORT,
+      bearerToken: process.env.KEEPER_BOT_HEALTH_BEARER_TOKEN,
+      maxAgeMs: process.env.READINESS_BOT_MAX_AGE_MS,
+    })
+  : null;
+const BOT_READINESS_MAX_AGE_MS = readPositiveIntegerEnv(
+  "READINESS_BOT_MAX_AGE_MS",
+  30_000,
+  5_000,
+);
+const BOT_HEALTH_HEARTBEAT_MS = readPositiveIntegerEnv(
+  "KEEPER_BOT_HEALTH_HEARTBEAT_MS",
+  Math.min(5_000, Math.floor(BOT_READINESS_MAX_AGE_MS / 3)),
+  250,
+  BOT_READINESS_MAX_AGE_MS - 1_000,
+);
 const MARKET_HEALTH_RETENTION_MS = Math.max(
   60_000,
   Number(process.env.KEEPER_MARKET_HEALTH_RETENTION_MS || 15 * 60_000),
@@ -402,20 +459,10 @@ function readPositiveIntegerEnv(
   return parsed;
 }
 
-if (
-  (botCluster === "mainnet" || botCluster === "mainnet-beta") &&
-  !process.env.SOLANA_ORACLE_DISPUTE_WINDOW_SECS?.trim()
-) {
-  throw new Error(
-    "SOLANA_ORACLE_DISPUTE_WINDOW_SECS must be explicitly configured on mainnet",
-  );
-}
-const configuredDisputeWindowSecs = readPositiveIntegerEnv(
-  "SOLANA_ORACLE_DISPUTE_WINDOW_SECS",
-  DEFAULT_DISPUTE_WINDOW_SECS,
-  60,
-  7 * 24 * 60 * 60,
-);
+const configuredDisputeWindowSecs = resolveOracleDisputeWindowSeconds({
+  cluster: botCluster,
+  configuredValue: process.env.SOLANA_ORACLE_DISPUTE_WINDOW_SECS,
+});
 
 const terminalLedger = new TerminalLedger();
 const terminalWorkerId = `duel-bot:${process.pid}:${randomUUID()}`;
@@ -458,23 +505,30 @@ const configRevalidationIntervalMs = readPositiveIntegerEnv(
   10_000,
   10 * 60_000,
 );
+const marketInitializationRecoveryTimeoutMs = readPositiveIntegerEnv(
+  "MARKET_INITIALIZATION_RECOVERY_TIMEOUT_MS",
+  15_000,
+  1_000,
+  90_000,
+);
+const marketInitializationMaxAttempts = readPositiveIntegerEnv(
+  "MARKET_INITIALIZATION_MAX_ATTEMPTS",
+  2,
+  1,
+  3,
+);
+const marketInitializationRetryDelayMs = readPositiveIntegerEnv(
+  "MARKET_INITIALIZATION_RETRY_DELAY_MS",
+  1_000,
+  0,
+  10_000,
+);
 
 class ManualReviewTerminalError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ManualReviewTerminalError";
   }
-}
-
-function readConfiguredWallet(envName: string, fallback: PublicKey): PublicKey {
-  const configured = process.env[envName]?.trim();
-  if (configured) {
-    return new PublicKey(configured);
-  }
-  if (botCluster === "mainnet-beta") {
-    throw new Error(`Missing required environment variable: ${envName}`);
-  }
-  return fallback;
 }
 
 const minSignerLamports = Math.max(
@@ -552,48 +606,77 @@ let lastMarketConfigVerifiedAtMs: number | null = null;
 const oracleConfigPda = findOracleConfigPda(fightOracle.programId);
 const marketConfigPda = findMarketConfigPda(marketProgram.programId);
 
-const isMainnetBot = botCluster === "mainnet" || botCluster === "mainnet-beta";
 const {
   tradeTreasuryFeeBps,
   tradeMarketMakerFeeBps,
   winningsMarketMakerFeeBps,
-} = isMainnetBot
-  ? resolveApprovedLaunchFeePolicy({
-      approval: process.env.SOLANA_LAUNCH_FEE_POLICY_APPROVED,
-      tradeTreasuryFeeBps: process.env.TRADE_TREASURY_FEE_BPS,
-      tradeMarketMakerFeeBps: process.env.TRADE_MARKET_MAKER_FEE_BPS,
-      winningsMarketMakerFeeBps: process.env.WINNINGS_MARKET_MAKER_FEE_BPS,
-    })
-  : resolveLaunchFeePolicy({
-      tradeTreasuryFeeBps: args["trade-treasury-fee-bps"],
-      tradeMarketMakerFeeBps: args["trade-market-maker-fee-bps"],
-      winningsMarketMakerFeeBps: args["winnings-market-maker-fee-bps"],
-    });
-const configuredTradeTreasuryWallet = readConfiguredWallet(
-  "TRADE_TREASURY_WALLET",
-  keeperFeePayerKeypair.publicKey,
+} = resolveClusterLaunchFeePolicy({
+  cluster: botCluster,
+  approval: process.env.SOLANA_LAUNCH_FEE_POLICY_APPROVED,
+  tradeTreasuryFeeBps: args["trade-treasury-fee-bps"],
+  tradeMarketMakerFeeBps: args["trade-market-maker-fee-bps"],
+  winningsMarketMakerFeeBps: args["winnings-market-maker-fee-bps"],
+});
+const configuredTradeTreasuryWallet = resolveConfiguredLaunchWallet({
+  cluster: botCluster,
+  envName: "TRADE_TREASURY_WALLET",
+  configuredValue: process.env.TRADE_TREASURY_WALLET,
+  localFallback: keeperFeePayerKeypair.publicKey,
+});
+const configuredTradeMarketMakerWallet = resolveConfiguredLaunchWallet({
+  cluster: botCluster,
+  envName: "TRADE_MARKET_MAKER_WALLET",
+  configuredValue: process.env.TRADE_MARKET_MAKER_WALLET,
+  localFallback: marketMakerKeypair.publicKey,
+});
+validateKeeperFeeTreasurySeparation(
+  botCluster,
+  keeperRolePublicKeys,
+  configuredTradeTreasuryWallet,
 );
-const configuredTradeMarketMakerWallet = readConfiguredWallet(
-  "TRADE_MARKET_MAKER_WALLET",
-  marketMakerKeypair.publicKey,
-);
-const configuredSeedSol = Number(args["seed-sol"]);
-const marketMakerSeedLamports = Math.max(
-  1_000,
-  Math.floor(configuredSeedSol * LAMPORTS_PER_SOL),
-);
+const managedLiquidityRiskPolicy = resolveClusterManagedLiquidityRiskPolicy({
+  cluster: botCluster,
+  approval: process.env.SOLANA_LAUNCH_MARKET_MAKER_RISK_APPROVED,
+  seedSol: process.env.MARKET_MAKER_SEED_SOL,
+  minQuoteSol: process.env.MARKET_MAKER_MIN_QUOTE_SOL,
+  referenceBidPriceMillis: process.env.MARKET_MAKER_BID_PRICE,
+  referenceAskPriceMillis: process.env.MARKET_MAKER_ASK_PRICE,
+  minQuotePriceMillis: process.env.MARKET_MAKER_MIN_QUOTE_PRICE_MILLIS,
+  maxQuotePriceMillis: process.env.MARKET_MAKER_MAX_QUOTE_PRICE_MILLIS,
+  maxInventorySolPerSide: process.env.MARKET_MAKER_MAX_INVENTORY_SOL_PER_SIDE,
+  maxNetExposureSol: process.env.MARKET_MAKER_MAX_NET_EXPOSURE_SOL,
+  maxGrossExposureSol: process.env.MARKET_MAKER_MAX_GROSS_EXPOSURE_SOL,
+  maxSideImbalanceBps: process.env.MARKET_MAKER_MAX_SIDE_IMBALANCE_BPS,
+  maxDrawdownBps: process.env.MARKET_MAKER_MAX_DRAWDOWN_BPS,
+});
+const marketMakerSeedLamports =
+  managedLiquidityRiskPolicy?.seedLamports ??
+  parseManagedLiquiditySolLamports(
+    "MARKET_MAKER_SEED_SOL",
+    process.env.MARKET_MAKER_SEED_SOL?.trim() || String(args["seed-sol"]),
+  );
 const autoSeedDelayMs = Math.max(
   0,
   Math.floor(Number(args["auto-seed-delay-seconds"]) * 1000),
 );
-const configuredBidPrice = Math.max(
-  1,
-  Math.min(999, Math.floor(Number(process.env.MARKET_MAKER_BID_PRICE || 400))),
-);
-const configuredAskPrice = Math.max(
-  configuredBidPrice + 1,
-  Math.min(999, Math.floor(Number(process.env.MARKET_MAKER_ASK_PRICE || 600))),
-);
+const configuredBidPrice =
+  managedLiquidityRiskPolicy?.referenceBidPriceMillis ??
+  Math.max(
+    1,
+    Math.min(
+      999,
+      Math.floor(Number(process.env.MARKET_MAKER_BID_PRICE || 400)),
+    ),
+  );
+const configuredAskPrice =
+  managedLiquidityRiskPolicy?.referenceAskPriceMillis ??
+  Math.max(
+    configuredBidPrice + 1,
+    Math.min(
+      999,
+      Math.floor(Number(process.env.MARKET_MAKER_ASK_PRICE || 600)),
+    ),
+  );
 const configuredMidPrice = Math.max(
   1,
   Math.round((configuredBidPrice + configuredAskPrice) / 2),
@@ -623,42 +706,62 @@ const managedClobQuoteConfig = {
   ...DEFAULT_MARKET_MAKER_CONFIG,
   ...managedClobQuoteTiming,
   targetSpreadBps: configuredSpreadBps,
-  minQuoteUnits: Math.max(1, Math.floor(marketMakerSeedLamports / 4)),
+  minQuotePrice:
+    managedLiquidityRiskPolicy?.minQuotePriceMillis ??
+    DEFAULT_MARKET_MAKER_CONFIG.minQuotePrice,
+  maxQuotePrice:
+    managedLiquidityRiskPolicy?.maxQuotePriceMillis ??
+    DEFAULT_MARKET_MAKER_CONFIG.maxQuotePrice,
+  minQuoteUnits:
+    managedLiquidityRiskPolicy?.minQuoteLamports ??
+    Math.max(1_000, Math.floor(marketMakerSeedLamports / 4 / 1_000) * 1_000),
   maxQuoteUnits: marketMakerSeedLamports,
-  maxInventoryPerSide: Math.max(
-    DEFAULT_MARKET_MAKER_CONFIG.maxInventoryPerSide,
-    marketMakerSeedLamports * 4,
-  ),
-  maxNetExposure: Math.max(
-    DEFAULT_MARKET_MAKER_CONFIG.maxNetExposure,
-    marketMakerSeedLamports * 2,
-  ),
-  maxGrossExposure: Math.max(
-    DEFAULT_MARKET_MAKER_CONFIG.maxGrossExposure,
-    marketMakerSeedLamports * 6,
-  ),
+  maxInventoryPerSide:
+    managedLiquidityRiskPolicy?.maxInventoryLamportsPerSide ??
+    Math.max(
+      DEFAULT_MARKET_MAKER_CONFIG.maxInventoryPerSide,
+      marketMakerSeedLamports * 4,
+    ),
+  maxNetExposure:
+    managedLiquidityRiskPolicy?.maxNetExposureLamports ??
+    Math.max(
+      DEFAULT_MARKET_MAKER_CONFIG.maxNetExposure,
+      marketMakerSeedLamports * 2,
+    ),
+  maxGrossExposure:
+    managedLiquidityRiskPolicy?.maxGrossExposureLamports ??
+    Math.max(
+      DEFAULT_MARKET_MAKER_CONFIG.maxGrossExposure,
+      marketMakerSeedLamports * 6,
+    ),
+  maxSideImbalanceBps:
+    managedLiquidityRiskPolicy?.maxSideImbalanceBps ??
+    DEFAULT_MARKET_MAKER_CONFIG.maxSideImbalanceBps,
+  maxDrawdownBps:
+    managedLiquidityRiskPolicy?.maxDrawdownBps ??
+    DEFAULT_MARKET_MAKER_CONFIG.maxDrawdownBps,
 };
 
 const requiredPrograms = [
   {
     label: "fight oracle",
     programId: fightProgram.programId,
-    expectedUpgradeAuthority: resolveExpectedUpgradeAuthority({
+    expectedUpgradeAuthority: resolveClusterExpectedUpgradeAuthority({
+      cluster: botCluster,
       value:
         process.env.FIGHT_ORACLE_EXPECTED_UPGRADE_AUTHORITY ||
         process.env.SOLANA_EXPECTED_UPGRADE_AUTHORITY,
-      required: botCluster === "mainnet" || botCluster === "mainnet-beta",
       label: "fight oracle",
     }),
   },
   {
     label: "duel market",
     programId: marketProgram.programId,
-    expectedUpgradeAuthority: resolveExpectedUpgradeAuthority({
+    expectedUpgradeAuthority: resolveClusterExpectedUpgradeAuthority({
+      cluster: botCluster,
       value:
         process.env.DUEL_MARKET_EXPECTED_UPGRADE_AUTHORITY ||
         process.env.SOLANA_EXPECTED_UPGRADE_AUTHORITY,
-      required: botCluster === "mainnet" || botCluster === "mainnet-beta",
       label: "duel market",
     }),
   },
@@ -823,9 +926,7 @@ async function ensureKeeperChainReady(): Promise<boolean> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const rpcFailure = isRpcConnectivityError(error);
-    const backoffMs = rpcFailure
-      ? registerRpcFailure()
-      : chainCheckCooldownMs;
+    const backoffMs = rpcFailure ? registerRpcFailure() : chainCheckCooldownMs;
     if (Date.now() - lastChainWarningAt > 10_000) {
       console.warn(
         `[bot] failed keeper chain readiness check against ${connection.rpcEndpoint}: ${message}. Backing off for ${Math.round(
@@ -916,6 +1017,16 @@ const ensureOracleReady = async (): Promise<void> => {
       `Oracle config ${oracleConfigPda.toBase58()} was not created`,
     );
   }
+  const accountSchemaVersion = requireSafeAccountInteger(
+    config.accountSchemaVersion,
+    "oracle account schema version",
+    { min: 1 },
+  );
+  if (accountSchemaVersion !== FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION) {
+    throw new Error(
+      `Oracle config ${oracleConfigPda.toBase58()} uses unsupported account schema ${accountSchemaVersion}; expected ${FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION}`,
+    );
+  }
   const onChainAuthority = config.authority as PublicKey;
   if (
     oracleConfigAuthorityKeypair &&
@@ -925,11 +1036,22 @@ const ensureOracleReady = async (): Promise<void> => {
       `ORACLE_CONFIG_AUTHORITY_KEYPAIR ${oracleConfigAuthorityKeypair.publicKey.toBase58()} does not match on-chain oracle authority ${onChainAuthority.toBase58()}`,
     );
   }
-  const configNeedsUpdate =
-    !(config.reporter as PublicKey).equals(oracleReporterKeypair.publicKey) ||
-    !(config.finalizer as PublicKey).equals(oracleFinalizerKeypair.publicKey) ||
-    !(config.challenger as PublicKey).equals(oracleChallengerWallet) ||
-    asNum(config.disputeWindowSecs) !== configuredDisputeWindowSecs;
+  const oracleConfigNeedsUpdate = (
+    candidate: NonNullable<typeof config>,
+  ): boolean =>
+    !(candidate.reporter as PublicKey).equals(
+      oracleReporterKeypair.publicKey,
+    ) ||
+    !(candidate.finalizer as PublicKey).equals(
+      oracleFinalizerKeypair.publicKey,
+    ) ||
+    !(candidate.challenger as PublicKey).equals(oracleChallengerWallet) ||
+    requireSafeAccountInteger(
+      candidate.disputeWindowSecs,
+      "oracle dispute window seconds",
+      { min: 1 },
+    ) !== configuredDisputeWindowSecs;
+  const configNeedsUpdate = oracleConfigNeedsUpdate(config);
   if (configNeedsUpdate) {
     if (Boolean(config.configFrozen)) {
       throw new Error(
@@ -959,6 +1081,32 @@ const ensureOracleReady = async (): Promise<void> => {
           .rpc(),
       connection,
     );
+    config =
+      await fightProgram.account.oracleConfig.fetchNullable(oracleConfigPda);
+    if (!config) {
+      throw new Error(
+        `Oracle config ${oracleConfigPda.toBase58()} disappeared after update`,
+      );
+    }
+  }
+  const verifiedOracleAuthority = config.authority as PublicKey;
+  if (
+    oracleConfigAuthorityKeypair &&
+    !verifiedOracleAuthority.equals(oracleConfigAuthorityKeypair.publicKey)
+  ) {
+    throw new Error(
+      `Oracle config ${oracleConfigPda.toBase58()} authority drifted after verification`,
+    );
+  }
+  if (oracleConfigNeedsUpdate(config)) {
+    throw new Error(
+      `Oracle config ${oracleConfigPda.toBase58()} did not converge to the required launch roles or dispute window`,
+    );
+  }
+  if (!Boolean(config.configFrozen)) {
+    throw new Error(
+      `Oracle config ${oracleConfigPda.toBase58()} is not permanently frozen; run the approved launch configuration freeze before starting the duel keeper`,
+    );
   }
   lastOracleConfigVerifiedAtMs = Date.now();
   markRpcSuccess();
@@ -983,7 +1131,7 @@ const ensureMarketConfigReady = async (): Promise<void> => {
     ),
   ]);
 
-  const existingConfig =
+  let existingConfig =
     await marketProgram.account.marketConfig.fetchNullable(marketConfigPda);
   const expectedConfig = {
     marketOperator: clobMarketOperatorKeypair.publicKey,
@@ -1025,9 +1173,13 @@ const ensureMarketConfigReady = async (): Promise<void> => {
     console.log(
       `[bot] CLOB market config initialized at ${marketConfigPda.toBase58()}`,
     );
-    lastMarketConfigVerifiedAtMs = Date.now();
-    markRpcSuccess();
-    return;
+    existingConfig =
+      await marketProgram.account.marketConfig.fetchNullable(marketConfigPda);
+    if (!existingConfig) {
+      throw new Error(
+        `CLOB config ${marketConfigPda.toBase58()} was not created`,
+      );
+    }
   }
 
   const onChainAuthority = existingConfig.authority as PublicKey;
@@ -1039,20 +1191,30 @@ const ensureMarketConfigReady = async (): Promise<void> => {
       `CLOB_CONFIG_AUTHORITY_KEYPAIR ${clobConfigAuthorityKeypair.publicKey.toBase58()} does not match on-chain CLOB authority ${onChainAuthority.toBase58()}`,
     );
   }
-  const configNeedsUpdate =
-    !(existingConfig.marketOperator as PublicKey).equals(
+  const marketConfigNeedsUpdate = (
+    candidate: NonNullable<typeof existingConfig>,
+  ): boolean =>
+    !(candidate.marketOperator as PublicKey).equals(
       expectedConfig.marketOperator,
     ) ||
-    !(existingConfig.treasury as PublicKey).equals(expectedConfig.treasury) ||
-    !(existingConfig.marketMaker as PublicKey).equals(
-      expectedConfig.marketMaker,
-    ) ||
-    asNum(existingConfig.tradeTreasuryFeeBps) !==
-      expectedConfig.tradeTreasuryFeeBps ||
-    asNum(existingConfig.tradeMarketMakerFeeBps) !==
-      expectedConfig.tradeMarketMakerFeeBps ||
-    asNum(existingConfig.winningsMarketMakerFeeBps) !==
-      expectedConfig.winningsMarketMakerFeeBps;
+    !(candidate.treasury as PublicKey).equals(expectedConfig.treasury) ||
+    !(candidate.marketMaker as PublicKey).equals(expectedConfig.marketMaker) ||
+    requireSafeAccountInteger(
+      candidate.tradeTreasuryFeeBps,
+      "market treasury trade fee bps",
+      { min: 0, max: 10_000 },
+    ) !== expectedConfig.tradeTreasuryFeeBps ||
+    requireSafeAccountInteger(
+      candidate.tradeMarketMakerFeeBps,
+      "market-maker trade fee bps",
+      { min: 0, max: 10_000 },
+    ) !== expectedConfig.tradeMarketMakerFeeBps ||
+    requireSafeAccountInteger(
+      candidate.winningsMarketMakerFeeBps,
+      "market-maker winnings fee bps",
+      { min: 0, max: 10_000 },
+    ) !== expectedConfig.winningsMarketMakerFeeBps;
+  const configNeedsUpdate = marketConfigNeedsUpdate(existingConfig);
 
   if (configNeedsUpdate) {
     if (Boolean(existingConfig.configFrozen)) {
@@ -1085,12 +1247,38 @@ const ensureMarketConfigReady = async (): Promise<void> => {
           .rpc(),
       connection,
     );
+    existingConfig =
+      await marketProgram.account.marketConfig.fetchNullable(marketConfigPda);
+    if (!existingConfig) {
+      throw new Error(
+        `CLOB config ${marketConfigPda.toBase58()} disappeared after update`,
+      );
+    }
     console.log(
       `[bot] CLOB market config updated at ${marketConfigPda.toBase58()} treasury=${expectedConfig.treasury.toBase58()} marketMaker=${expectedConfig.marketMaker.toBase58()}`,
     );
   } else if (firstVerification) {
     console.log(
       `[bot] CLOB market config verified at ${marketConfigPda.toBase58()}`,
+    );
+  }
+  const verifiedMarketAuthority = existingConfig.authority as PublicKey;
+  if (
+    clobConfigAuthorityKeypair &&
+    !verifiedMarketAuthority.equals(clobConfigAuthorityKeypair.publicKey)
+  ) {
+    throw new Error(
+      `CLOB config ${marketConfigPda.toBase58()} authority drifted after verification`,
+    );
+  }
+  if (marketConfigNeedsUpdate(existingConfig)) {
+    throw new Error(
+      `CLOB config ${marketConfigPda.toBase58()} did not converge to the required launch operator, fee recipients, or fee policy`,
+    );
+  }
+  if (!Boolean(existingConfig.configFrozen)) {
+    throw new Error(
+      `CLOB config ${marketConfigPda.toBase58()} is not permanently frozen; run the approved launch configuration freeze before starting the duel keeper`,
     );
   }
   lastMarketConfigVerifiedAtMs = Date.now();
@@ -1179,6 +1367,7 @@ type ActiveClobMatch = {
 };
 
 type ManagedOrderState = ManagedClobOrder & {
+  orderBehavior: number;
   remainingLamports: number;
   previousOrderId: number;
   nextOrderId: number;
@@ -1248,6 +1437,7 @@ function buildDuelMetadata(data: DuelLifecycleEvent): string {
   return buildDuelLifecycleMetadata({
     duelId: data.duelId,
     duelKey: data.duelKeyHex,
+    snapshotVersion: data.competitiveSnapshotVersion,
     snapshotDigest: data.competitiveSnapshotDigest,
   });
 }
@@ -1291,17 +1481,31 @@ async function upsertDuelLifecycle(
   const duelState = findDuelStatePda(fightProgram.programId, duelKey);
   const existingDuelState = await getDuelState(duelState);
   const nowSeconds = Math.floor(Date.now() / 1000);
-  const betOpenTs = Math.floor((data.betOpenTime ?? Date.now()) / 1000);
-  const betCloseTs = Math.max(
-    betOpenTs + 1,
-    Math.floor(
-      (data.betCloseTime ?? data.fightStartTime ?? Date.now() + 1_000) / 1000,
-    ),
-  );
-  const duelStartTs = Math.max(
-    betCloseTs,
-    Math.floor((data.fightStartTime ?? data.betCloseTime ?? Date.now()) / 1000),
-  );
+  const { betOpenTs, betCloseTs, duelStartTs } = resolveDuelLifecycleTiming({
+    existing: existingDuelState
+      ? {
+          betOpenTs: requireSafeAccountInteger(
+            existingDuelState.betOpenTs,
+            "existing duel bet-open timestamp",
+            { min: 1 },
+          ),
+          betCloseTs: requireSafeAccountInteger(
+            existingDuelState.betCloseTs,
+            "existing duel bet-close timestamp",
+            { min: 1 },
+          ),
+          duelStartTs: requireSafeAccountInteger(
+            existingDuelState.duelStartTs,
+            "existing duel start timestamp",
+            { min: 1 },
+          ),
+        }
+      : null,
+    betOpenTimeMs: data.betOpenTime,
+    betCloseTimeMs: data.betCloseTime,
+    fightStartTimeMs: data.fightStartTime,
+    nowMs: Date.now(),
+  });
   const requestedStatus =
     status === "scheduled" && betOpenTs <= nowSeconds ? "bettingOpen" : status;
   const participantAHash =
@@ -1310,6 +1514,9 @@ async function upsertDuelLifecycle(
   const participantBHash =
     toByteArray32(existingDuelState?.participantBHash) ??
     hashParticipant(data.agent2);
+  const competitiveSnapshotDigest = Array.from(
+    Buffer.from(data.competitiveSnapshotDigest, "hex"),
+  );
 
   await runWithRecovery(
     () =>
@@ -1318,6 +1525,8 @@ async function upsertDuelLifecycle(
           Array.from(duelKey),
           participantAHash,
           participantBHash,
+          data.competitiveSnapshotVersion,
+          competitiveSnapshotDigest,
           new BN(betOpenTs),
           new BN(betCloseTs),
           new BN(duelStartTs),
@@ -1410,37 +1619,83 @@ async function getManagedOrderState(
     return null;
   }
 
+  const accountOrderId = requireSafeAccountInteger(
+    orderAccount.id,
+    "managed order id",
+    { min: 1 },
+  );
+  const accountSide = requireSafeAccountInteger(
+    orderAccount.side,
+    "managed order side",
+    { min: SIDE_BID, max: SIDE_ASK },
+  );
   if (
     !(orderAccount.marketState as PublicKey).equals(trackedMatch.marketState) ||
     !(orderAccount.maker as PublicKey).equals(marketMakerKeypair.publicKey) ||
-    asNum(orderAccount.id, -1) !== trackedOrder.orderId ||
-    asNum(orderAccount.side, -1) !== trackedOrder.side
+    accountOrderId !== trackedOrder.orderId ||
+    accountSide !== trackedOrder.side
   ) {
     throw new Error(`managed order identity drift for ${orderPda.toBase58()}`);
   }
 
-  const amountLamports = asNum(
+  const amountLamports = requireSafeAccountInteger(
     orderAccount.amount,
-    trackedOrder.amountLamports,
+    "managed order amount",
+    { min: 1 },
   );
-  const remainingLamports = Math.max(
-    0,
-    amountLamports - asNum(orderAccount.filled),
+  const filledLamports = requireSafeAccountInteger(
+    orderAccount.filled,
+    "managed order filled amount",
+    { min: 0, max: amountLamports },
   );
+  const remainingLamports = amountLamports - filledLamports;
   if (remainingLamports <= 0) {
     return null;
+  }
+  if (amountLamports % 1_000 !== 0 || filledLamports % 1_000 !== 0) {
+    throw new Error(`managed order lot-size drift for ${orderPda.toBase58()}`);
+  }
+  const price = requireSafeAccountInteger(
+    orderAccount.price,
+    "managed order price",
+    { min: 1, max: 999 },
+  );
+  if (price !== trackedOrder.price) {
+    throw new Error(`managed order price drift for ${orderPda.toBase58()}`);
+  }
+  const orderBehavior = requireSafeAccountInteger(
+    orderAccount.orderBehavior,
+    "managed order behavior",
+    { min: 0, max: 2 },
+  );
+  const previousOrderId = requireSafeAccountInteger(
+    orderAccount.prevOrderId,
+    "managed previous order id",
+    { min: 0 },
+  );
+  const nextOrderId = requireSafeAccountInteger(
+    orderAccount.nextOrderId,
+    "managed next order id",
+    { min: 0 },
+  );
+  const continuationPending = Boolean(orderAccount.continuationPending);
+  if (continuationPending && filledLamports !== 0) {
+    throw new Error(
+      `managed continuation order retained fills for ${orderPda.toBase58()}`,
+    );
   }
 
   return {
     orderId: trackedOrder.orderId,
     side: trackedOrder.side,
-    price: asNum(orderAccount.price, trackedOrder.price),
+    price,
+    orderBehavior,
     amountLamports,
     placedAtMs: trackedOrder.placedAtMs,
     remainingLamports,
-    previousOrderId: asNum(orderAccount.prevOrderId),
-    nextOrderId: asNum(orderAccount.nextOrderId),
-    continuationPending: Boolean(orderAccount.continuationPending),
+    previousOrderId,
+    nextOrderId,
+    continuationPending,
   };
 }
 
@@ -1469,6 +1724,39 @@ async function buildManagedClobQuoteContext(
     activeOrders.length > 0
       ? now - Math.min(...activeOrders.map((order) => order.placedAtMs))
       : null;
+  const bestBid = marketState
+    ? requireSafeAccountInteger(marketState.bestBid, "market best bid", {
+        min: 0,
+        max: 999,
+      })
+    : 0;
+  const bestAsk = marketState
+    ? requireSafeAccountInteger(marketState.bestAsk, "market best ask", {
+        min: 1,
+        max: 1_000,
+      })
+    : 1_000;
+  const betCloseTs = duelState
+    ? requireSafeAccountInteger(
+        duelState.betCloseTs,
+        "managed quote duel bet-close timestamp",
+        { min: 1, max: Math.floor(Number.MAX_SAFE_INTEGER / 1_000) },
+      )
+    : null;
+  const yesExposure = userBalance
+    ? requireSafeAccountInteger(
+        userBalance.aShares,
+        "market-maker A-share exposure",
+        { min: 0 },
+      )
+    : 0;
+  const noExposure = userBalance
+    ? requireSafeAccountInteger(
+        userBalance.bShares,
+        "market-maker B-share exposure",
+        { min: 0 },
+      )
+    : 0;
 
   return {
     snapshot: {
@@ -1476,16 +1764,16 @@ async function buildManagedClobQuoteContext(
       lifecycleStatus: mapClobLifecycleStatus(marketState),
       duelKey: trackedMatch.duelKeyHex,
       marketRef: trackedMatch.marketState.toBase58(),
-      bestBid: normalizeClobBestBid(asNum(marketState?.bestBid)),
-      bestAsk: normalizeClobBestAsk(asNum(marketState?.bestAsk, 1_000)),
-      betCloseTimeMs: duelState ? asNum(duelState.betCloseTs) * 1_000 : null,
+      bestBid: normalizeClobBestBid(bestBid),
+      bestAsk: normalizeClobBestAsk(bestAsk),
+      betCloseTimeMs: betCloseTs === null ? null : betCloseTs * 1_000,
       lastStreamAtMs: trackedMatch.lastStreamAtMs ?? lastStreamEventAtMs ?? now,
       lastOracleAtMs: trackedMatch.lastOracleAtMs ?? now,
       lastRpcAtMs: trackedMatch.lastRpcAtMs ?? lastSuccessfulRpcAtMs ?? now,
       quoteAgeMs,
       exposure: {
-        yes: asNum(userBalance?.aShares),
-        no: asNum(userBalance?.bShares),
+        yes: yesExposure,
+        no: noExposure,
         openYes: yesBidOrder?.remainingLamports ?? 0,
         openNo: noAskOrder?.remainingLamports ?? 0,
       },
@@ -1547,18 +1835,72 @@ async function cancelManagedClobOrder(
     trackedOrder.side,
     trackedOrder.price,
   );
-  const marketState = await getClobMarketState(trackedMatch.marketState);
+  const [marketState, priceLevelAccount] = await Promise.all([
+    getClobMarketState(trackedMatch.marketState),
+    marketProgram.account.priceLevel.fetchNullable(priceLevel),
+  ]);
   if (!marketState) {
     throw new Error(
       `cannot recover managed order ${trackedOrder.orderId}: market is missing`,
     );
   }
+  let decodedPriceLevel: ManagedOrderClosurePriceLevel | null = null;
+  if (priceLevelAccount) {
+    const levelSide = requireSafeAccountInteger(
+      priceLevelAccount.side,
+      "managed price-level side",
+      { min: SIDE_BID, max: SIDE_ASK },
+    );
+    const levelPrice = requireSafeAccountInteger(
+      priceLevelAccount.price,
+      "managed price-level price",
+      { min: 1, max: 999 },
+    );
+    const priceLevelTotalOpen = requireSafeAccountInteger(
+      priceLevelAccount.totalOpen,
+      "managed price-level open amount",
+      { min: 0 },
+    );
+    if (
+      !(priceLevelAccount.marketState as PublicKey).equals(
+        trackedMatch.marketState,
+      ) ||
+      levelSide !== trackedOrder.side ||
+      levelPrice !== trackedOrder.price
+    ) {
+      throw new Error(
+        `cannot recover managed order ${trackedOrder.orderId}: price level is missing or inconsistent`,
+      );
+    }
+    decodedPriceLevel = {
+      headOrderId: requireSafeAccountInteger(
+        priceLevelAccount.headOrderId,
+        "managed price-level head order id",
+        { min: 0 },
+      ),
+      tailOrderId: requireSafeAccountInteger(
+        priceLevelAccount.tailOrderId,
+        "managed price-level tail order id",
+        { min: 0 },
+      ),
+      totalOpen: priceLevelTotalOpen,
+    };
+  }
+  const closurePriceLevel = resolveManagedOrderClosurePriceLevel({
+    continuationPending: trackedOrder.continuationPending,
+    priceLevel: decodedPriceLevel,
+  });
   const marketIsOpen = enumIs(marketState.status, "open");
   const closurePlan = planManagedOrderClosure({
     marketIsOpen,
     orderId: trackedOrder.orderId,
+    orderBehavior: trackedOrder.orderBehavior,
+    remainingAmount: trackedOrder.remainingLamports,
     previousOrderId: trackedOrder.previousOrderId,
     nextOrderId: trackedOrder.nextOrderId,
+    priceLevelHeadOrderId: closurePriceLevel.headOrderId,
+    priceLevelTailOrderId: closurePriceLevel.tailOrderId,
+    priceLevelTotalOpen: closurePriceLevel.totalOpen,
     continuationPending: trackedOrder.continuationPending,
   });
   const remainingAccounts = closurePlan.adjacentOrderIds.map((orderId) => ({
@@ -1658,7 +2000,11 @@ async function placeManagedClobOrder(
     );
   }
 
-  const orderId = asNum(marketState.nextOrderId);
+  const orderId = requireSafeAccountInteger(
+    marketState.nextOrderId,
+    "market next order id",
+    { min: 1 },
+  );
   const userBalance = findUserBalancePda(
     marketProgram.programId,
     trackedMatch.marketState,
@@ -1678,7 +2024,35 @@ async function placeManagedClobOrder(
   const restingLevelAccount =
     await marketProgram.account.priceLevel.fetchNullable(restingLevel);
   markRpcSuccess(trackedMatch);
-  const restingTailOrderId = asNum(restingLevelAccount?.tailOrderId);
+  let restingTailOrderId = 0;
+  if (restingLevelAccount) {
+    const restingLevelSide = requireSafeAccountInteger(
+      restingLevelAccount.side,
+      "resting price-level side",
+      { min: SIDE_BID, max: SIDE_ASK },
+    );
+    const restingLevelPrice = requireSafeAccountInteger(
+      restingLevelAccount.price,
+      "resting price-level price",
+      { min: 1, max: 999 },
+    );
+    if (
+      !(restingLevelAccount.marketState as PublicKey).equals(
+        trackedMatch.marketState,
+      ) ||
+      restingLevelSide !== side ||
+      restingLevelPrice !== price
+    ) {
+      throw new Error(
+        `refusing to place managed order ${orderId}: resting price level is inconsistent`,
+      );
+    }
+    restingTailOrderId = requireSafeAccountInteger(
+      restingLevelAccount.tailOrderId,
+      "resting price-level tail order id",
+      { min: 0 },
+    );
+  }
   const remainingAccounts =
     restingTailOrderId > 0
       ? [
@@ -1702,7 +2076,7 @@ async function placeManagedClobOrder(
           side,
           price,
           new BN(amountLamports),
-          ORDER_BEHAVIOR_GTC,
+          ORDER_BEHAVIOR_POST_ONLY,
         )
         .accountsPartial({
           marketState: trackedMatch.marketState,
@@ -1795,12 +2169,21 @@ async function ensureManagedClobOrder(
     return;
   }
 
-  trackedMatch[side] = await placeManagedClobOrder(
-    trackedMatch,
-    side === "yesBidOrder" ? SIDE_BID : SIDE_ASK,
-    decision.targetPrice,
-    decision.targetUnits,
-  );
+  try {
+    trackedMatch[side] = await placeManagedClobOrder(
+      trackedMatch,
+      side === "yesBidOrder" ? SIDE_BID : SIDE_ASK,
+      decision.targetPrice,
+      decision.targetUnits,
+    );
+  } catch (error) {
+    const disposition = classifyManagedLiquiditySubmissionError(error);
+    if (!disposition) throw error;
+    trackedMatch[side] = null;
+    console.info(
+      `[bot] Skipped stale managed ${side === "yesBidOrder" ? "A-bid" : "B-ask"} for ${trackedMatch.marketState.toBase58()} (${disposition}); refreshing next cycle`,
+    );
+  }
 }
 
 async function createOrSyncRound(
@@ -1815,31 +2198,36 @@ async function createOrSyncRound(
   const vault = findClobVaultPda(marketProgram.programId, marketState);
   const duelKey = duelKeyHexToBytes(data.duelKeyHex);
 
-  try {
-    await runWithRecovery(
-      () =>
-        marketProgram.methods
-          .initializeMarket(Array.from(duelKey), DUEL_WINNER_MARKET_KIND)
-          .accountsPartial({
-            operator: clobMarketOperatorKeypair.publicKey,
-            config: marketConfigPda,
-            duelState,
-            marketState,
-            vault,
-            systemProgram: SystemProgram.programId,
-          })
-          .signers([clobMarketOperatorKeypair])
-          .rpc(),
-      connection,
-    );
-  } catch (error) {
-    if (!isIgnorableRaceError(error)) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/already in use|account .* already in use/i.test(message)) {
-        throw error;
-      }
-    }
-  }
+  await ensureIdempotentAccountInitialized({
+    isInitialized: async () =>
+      (await connection.getAccountInfo(marketState, "confirmed")) != null,
+    submit: async () => {
+      await runWithRecovery(
+        () =>
+          marketProgram.methods
+            .initializeMarket(Array.from(duelKey), DUEL_WINNER_MARKET_KIND)
+            .accountsPartial({
+              operator: clobMarketOperatorKeypair.publicKey,
+              config: marketConfigPda,
+              duelState,
+              marketState,
+              vault,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([clobMarketOperatorKeypair])
+            .rpc(),
+        connection,
+        marketInitializationRecoveryTimeoutMs,
+      );
+    },
+    maxAttempts: marketInitializationMaxAttempts,
+    retryDelayMs: marketInitializationRetryDelayMs,
+    onRetry: ({ attempt, maxAttempts, error }) => {
+      console.warn(
+        `[bot] Market initialization was not confirmed for duel ${data.duelId}; retrying deterministic account initialization (${attempt + 1}/${maxAttempts}): ${sanitizeErrorMessage(error)}`,
+      );
+    },
+  });
 
   const trackedMatch: ActiveClobMatch = {
     duelId: data.duelId,
@@ -1891,8 +2279,17 @@ async function lockRound(data: DuelLifecycleEvent): Promise<void> {
     );
   }
   if (lockAction === "lock") {
+    if (!duelState) {
+      throw new Error(
+        `cannot safely lock duel ${data.duelId}: Solana oracle account is missing`,
+      );
+    }
     await waitForConfirmedChainTimestamp(
-      asNum(duelState?.betCloseTs),
+      requireSafeAccountInteger(
+        duelState.betCloseTs,
+        "duel lock bet-close timestamp",
+        { min: 1 },
+      ),
       `cannot lock duel ${data.duelId}`,
     );
     await upsertDuelLifecycle(data, "locked");
@@ -1910,7 +2307,12 @@ async function maybeWarnUnresolvedDuel(
   }
 
   const now = Math.floor(Date.now() / 1000);
-  if (now < asNum(duelState.betCloseTs)) {
+  const betCloseTs = requireSafeAccountInteger(
+    duelState.betCloseTs,
+    "unresolved duel bet-close timestamp",
+    { min: 1 },
+  );
+  if (now < betCloseTs) {
     return;
   }
   if (unresolvedOracleWarningMatches.has(trackedMatch.duelId)) {
@@ -2070,10 +2472,15 @@ async function performOnChainMarketDiscovery(): Promise<void> {
     });
 
     let recoveredMarketCount = 0;
+    let restartRecoveredMarketCount = 0;
     let recoveredOrderCount = 0;
     for (const recovered of result.markets) {
-      if (!activeClobMatches.has(recovered.duelId)) {
+      const alreadyTracked = activeClobMatches.has(recovered.duelId);
+      if (!alreadyTracked) {
         recoveredMarketCount += 1;
+      }
+      if (requiresRestartMarketReconciliation(recovered, alreadyTracked)) {
+        restartRecoveredMarketCount += 1;
       }
       recoveredOrderCount += hydrateRecoveredMarket(recovered, observedAt);
     }
@@ -2087,9 +2494,9 @@ async function performOnChainMarketDiscovery(): Promise<void> {
     marketDiscoveryErrorDetails = null;
     markRpcSuccess();
 
-    if (recoveredMarketCount > 0 || recoveredOrderCount > 0) {
+    if (restartRecoveredMarketCount > 0 || recoveredOrderCount > 0) {
       restartRecoveryObservedAtMs = restartRecoveryObservedAtMs ?? observedAt;
-      restartRecoveryDetails = `recovered ${recoveredMarketCount} canonical on-chain duel market(s) and ${recoveredOrderCount} previously untracked active market-maker order(s)`;
+      restartRecoveryDetails = `recovered ${restartRecoveredMarketCount} active canonical on-chain duel market(s) and ${recoveredOrderCount} previously untracked active market-maker order(s)`;
     }
     console.log(
       `[bot] On-chain market discovery found ${result.markets.length} canonical market(s), ${recoveredOrderCount} untracked active order(s), and ${result.issues.length} issue(s)`,
@@ -2140,7 +2547,13 @@ function loadPreviousBotHealthSnapshot(): KeeperBotHealthSnapshot | null {
     return null;
   }
   try {
-    return JSON.parse(fs_node.readFileSync(BOT_HEALTH_FILE, "utf8"));
+    const snapshot = parseKeeperBotHealthSnapshot(
+      JSON.parse(fs_node.readFileSync(BOT_HEALTH_FILE, "utf8")),
+    );
+    if (!snapshot) {
+      console.warn("[bot] Ignoring invalid previous bot health snapshot");
+    }
+    return snapshot;
   } catch (error) {
     console.warn("[bot] Failed to read previous bot health snapshot:", error);
     return null;
@@ -2234,6 +2647,10 @@ function buildManagedClobHealthRecord(
     chainKey: "solana",
     duelId: trackedMatch.duelId,
     duelKey: trackedMatch.duelKeyHex,
+    correlationId: buildDuelCorrelationId({
+      duelId: trackedMatch.duelId,
+      duelKey: trackedMatch.duelKeyHex,
+    }),
     marketRef: trackedMatch.marketState.toBase58(),
     lifecycleStatus:
       lifecycleStatusOverride ?? snapshot?.lifecycleStatus ?? "UNKNOWN",
@@ -2285,6 +2702,48 @@ function buildBotRecoveryStates(now = Date.now()): KeeperRecoveryState[] {
   const feedCheckpoint = terminalLedger.getBettingFeedCheckpoint();
   const pendingTerminalCount =
     terminalSummary.PENDING + terminalSummary.PROCESSING;
+  const terminalOperations = terminalLedger.listOperationCorrelations(
+    ["PENDING", "PROCESSING", "MANUAL_REVIEW", "DEAD_LETTER"],
+    64,
+  );
+  const terminalCorrelations = (
+    ...statuses: TerminalOperationRecord["status"][]
+  ) =>
+    normalizeDuelCorrelationIds(
+      terminalOperations
+        .filter((operation) => statuses.includes(operation.status))
+        .map((operation) => operation.correlationId),
+    );
+  const correlationForDuel = (duelId: string): string | null => {
+    const trackedMatch = activeClobMatches.get(duelId);
+    if (trackedMatch) {
+      return buildDuelCorrelationId({
+        duelId: trackedMatch.duelId,
+        duelKey: trackedMatch.duelKeyHex,
+      });
+    }
+    return terminalLedger.getByDuelId(duelId)?.correlationId ?? null;
+  };
+  const recoveryDuelRefs = new Set(
+    marketRecoveryIssues.map((issue) => issue.duelRef),
+  );
+  const marketRecoveryCorrelations = normalizeDuelCorrelationIds(
+    [...activeClobMatches.values()]
+      .filter((trackedMatch) =>
+        recoveryDuelRefs.has(trackedMatch.duelState.toBase58()),
+      )
+      .map((trackedMatch) =>
+        buildDuelCorrelationId({
+          duelId: trackedMatch.duelId,
+          duelKey: trackedMatch.duelKeyHex,
+        }),
+      ),
+  );
+  const awaitingResultCorrelations = normalizeDuelCorrelationIds(
+    [...unresolvedOracleWarningMatches]
+      .map(correlationForDuel)
+      .filter((value): value is string => value !== null),
+  );
   return [
     {
       code: "feed-continuity",
@@ -2314,6 +2773,7 @@ function buildBotRecoveryStates(now = Date.now()): KeeperRecoveryState[] {
       sinceMs: marketRecoveryIssueObservedAtMs,
       untilMs: null,
       details: summarizeMarketRecoveryIssues(marketRecoveryIssues),
+      correlationIds: marketRecoveryCorrelations,
     },
     {
       code: "program-api-missing",
@@ -2372,6 +2832,7 @@ function buildBotRecoveryStates(now = Date.now()): KeeperRecoveryState[] {
         unresolvedOracleWarningMatches.size > 0
           ? `${unresolvedOracleWarningMatches.size} locked duel(s) waiting on authoritative result`
           : null,
+      correlationIds: awaitingResultCorrelations,
     },
     {
       code: "terminal-queue",
@@ -2382,6 +2843,7 @@ function buildBotRecoveryStates(now = Date.now()): KeeperRecoveryState[] {
         pendingTerminalCount > 0
           ? `${terminalSummary.PENDING} pending and ${terminalSummary.PROCESSING} processing terminal operation(s)`
           : null,
+      correlationIds: terminalCorrelations("PENDING", "PROCESSING"),
     },
     {
       code: "terminal-manual-review",
@@ -2392,6 +2854,7 @@ function buildBotRecoveryStates(now = Date.now()): KeeperRecoveryState[] {
         terminalSummary.MANUAL_REVIEW > 0
           ? `${terminalSummary.MANUAL_REVIEW} terminal operation(s) require manual review`
           : null,
+      correlationIds: terminalCorrelations("MANUAL_REVIEW"),
     },
     {
       code: "terminal-dead-letter",
@@ -2402,13 +2865,17 @@ function buildBotRecoveryStates(now = Date.now()): KeeperRecoveryState[] {
         terminalSummary.DEAD_LETTER > 0
           ? `${terminalSummary.DEAD_LETTER} terminal operation(s) exhausted automatic retries`
           : null,
+      correlationIds: terminalCorrelations("DEAD_LETTER"),
     },
   ];
 }
 
+let latestBotHealthSnapshot: KeeperBotHealthSnapshot | null = null;
+let duelBotHealthServer: ReturnType<typeof Bun.serve> | null = null;
+
 function writeBotHealthSnapshot(): void {
-  if (!BOT_HEALTH_FILE) return;
   try {
+    const nowMs = Date.now();
     trimSettledClobHealth();
     const activeRecords = Array.from(activeClobMatches.values()).map(
       (trackedMatch) => buildManagedClobHealthRecord(trackedMatch),
@@ -2416,22 +2883,53 @@ function writeBotHealthSnapshot(): void {
     const recentSettledRecords = Array.from(settledClobHealth.entries())
       .filter(([duelId]) => !activeClobMatches.has(duelId))
       .map(([, record]) => record);
+    const markets = [...activeRecords, ...recentSettledRecords];
     const snapshot: KeeperBotHealthSnapshot = {
       chainKey: "solana",
-      updatedAtMs: Date.now(),
+      releaseCommitSha: BOT_RELEASE_IDENTITY.commitSha,
+      runtime: DUEL_BOT_RUNTIME_IDENTITY,
+      updatedAtMs: nowMs,
       bootedAtMs: botBootedAtMs,
       running: botRuntimeRunning,
       processId: typeof process.pid === "number" ? process.pid : null,
       lastSuccessfulRpcAtMs,
       recovery: buildBotRecoveryStates(),
-      markets: [...activeRecords, ...recentSettledRecords],
+      markets,
+      operatorMetrics: buildKeeperOperatorMetrics({
+        nowMs,
+        checkpoint: terminalLedger.getBettingFeedCheckpoint(),
+        terminal: terminalLedger.getOperationsTelemetry(),
+        markets,
+      }),
     };
+    latestBotHealthSnapshot = snapshot;
+    if (!BOT_HEALTH_FILE) return;
     fs_node.mkdirSync(path.dirname(BOT_HEALTH_FILE), { recursive: true });
     fs_node.writeFileSync(BOT_HEALTH_FILE, JSON.stringify(snapshot, null, 2));
   } catch (error) {
     console.warn("[bot] Failed to write bot health snapshot:", error);
   }
 }
+
+let lastBotHeartbeatWarningAtMs = 0;
+const botHealthHeartbeat = createKeeperBotHeartbeat({
+  intervalMs: BOT_HEALTH_HEARTBEAT_MS,
+  probe: async () => {
+    await connection.getSlot("confirmed");
+  },
+  onRpcSuccess: () => {
+    markRpcSuccess();
+  },
+  writeSnapshot: writeBotHealthSnapshot,
+  onProbeError: (error) => {
+    const now = Date.now();
+    if (now - lastBotHeartbeatWarningAtMs < BOT_READINESS_MAX_AGE_MS) return;
+    lastBotHeartbeatWarningAtMs = now;
+    console.warn(
+      `[bot] health RPC probe failed: ${sanitizeErrorMessage(error)}`,
+    );
+  },
+});
 
 async function settleTrackedMatchFromResolvedState(
   trackedMatch: ActiveClobMatch,
@@ -2440,64 +2938,186 @@ async function settleTrackedMatchFromResolvedState(
 ): Promise<void> {
   await syncTrackedMarketFromOracle(trackedMatch);
   await cancelManagedClobQuotes(trackedMatch, "market-resolved");
-  await withdrawResolvedTradeFees(trackedMatch);
   if (winnerSide) {
     trackedMatch.winner = winnerSide;
   }
+  await settleTrackedMarketCustody(trackedMatch, "RESOLVED");
   trackedMatch.lastResolvedAtMs = Date.now();
-  await captureSettledClobHealth(trackedMatch, "RESOLVED");
   activeClobMatches.delete(duelId);
   unresolvedOracleWarningMatches.delete(duelId);
   writeBotHealthSnapshot();
 }
 
+async function settleManagedMarketMakerBalance(
+  trackedMatch: ActiveClobMatch,
+  lifecycleStatus: "RESOLVED" | "CANCELLED",
+): Promise<void> {
+  const marketState = await getClobMarketState(trackedMatch.marketState);
+  if (
+    !marketState ||
+    !enumIs(
+      marketState.status,
+      lifecycleStatus === "RESOLVED" ? "resolved" : "cancelled",
+    )
+  ) {
+    throw new Error(
+      `Cannot settle market-maker balance for non-${lifecycleStatus.toLowerCase()} market ${trackedMatch.marketState.toBase58()}`,
+    );
+  }
+  const userBalance = findUserBalancePda(
+    marketProgram.programId,
+    trackedMatch.marketState,
+    marketMakerKeypair.publicKey,
+  );
+  const balance =
+    await marketProgram.account.userBalance.fetchNullable(userBalance);
+  const action = resolveManagedMarketMakerSettlement({
+    lifecycleStatus,
+    winner:
+      lifecycleStatus === "RESOLVED"
+        ? enumIs(marketState.winner, "a")
+          ? "A"
+          : enumIs(marketState.winner, "b")
+            ? "B"
+            : null
+        : null,
+    balance: balance
+      ? {
+          aShares: requireAccountU64(balance.aShares, "A-share balance"),
+          bShares: requireAccountU64(balance.bShares, "B-share balance"),
+          aLockedLamports: requireAccountU64(
+            balance.aLockedLamports,
+            "A-side locked lamports",
+          ),
+          bLockedLamports: requireAccountU64(
+            balance.bLockedLamports,
+            "B-side locked lamports",
+          ),
+          tradeTreasuryFeeLamports: requireAccountU64(
+            balance.tradeTreasuryFeeLamports,
+            "user treasury-fee lamports",
+          ),
+          tradeMarketMakerFeeLamports: requireAccountU64(
+            balance.tradeMarketMakerFeeLamports,
+            "user market-maker-fee lamports",
+          ),
+        }
+      : null,
+  });
+  if (action === "none") return;
+
+  await runWithRecovery(
+    () =>
+      action === "claim"
+        ? marketProgram.methods
+            .claim()
+            .accountsPartial({
+              marketState: trackedMatch.marketState,
+              duelState: trackedMatch.duelState,
+              userBalance,
+              config: marketConfigPda,
+              marketMaker: marketState.marketMaker as PublicKey,
+              vault: trackedMatch.vault,
+              user: marketMakerKeypair.publicKey,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([marketMakerKeypair])
+            .rpc()
+        : action === "close-losing-balance"
+          ? marketProgram.methods
+              .closeLosingBalance()
+              .accountsPartial({
+                marketState: trackedMatch.marketState,
+                duelState: trackedMatch.duelState,
+                userBalance,
+                user: marketMakerKeypair.publicKey,
+              })
+              .signers([marketMakerKeypair])
+              .rpc()
+          : marketProgram.methods
+              .closeEmptyUserBalance()
+              .accountsPartial({
+                marketState: trackedMatch.marketState,
+                userBalance,
+                user: marketMakerKeypair.publicKey,
+              })
+              .signers([marketMakerKeypair])
+              .rpc(),
+    connection,
+  );
+  trackedMatch.lastClaimAtMs = markRpcSuccess(trackedMatch);
+  console.log(
+    `[Keeper] Settled market-maker balance for ${trackedMatch.duelId}: ${action}`,
+  );
+}
+
 async function withdrawResolvedTradeFees(
   trackedMatch: ActiveClobMatch,
 ): Promise<void> {
-  const marketState = await getClobMarketState(trackedMatch.marketState);
-  if (!marketState || !enumIs(marketState.status, "resolved")) {
-    throw new Error(
-      `Cannot release execution-fee escrow for unresolved market ${trackedMatch.marketState.toBase58()}`,
-    );
-  }
-  const treasuryFeeLamports = asAccountBigInt(
-    marketState.accruedTradeTreasuryFeeLamports,
-  );
-  const marketMakerFeeLamports = asAccountBigInt(
-    marketState.accruedTradeMarketMakerFeeLamports,
-  );
-  if (treasuryFeeLamports === 0n && marketMakerFeeLamports === 0n) return;
-
-  try {
-    await runWithRecovery(
-      () =>
-        marketProgram.methods
-          .withdrawResolvedTradeFees()
-          .accountsPartial({
-            marketState: trackedMatch.marketState,
-            duelState: trackedMatch.duelState,
-            treasury: marketState.treasury as PublicKey,
-            marketMaker: marketState.marketMaker as PublicKey,
-            vault: trackedMatch.vault,
-            submitter: marketMakerKeypair.publicKey,
-            systemProgram: SystemProgram.programId,
-          })
-          .signers([marketMakerKeypair])
-          .rpc(),
-      connection,
-    );
-  } catch (error) {
-    if (
-      String((error as Error)?.message ?? error).includes("NothingToWithdraw")
-    ) {
-      return;
-    }
-    throw error;
-  }
+  const result = await releaseResolvedTradeFeesFailClosed({
+    readEscrow: async () => {
+      const marketState = await getClobMarketState(trackedMatch.marketState);
+      if (!marketState || !enumIs(marketState.status, "resolved")) {
+        throw new Error(
+          `Cannot release execution-fee escrow for unresolved market ${trackedMatch.marketState.toBase58()}`,
+        );
+      }
+      return {
+        treasuryLamports: requireAccountU64(
+          marketState.accruedTradeTreasuryFeeLamports,
+          "accrued treasury-fee lamports",
+        ),
+        marketMakerLamports: requireAccountU64(
+          marketState.accruedTradeMarketMakerFeeLamports,
+          "accrued market-maker-fee lamports",
+        ),
+      };
+    },
+    submitRelease: async () => {
+      const marketState = await getClobMarketState(trackedMatch.marketState);
+      if (!marketState || !enumIs(marketState.status, "resolved")) {
+        throw new Error(
+          `Cannot release execution-fee escrow for unresolved market ${trackedMatch.marketState.toBase58()}`,
+        );
+      }
+      await runWithRecovery(
+        () =>
+          marketProgram.methods
+            .withdrawResolvedTradeFees()
+            .accountsPartial({
+              marketState: trackedMatch.marketState,
+              duelState: trackedMatch.duelState,
+              treasury: marketState.treasury as PublicKey,
+              marketMaker: marketState.marketMaker as PublicKey,
+              vault: trackedMatch.vault,
+              submitter: marketMakerKeypair.publicKey,
+              systemProgram: SystemProgram.programId,
+            })
+            .signers([marketMakerKeypair])
+            .rpc(),
+        connection,
+      );
+    },
+  });
+  if (!result.attempted) return;
   markRpcSuccess(trackedMatch);
   console.log(
-    `[Keeper] Released resolved execution-fee escrow for ${trackedMatch.duelId}: treasury=${treasuryFeeLamports} marketMaker=${marketMakerFeeLamports}`,
+    `[Keeper] Released resolved execution-fee escrow for ${trackedMatch.duelId}: treasury=${result.before.treasuryLamports} marketMaker=${result.before.marketMakerLamports}`,
   );
+}
+
+async function settleTrackedMarketCustody(
+  trackedMatch: ActiveClobMatch,
+  lifecycleStatus: "RESOLVED" | "CANCELLED",
+): Promise<void> {
+  await reconcileTerminalMarketCustody({
+    lifecycleStatus,
+    settleMarketMakerBalance: () =>
+      settleManagedMarketMakerBalance(trackedMatch, lifecycleStatus),
+    releaseResolvedTradeFees: () => withdrawResolvedTradeFees(trackedMatch),
+    captureSettledHealth: () =>
+      captureSettledClobHealth(trackedMatch, lifecycleStatus),
+  });
 }
 
 async function maybeFinalizeTrackedProposal(
@@ -2517,8 +3137,22 @@ async function maybeFinalizeTrackedProposal(
     throw new Error(`Missing oracle config ${oracleConfigPda.toBase58()}`);
   }
 
-  const finalizableAt =
-    asNum(duelState.pendingProposedAt) + asNum(oracleConfig.disputeWindowSecs);
+  const pendingProposedAt = requireSafeAccountInteger(
+    duelState.pendingProposedAt,
+    "pending proposal timestamp",
+    { min: 1 },
+  );
+  const disputeWindowSecs = requireSafeAccountInteger(
+    oracleConfig.disputeWindowSecs,
+    "proposal dispute window seconds",
+    { min: 1 },
+  );
+  const finalizableAt = pendingProposedAt + disputeWindowSecs;
+  if (!Number.isSafeInteger(finalizableAt)) {
+    throw new Error(
+      "proposal finalization timestamp exceeds safe integer range",
+    );
+  }
   const chainTimeSecs = await getConfirmedChainTimeSecs();
   if (!isOracleTimestampMature(chainTimeSecs, finalizableAt)) {
     return false;
@@ -2612,7 +3246,11 @@ async function reportRoundResult(
   try {
     duelEndTs = resolveOracleDuelEndTimestamp({
       duelEndTimeMs: data.duelEndTime,
-      duelStartTs: asNum(duelState.duelStartTs),
+      duelStartTs: requireSafeAccountInteger(
+        duelState.duelStartTs,
+        "completed duel start timestamp",
+        { min: 1 },
+      ),
     });
   } catch (error) {
     throw new Error(
@@ -2627,7 +3265,11 @@ async function reportRoundResult(
 
   duelState = await getDuelState(trackedMatch.duelState);
   if (duelState && enumIs(duelState.status, "locked")) {
-    const duelStartTs = asNum(duelState.duelStartTs);
+    const duelStartTs = requireSafeAccountInteger(
+      duelState.duelStartTs,
+      "locked duel start timestamp",
+      { min: 1 },
+    );
     if (duelEndTs < duelStartTs) {
       throw new Error(
         `[Keeper] duel:completed for ${data.duelId} ended at ${duelEndTs}, before its immutable on-chain start ${duelStartTs}; refusing to post an inconsistent result.`,
@@ -2643,6 +3285,8 @@ async function reportRoundResult(
       winnerSide,
       resolvedSeed,
       replayHashHex,
+      data.competitiveSnapshotVersion,
+      data.competitiveSnapshotDigest,
     );
     const proposalRecord = findProposalRecordPda(
       fightProgram.programId,
@@ -2857,7 +3501,7 @@ async function cancelRoundForTerminalOutcome(
   }
 
   await syncTrackedMarketFromOracle(trackedMatch);
-  await captureSettledClobHealth(trackedMatch, "CANCELLED");
+  await settleTrackedMarketCustody(trackedMatch, "CANCELLED");
   unresolvedOracleWarningMatches.delete(data.duelId);
   activeClobMatches.delete(data.duelId);
 }
@@ -2954,8 +3598,10 @@ async function ensureTrackedMatchForTerminalEvent(
     );
   }
   activeClobMatches.set(data.duelId, recovered);
-  restartRecoveryObservedAtMs = restartRecoveryObservedAtMs ?? Date.now();
-  restartRecoveryDetails = `recovered terminal duel ${data.duelId} from persistent ledger`;
+  // Terminal operations are intentionally processed from the durable ledger
+  // after the dispute window. Rehydrating that expected work is not a keeper
+  // restart condition; the terminal queue and partial-claim market marker
+  // expose its bounded progress until the claim completes.
   return recovered;
 }
 
@@ -3081,7 +3727,16 @@ const duelFeedConfig = resolveDuelFeedConfig({
   gameUrl: args["game-url"],
   bearerToken: process.env.BET_SYNC_SOURCE_BEARER_TOKEN,
 });
-const gameClient = new GameClient(duelFeedConfig.gameUrl, terminalLedger);
+const allowLocalDiagnosticFeed = resolveLocalDiagnosticDuelFeed({
+  requested: process.env.HYPERBET_LOCAL_DIAGNOSTIC_FEED === "true",
+  cluster: botCluster,
+  gameUrl: duelFeedConfig.gameUrl,
+  rpcUrl: getRpcUrl(),
+});
+const gameClient = new GameClient(duelFeedConfig.gameUrl, terminalLedger, {
+  allowDiagnosticSnapshot: allowLocalDiagnosticFeed,
+  bearerToken: duelFeedConfig.bearerToken,
+});
 let shutdownRequested = false;
 let keeperMutationTail: Promise<void> = Promise.resolve();
 
@@ -3105,8 +3760,11 @@ function recordBotRuntimeError(error: unknown): void {
 }
 
 function closeKeeperRuntime(): void {
+  botHealthHeartbeat.stop();
   botRuntimeRunning = false;
   writeBotHealthSnapshot();
+  duelBotHealthServer?.stop(true);
+  duelBotHealthServer = null;
   gameClient.disconnect();
   terminalLedger.close();
 }
@@ -3123,7 +3781,15 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 
 gameClient.onDuelStart((data) =>
   withKeeperMutationLock(async () => {
-    markStreamEvent();
+    const rendererObservationCurrent = isCurrentDuelRendererObservation({
+      rendererReady: data.rendererHealth.ready,
+      rendererUpdatedAt: data.rendererHealth.updatedAt,
+      emittedAt: data.emittedAt,
+      betOpenTime: data.betOpenTime,
+    });
+    if (rendererObservationCurrent) {
+      markStreamEvent();
+    }
     if (!keeperProgramApiReady) {
       warnMissingKeeperMethodsOnce();
       throw new Error("keeper program API is not ready for duel start");
@@ -3148,6 +3814,20 @@ gameClient.onDuelStart((data) =>
       await ensureMarketConfigReady();
       await ensureOnChainMarketDiscovery(marketDiscoveryErrorAtMs != null);
       let trackedMatch = activeClobMatches.get(data.duelId) ?? null;
+      const admission = resolveDuelMarketAdmission({
+        existingMarket: trackedMatch !== null,
+        rendererReady: data.rendererHealth.ready,
+        rendererUpdatedAt: data.rendererHealth.updatedAt,
+        phase: data.phase,
+        emittedAt: data.emittedAt,
+        betOpenTime: data.betOpenTime,
+        betCloseTime: data.betCloseTime,
+      });
+      if (admission.action === "reject") {
+        throw new Error(
+          `refusing first market creation for duel ${data.duelId}: ${admission.reason}`,
+        );
+      }
       if (trackedMatch) {
         const duelState = await upsertDuelLifecycle(data, "bettingOpen");
         if (!duelState.equals(trackedMatch.duelState)) {
@@ -3173,17 +3853,38 @@ gameClient.onDuelStart((data) =>
   }),
 );
 
-gameClient.onStateFrame((data) => {
+// A duplicate sequence must not replay lifecycle callbacks, but a successful
+// authenticated and continuity-checked poll is still an authoritative source
+// heartbeat for the market-maker stale-stream circuit breaker.
+gameClient.onSourceObservation((data) => {
   const trackedMatch = data.duelId
     ? (activeClobMatches.get(data.duelId) ?? null)
     : null;
-  markStreamEvent(trackedMatch);
+  if (
+    isCurrentDuelRendererObservation({
+      rendererReady: data.rendererHealth.ready,
+      rendererUpdatedAt: data.rendererHealth.updatedAt,
+      emittedAt: data.emittedAt,
+      betOpenTime: data.betOpenTime,
+    })
+  ) {
+    markStreamEvent(trackedMatch);
+  }
   writeBotHealthSnapshot();
 });
 
 gameClient.onBettingLocked((data) =>
   withKeeperMutationLock(async () => {
-    markStreamEvent(activeClobMatches.get(data.duelId) ?? null);
+    if (
+      isCurrentDuelRendererObservation({
+        rendererReady: data.rendererHealth.ready,
+        rendererUpdatedAt: data.rendererHealth.updatedAt,
+        emittedAt: data.emittedAt,
+        betOpenTime: data.betOpenTime,
+      })
+    ) {
+      markStreamEvent(activeClobMatches.get(data.duelId) ?? null);
+    }
     if (!keeperProgramApiReady) {
       warnMissingKeeperMethodsOnce();
       throw new Error("keeper program API is not ready for betting lock");
@@ -3215,7 +3916,16 @@ gameClient.onBettingLocked((data) =>
 
 gameClient.onDuelEnd((data) =>
   withKeeperMutationLock(async () => {
-    markStreamEvent(activeClobMatches.get(data.duelId) ?? null);
+    if (
+      isCurrentDuelRendererObservation({
+        rendererReady: data.rendererHealth.ready,
+        rendererUpdatedAt: data.rendererHealth.updatedAt,
+        emittedAt: data.emittedAt,
+        betOpenTime: data.betOpenTime,
+      })
+    ) {
+      markStreamEvent(activeClobMatches.get(data.duelId) ?? null);
+    }
     console.log("Duel Ended:", data);
     const terminal = classifyDuelTerminal({
       outcome: data.outcome,
@@ -3329,19 +4039,27 @@ async function runMaintenance(): Promise<void> {
       continue;
     }
 
-    if (
-      enumIs(duelState.status, "resolved") ||
-      enumIs(duelState.status, "cancelled")
-    ) {
+    if (enumIs(duelState.status, "resolved")) {
       await cancelManagedClobQuotes(trackedMatch, "market-terminal");
-      trackedMatch.lastResolvedAtMs =
-        trackedMatch.lastResolvedAtMs ?? Date.now();
-      await captureSettledClobHealth(
-        trackedMatch,
-        enumIs(duelState.status, "cancelled") ? "CANCELLED" : "RESOLVED",
-      );
+      const recoveredWinner = resolvedWinnerFromDuelState(duelState);
+      if (!recoveredWinner) {
+        throw new Error(
+          `Resolved duel ${duelId} is missing a canonical participant winner`,
+        );
+      }
+      trackedMatch.winner = recoveredWinner;
+      await settleTrackedMarketCustody(trackedMatch, "RESOLVED");
       unresolvedOracleWarningMatches.delete(duelId);
       activeClobMatches.delete(duelId);
+      continue;
+    }
+
+    if (enumIs(duelState.status, "cancelled")) {
+      await cancelManagedClobQuotes(trackedMatch, "market-terminal");
+      await settleTrackedMarketCustody(trackedMatch, "CANCELLED");
+      unresolvedOracleWarningMatches.delete(duelId);
+      activeClobMatches.delete(duelId);
+      continue;
     }
   }
 
@@ -3350,6 +4068,22 @@ async function runMaintenance(): Promise<void> {
   }
   clearCompletedRestartRecovery();
   // Brand-new rounds are still created only from authoritative duel-start events.
+}
+
+botHealthHeartbeat.start();
+void botHealthHeartbeat.tick();
+writeBotHealthSnapshot();
+if (DUEL_BOT_HEALTH_SERVER_CONFIG) {
+  duelBotHealthServer = startDuelBotHealthServer({
+    config: DUEL_BOT_HEALTH_SERVER_CONFIG,
+    production: PROTECTED_KEEPER_RUNTIME,
+    release: BOT_RELEASE_IDENTITY,
+    runtime: DUEL_BOT_RUNTIME_IDENTITY,
+    getSnapshot: () => latestBotHealthSnapshot,
+  });
+  console.log(
+    `[bot] private health server listening on ${duelBotHealthServer.url.origin}`,
+  );
 }
 
 try {
@@ -3371,7 +4105,7 @@ try {
 writeBotHealthSnapshot();
 gameClient.connect();
 
-for (; !shutdownRequested; ) {
+for (; !shutdownRequested;) {
   try {
     await withKeeperMutationLock(runMaintenance);
     lastCycleErrorAtMs = null;

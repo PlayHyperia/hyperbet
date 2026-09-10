@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "randomWordCount": 256,
+  "cases": [
+    {
+      "id": "hype-mixed",
+      "kind": "seed",
+      "seed": "0x48595045",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    },
+    {
+      "id": "golden-ratio-mixed",
+      "kind": "seed",
+      "seed": "0x3c6ef373",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    },
+    {
+      "id": "order-book-mixed",
+      "kind": "seed",
+      "seed": "0x424f4f4b",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    },
+    {
+      "id": "matching-tick-mixed",
+      "kind": "seed",
+      "seed": "0x5449434b",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    }
+  ]
+}

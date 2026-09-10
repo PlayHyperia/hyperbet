@@ -8,9 +8,50 @@ export type StreamStateSourceConfig = {
   bearerToken: string;
 };
 
-function isMainnetCluster(cluster: string): boolean {
-  const normalized = cluster.trim().toLowerCase();
-  return normalized === "mainnet" || normalized === "mainnet-beta";
+function isLoopbackHostname(hostname: string): boolean {
+  return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
+    hostname.trim().toLowerCase(),
+  );
+}
+
+export function resolveLocalDiagnosticDuelFeed(input: {
+  requested: boolean;
+  cluster: string;
+  gameUrl: string;
+  rpcUrl: string;
+}): boolean {
+  if (!input.requested) return false;
+  if (input.cluster.trim().toLowerCase() !== "localnet") {
+    throw new Error(
+      "HYPERBET_LOCAL_DIAGNOSTIC_FEED requires SOLANA_CLUSTER=localnet",
+    );
+  }
+  let gameUrl: URL;
+  let rpcUrl: URL;
+  try {
+    gameUrl = new URL(input.gameUrl);
+    rpcUrl = new URL(input.rpcUrl);
+  } catch {
+    throw new Error(
+      "HYPERBET_LOCAL_DIAGNOSTIC_FEED requires absolute game and RPC URLs",
+    );
+  }
+  for (const [label, parsed] of [
+    ["GAME_URL", gameUrl],
+    ["SOLANA_RPC_URL", rpcUrl],
+  ] as const) {
+    if (
+      parsed.protocol !== "http:" ||
+      !isLoopbackHostname(parsed.hostname) ||
+      parsed.username ||
+      parsed.password
+    ) {
+      throw new Error(
+        `HYPERBET_LOCAL_DIAGNOSTIC_FEED requires loopback HTTP ${label}`,
+      );
+    }
+  }
+  return true;
 }
 
 export function resolveDuelFeedConfig(input: {
@@ -30,13 +71,23 @@ export function resolveDuelFeedConfig(input: {
   if (parsed.username || parsed.password) {
     throw new Error("GAME_URL must not contain embedded credentials");
   }
-  if (isMainnetCluster(input.cluster)) {
+  const cluster = input.cluster.trim().toLowerCase();
+  if (
+    cluster !== "localnet" &&
+    cluster !== "devnet" &&
+    cluster !== "testnet" &&
+    cluster !== "mainnet" &&
+    cluster !== "mainnet-beta"
+  ) {
+    throw new Error(`Unsupported Solana duel-feed cluster '${input.cluster}'`);
+  }
+  if (cluster !== "localnet") {
     if (parsed.protocol !== "https:") {
-      throw new Error("GAME_URL must use HTTPS on mainnet-beta");
+      throw new Error("GAME_URL must use HTTPS on every non-local launch rail");
     }
     if (!bearerToken) {
       throw new Error(
-        "BET_SYNC_SOURCE_BEARER_TOKEN is required on mainnet-beta",
+        "BET_SYNC_SOURCE_BEARER_TOKEN is required on every non-local launch rail",
       );
     }
   } else if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {

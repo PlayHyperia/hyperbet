@@ -29,7 +29,7 @@ function createScopedMockPlugin() {
 /** @type {import('@storybook/react-vite').StorybookConfig} */
 module.exports = {
   stories: ["../stories/**/*.stories.@(ts|tsx)"],
-  addons: ["@storybook/addon-essentials", "@storybook/addon-interactions"],
+  addons: ["@storybook/addon-essentials"],
   framework: {
     name: "@storybook/react-vite",
     options: {},

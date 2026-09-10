@@ -34,7 +34,8 @@ type PointsResponse = {
 };
 
 type InviteResponse = {
-  inviteCode: string;
+  inviteCode: string | null;
+  inviteRegistrationRequired: boolean;
 };
 
 type PredictionMarketsResponse = {
@@ -162,7 +163,7 @@ async function ensureWalletConnected(page: Page): Promise<void> {
       .getByRole("button", { name: /E2E Trader/i })
       .first();
     if (!(await walletOption.isVisible().catch(() => false))) return false;
-    await walletOption.click({ force: true });
+    await walletOption.click();
     await expect(
       page.getByRole("dialog", {
         name: /Connect a wallet on Solana to continue/i,
@@ -305,7 +306,8 @@ test.describe("app tabs and api coverage", () => {
       request,
       `/api/arena/invite/${encodeURIComponent(wallet)}?platform=solana`,
     );
-    expect(invite.inviteCode).not.toBe("");
+    expect(invite.inviteCode).toBeNull();
+    expect(invite.inviteRegistrationRequired).toBe(true);
 
     for (const retiredPath of [
       "/api/perps/markets",
@@ -343,6 +345,7 @@ test.describe("app tabs and api coverage", () => {
     await selectChain(page, "solana");
     await ensureWalletConnected(page);
 
+    await page.getByTestId("duels-bottom-tab-trades").click();
     await expect(page.getByTestId("duels-bottom-panel-trades")).toBeVisible();
 
     await page.getByTestId("duels-bottom-tab-orders").click();
@@ -362,7 +365,7 @@ test.describe("app tabs and api coverage", () => {
     await page.getByTestId("duels-bottom-tab-news").click();
     await expect(page.getByTestId("duels-bottom-panel-news")).toBeVisible();
     await expect(page.getByTestId("duels-bottom-panel-news")).toContainText(
-      /fighting|announcement|resolution|cancelled/i,
+      /next match|betting open|watching now/i,
     );
 
     await page.getByTestId("duels-bottom-tab-holders").click();
@@ -381,12 +384,39 @@ test.describe("app tabs and api coverage", () => {
     await expect(
       page.getByTestId("duels-bottom-panel-topTraders"),
     ).toContainText(streamState.leaderboard[0]?.name || "");
+    await expect(
+      page.getByRole("table", { name: "Leaderboard" }),
+    ).toBeVisible();
 
     await page
       .locator('[data-testid="points-drawer-open"]:visible')
       .first()
       .click();
     await expect(page.getByTestId("points-drawer")).toBeVisible();
+    await expect(page.getByTestId("points-drawer-overlay")).toHaveCSS(
+      "position",
+      "fixed",
+    );
+    await expect(page.getByTestId("points-drawer")).toHaveCSS(
+      "overflow-y",
+      "auto",
+    );
+    await expect(
+      page.getByRole("tablist", {
+        name: "Leaderboard & Stats",
+      }),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId("points-drawer-tab-leaderboard"),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      await page
+        .getByTestId("points-drawer-close")
+        .evaluate((element) => element.getBoundingClientRect().height),
+    ).toBeGreaterThanOrEqual(44);
+    expect(await page.evaluate(() => document.body.style.overflow)).toBe(
+      "hidden",
+    );
 
     await expect(page.getByTestId("points-display-total").last()).toContainText(
       points.totalPoints.toLocaleString(),
@@ -396,15 +426,41 @@ test.describe("app tabs and api coverage", () => {
       page.getByTestId("points-drawer-panel-leaderboard"),
     ).toBeVisible();
 
-    await page.getByTestId("points-drawer-tab-history").click();
+    await page.getByTestId("points-drawer-tab-leaderboard").press("ArrowRight");
     await expect(page.getByTestId("points-drawer-panel-history")).toBeVisible();
-    await page.getByTestId("points-drawer-tab-referral").click();
+    await expect(page.getByTestId("points-drawer-tab-history")).toBeFocused();
+    await page.getByTestId("points-drawer-tab-history").press("End");
     await expect(
       page.getByTestId("points-drawer-panel-referral"),
     ).toBeVisible();
-    await expect(page.getByTestId("referral-panel-invite-code")).toContainText(
-      invite.inviteCode,
+    await expect(page.getByTestId("points-drawer-tab-referral")).toBeFocused();
+    expect(invite.inviteCode).toBeNull();
+    expect(invite.inviteRegistrationRequired).toBe(true);
+    const inviteCode = page.getByTestId("referral-panel-invite-code");
+    const createInvite = page.getByTestId("referral-panel-create-button");
+    await expect(inviteCode).toHaveText("-");
+    await expect(createInvite).toBeEnabled();
+    expect(
+      await createInvite.evaluate(
+        (element) => element.getBoundingClientRect().height,
+      ),
+    ).toBeGreaterThanOrEqual(44);
+    await createInvite.click();
+    await expect(page.getByTestId("referral-panel-status")).toHaveText(
+      "Invite code created",
     );
+    await expect(inviteCode).toHaveText(/^HS[A-F0-9]{8}$/u);
+    const createdInviteCode = (await inviteCode.textContent())?.trim() ?? "";
+    const persistedInvite = await fetchJson<InviteResponse>(
+      request,
+      `/api/arena/invite/${encodeURIComponent(wallet)}?platform=solana`,
+    );
+    expect(persistedInvite).toMatchObject({
+      inviteCode: createdInviteCode,
+      inviteRegistrationRequired: false,
+    });
+    await expect(createInvite).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Copy Link" })).toBeVisible();
     await expect(page.getByTestId("referral-panel-redeem-input")).toBeVisible();
     await expect(
       page.getByTestId("referral-panel-redeem-button"),
@@ -418,5 +474,6 @@ test.describe("app tabs and api coverage", () => {
 
     await page.getByTestId("points-drawer-close").click();
     await expect(page.getByTestId("points-drawer")).toBeHidden();
+    expect(await page.evaluate(() => document.body.style.overflow)).toBe("");
   });
 });

@@ -20,6 +20,7 @@ import fightOracleIdl from "../../../anchor/target/idl/fight_oracle.json";
 import duelMarketIdl from "../../../anchor/target/idl/duel_market.json";
 import {
   createOpenMarketFixture,
+  deriveOracleConfigPda,
   deriveUserBalancePda,
   uniqueDuelKey,
 } from "../../../anchor/tests/clob-test-helpers";
@@ -28,6 +29,14 @@ import {
   type StreamingCycle,
 } from "../../../keeper/src/game-client";
 import { buildDuelLifecycleMetadata } from "../../../keeper/src/duelTerminalPolicy";
+import { resolveLocalnetDuelTiming } from "./localnetDuelTiming";
+import {
+  buildSyntheticDuelCommitment,
+  E2E_AGENT_A_IDENTITY,
+  E2E_AGENT_B_IDENTITY,
+  E2E_INITIAL_CYCLE_ID,
+  syntheticParticipantHash,
+} from "./syntheticDuelFixture";
 
 type SignableTx = Transaction | VersionedTransaction;
 type AnchorLikeWallet = Wallet & { payer: Keypair };
@@ -429,30 +438,40 @@ async function main(): Promise<void> {
         `e2e-current-duel:${Date.now()}:${Math.random().toString(16).slice(2)}`,
       );
   const currentDuelKeyHex = Buffer.from(currentDuelKey).toString("hex");
-  const betOpenTs = realCycle?.betOpenTime
-    ? Math.floor(realCycle.betOpenTime / 1_000)
-    : now - 30;
-  const betCloseTs = realCycle?.betCloseTime
-    ? Math.floor(realCycle.betCloseTime / 1_000)
-    : now + 3_600;
-  const duelStartTs = realCycle?.fightStartTime
-    ? Math.floor(realCycle.fightStartTime / 1_000)
-    : realCycle
-      ? betCloseTs
-      : now + 3_660;
-  const currentDuelMetadata = realCycle
-    ? buildDuelLifecycleMetadata({
-        duelId: currentDuelId,
-        duelKey: currentDuelKeyHex,
-        snapshotDigest: realCycle.competitiveSnapshotDigest,
-      })
-    : JSON.stringify({
+  const { betOpenTs, betCloseTs, duelStartTs } = resolveLocalnetDuelTiming(
+    now,
+    realCycle,
+  );
+  const syntheticCommitment = realCycle
+    ? null
+    : buildSyntheticDuelCommitment({
+        cycleId: E2E_INITIAL_CYCLE_ID,
         duelId: currentDuelId,
         duelKeyHex: currentDuelKeyHex,
-        matchId: currentMatchId,
-        agent1: "E2E Active Agent A",
-        agent2: "E2E Active Agent B",
+        betOpenTs,
+        betCloseTs,
+        duelStartTs,
       });
+  const competitiveSnapshotVersion =
+    realCycle?.competitiveSnapshotVersion ??
+    syntheticCommitment?.competitiveSnapshotVersion;
+  const competitiveSnapshotDigest =
+    realCycle?.competitiveSnapshotDigest ??
+    syntheticCommitment?.competitiveSnapshotDigest;
+  if (
+    !Number.isSafeInteger(competitiveSnapshotVersion) ||
+    Number(competitiveSnapshotVersion) <= 0 ||
+    !competitiveSnapshotDigest ||
+    !/^[0-9a-f]{64}$/.test(competitiveSnapshotDigest)
+  ) {
+    throw new Error("Prepared duel is missing a canonical snapshot commitment");
+  }
+  const currentDuelMetadata = buildDuelLifecycleMetadata({
+    duelId: currentDuelId,
+    duelKey: currentDuelKeyHex,
+    snapshotVersion: Number(competitiveSnapshotVersion),
+    snapshotDigest: competitiveSnapshotDigest,
+  });
   const currentMarket = await createOpenMarketFixture(
     fightProgram as never,
     clobProgram as never,
@@ -464,15 +483,59 @@ async function main(): Promise<void> {
       // orders as already closed while the UI still thinks the market is open.
       betCloseTs,
       duelStartTs,
-      ...(realCycle
-        ? {
-            participantAHash: participantHash(realCycle.agent1),
-            participantBHash: participantHash(realCycle.agent2),
-          }
-        : {}),
+      participantAHash: realCycle
+        ? participantHash(realCycle.agent1)
+        : (syntheticCommitment?.participantAHash ??
+          syntheticParticipantHash(E2E_AGENT_A_IDENTITY.id)),
+      participantBHash: realCycle
+        ? participantHash(realCycle.agent2)
+        : (syntheticCommitment?.participantBHash ??
+          syntheticParticipantHash(E2E_AGENT_B_IDENTITY.id)),
+      competitiveSnapshotVersion: Number(competitiveSnapshotVersion),
+      competitiveSnapshotDigest: Array.from(
+        Buffer.from(competitiveSnapshotDigest, "hex"),
+      ),
       metadataUri: currentDuelMetadata,
     },
   );
+
+  const oracleConfigPda = deriveOracleConfigPda(fightProgram.programId);
+  const oracleConfig =
+    await fightProgram.account.oracleConfig.fetch(oracleConfigPda);
+  if (!oracleConfig.configFrozen) {
+    await fightProgram.methods
+      .freezeOracleConfig()
+      .accountsPartial({
+        authority: authority.publicKey,
+        oracleConfig: oracleConfigPda,
+      })
+      .signers([authority])
+      .rpc();
+  }
+
+  const marketConfig = await clobProgram.account.marketConfig.fetch(
+    currentMarket.config,
+  );
+  if (!marketConfig.configFrozen) {
+    await clobProgram.methods
+      .freezeConfig()
+      .accountsPartial({
+        authority: authority.publicKey,
+        config: currentMarket.config,
+      })
+      .signers([authority])
+      .rpc();
+  }
+
+  const [frozenOracleConfig, frozenMarketConfig] = await Promise.all([
+    fightProgram.account.oracleConfig.fetch(oracleConfigPda),
+    clobProgram.account.marketConfig.fetch(currentMarket.config),
+  ]);
+  if (!frozenOracleConfig.configFrozen || !frozenMarketConfig.configFrozen) {
+    throw new Error(
+      "Local Solana launch configuration did not converge to permanent freeze",
+    );
+  }
 
   const clobUserBalancePda = deriveUserBalancePda(
     clobProgram.programId,
@@ -482,6 +545,7 @@ async function main(): Promise<void> {
 
   const envBody = [
     "VITE_SOLANA_CLUSTER=localnet",
+    "VITE_TRANSACTIONS_ENABLED=true",
     `VITE_SOLANA_RPC_URL=${browserSolanaRpcUrl}`,
     `VITE_SOLANA_WS_URL=${browserSolanaWsUrl}`,
     "VITE_USE_LOCAL_SOLANA_RPC_PROXY=true",

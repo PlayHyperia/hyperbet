@@ -112,7 +112,19 @@ async function readBody(req) {
 }
 
 function resolveTarget(base, requestUrl) {
-  return new URL(requestUrl || "/", base);
+  const target = new URL(requestUrl || "/", base);
+  if (target.pathname === "/verifier") target.pathname = "/";
+  return target;
+}
+
+function isVerifierLaneRequest(requestUrl) {
+  try {
+    return (
+      new URL(requestUrl || "/", "http://127.0.0.1").pathname === "/verifier"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function getRpcMethod(body) {
@@ -158,10 +170,17 @@ function readE2eFaultControl() {
   if (!e2eFaultsEnabled || !e2eFaultControlPath) return null;
   try {
     const candidate = JSON.parse(fs.readFileSync(e2eFaultControlPath, "utf8"));
+    const supportedMode =
+      candidate?.mode === "hold_send_transaction_after_forward" ||
+      candidate?.mode === "hide_get_transaction_after_forward";
+    const supportedState =
+      candidate?.state === "armed" ||
+      candidate?.state === "observed" ||
+      candidate?.state === "released";
     if (
       candidate?.version !== 1 ||
-      candidate?.mode !== "hold_send_transaction_after_forward" ||
-      candidate?.state !== "armed" ||
+      !supportedMode ||
+      !supportedState ||
       typeof candidate?.faultId !== "string" ||
       !candidate.faultId.trim() ||
       typeof candidate?.requiredAccount !== "string" ||
@@ -171,25 +190,52 @@ function readE2eFaultControl() {
     ) {
       return null;
     }
+    if (
+      candidate.state !== "armed" &&
+      (typeof candidate.signature !== "string" || !candidate.signature.trim())
+    ) {
+      return null;
+    }
+    if (
+      candidate.mode === "hold_send_transaction_after_forward" &&
+      candidate.state === "released"
+    ) {
+      return null;
+    }
+    if (
+      candidate.mode === "hide_get_transaction_after_forward" &&
+      candidate.hiddenLookupCount !== undefined &&
+      candidate.hiddenLookupCount !== 0 &&
+      candidate.hiddenLookupCount !== 1
+    ) {
+      return null;
+    }
     return candidate;
   } catch {
     return null;
   }
 }
 
+function writeE2eFaultControl(control) {
+  const temporaryPath = `${e2eFaultControlPath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(control, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  fs.renameSync(temporaryPath, e2eFaultControlPath);
+}
+
 function recordE2eFaultObservation(control, signature) {
+  const observedAtMs = Date.now();
   const observation = {
     ...control,
     state: "observed",
     signature,
-    observedAtMs: Date.now(),
-    holdUntilMs: Date.now() + e2eFaultHoldMs,
+    observedAtMs,
+    ...(control.mode === "hold_send_transaction_after_forward"
+      ? { holdUntilMs: observedAtMs + e2eFaultHoldMs }
+      : { hiddenLookupCount: 0 }),
   };
-  const temporaryPath = `${e2eFaultControlPath}.${process.pid}.tmp`;
-  fs.writeFileSync(temporaryPath, `${JSON.stringify(observation, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  fs.renameSync(temporaryPath, e2eFaultControlPath);
+  writeE2eFaultControl(observation);
   return observation;
 }
 
@@ -200,7 +246,7 @@ async function maybeHoldForwardedSendTransaction(
 ) {
   if (rpcMethod !== "sendTransaction") return;
   const control = readE2eFaultControl();
-  if (!control) return;
+  if (!control || control.state !== "armed") return;
   const keys = transactionStaticAccountKeys(requestPayload);
   if (
     !keys.includes(control.requiredAccount) ||
@@ -218,10 +264,74 @@ async function maybeHoldForwardedSendTransaction(
   if (!signature) return;
 
   const observation = recordE2eFaultObservation(control, signature);
+  if (control.mode === "hide_get_transaction_after_forward") {
+    console.log(
+      `[solana-rpc-proxy] E2E fault ${observation.faultId} observed forwarded sendTransaction ${signature}; waiting to hide one finalized getTransaction response`,
+    );
+    return;
+  }
   console.log(
     `[solana-rpc-proxy] E2E fault ${observation.faultId} observed forwarded sendTransaction ${signature}; holding response for ${e2eFaultHoldMs}ms`,
   );
   await new Promise((resolve) => setTimeout(resolve, e2eFaultHoldMs));
+}
+
+function maybeHideFinalizedTransactionLookup(
+  rpcMethod,
+  requestPayload,
+  responsePayload,
+  requestUrl,
+) {
+  if (rpcMethod !== "getTransaction" || !isVerifierLaneRequest(requestUrl)) {
+    return responsePayload;
+  }
+  const control = readE2eFaultControl();
+  if (
+    !control ||
+    control.mode !== "hide_get_transaction_after_forward" ||
+    control.state !== "observed" ||
+    control.hiddenLookupCount !== 0
+  ) {
+    return responsePayload;
+  }
+  const signature = requestPayload?.params?.[0];
+  const options = requestPayload?.params?.[1];
+  if (
+    signature !== control.signature ||
+    options == null ||
+    typeof options !== "object" ||
+    options.commitment !== "finalized"
+  ) {
+    return responsePayload;
+  }
+
+  let response;
+  try {
+    response = JSON.parse(responsePayload.toString("utf8"));
+  } catch {
+    return responsePayload;
+  }
+  if (response?.result == null) return responsePayload;
+
+  const hiddenAtMs = Date.now();
+  writeE2eFaultControl({
+    ...control,
+    state: "released",
+    hiddenLookupCount: 1,
+    hiddenAtMs,
+    releasedAtMs: hiddenAtMs,
+    requestedCommitment: "finalized",
+    requestedLane: "verifier",
+  });
+  console.log(
+    `[solana-rpc-proxy] E2E fault ${control.faultId} hid one finalized getTransaction response for ${signature}; subsequent lookups are released`,
+  );
+  return Buffer.from(
+    JSON.stringify({
+      ...response,
+      result: null,
+    }),
+  );
 }
 
 const server = createServer(async (req, res) => {
@@ -259,7 +369,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const payload = Buffer.from(await upstream.arrayBuffer());
+    let payload = Buffer.from(await upstream.arrayBuffer());
+    payload = maybeHideFinalizedTransactionLookup(
+      rpcMethod,
+      requestPayload,
+      payload,
+      req.url,
+    );
     await maybeHoldForwardedSendTransaction(rpcMethod, requestPayload, payload);
     res.writeHead(upstream.status, {
       ...filterResponseHeaders(upstream.headers),

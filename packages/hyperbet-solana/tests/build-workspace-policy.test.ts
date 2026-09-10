@@ -148,6 +148,24 @@ describe("Solana workspace build policy", () => {
       'bash "$ROOT_DIR/scripts/build-workspace.sh"',
     );
     expect(localnetHarness).not.toMatch(/^\s*anchor build/m);
+    expect(localnetHarness).toContain("tests/duel_market.anchor.ts::each");
+    expect(localnetHarness).toContain("--dry-run");
+    expect(localnetHarness).toContain(".tests[].fullTitle");
+    expect(localnetHarness).toContain("--fail-zero");
+    expect(localnetHarness).toContain("mocha_args+=(--bail)");
+    expect(localnetHarness).toContain(
+      "expanded $test_target into $isolated_count fresh-validator tests",
+    );
+
+    const forkRollbackHarness = readFileSync(
+      path.join(packageRoot, "anchor", "scripts", "run-fork-rollback-test.sh"),
+      "utf8",
+    );
+    expect(forkRollbackHarness).toContain(
+      'TS_MOCHA_COMMAND=(bunx "ts-mocha@10.0.0")',
+    );
+    expect(forkRollbackHarness).toContain("--fail-zero");
+    expect(forkRollbackHarness).toContain("--bail");
   });
 
   test("fails before work when canonical IDL generation has no Anchor CLI", () => {

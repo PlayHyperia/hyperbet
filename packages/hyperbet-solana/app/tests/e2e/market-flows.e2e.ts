@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,9 +50,28 @@ import {
   currentChainUnixTimestamp,
 } from "../../../anchor/tests/clob-test-helpers";
 import { confirmSignatureByPolling } from "../../../anchor/tests/test-anchor";
-import { buildTestCompetitiveSnapshot } from "../../../keeper/src/testCompetitiveSnapshot";
-import { parseDuelCancellationMetadata } from "../../../keeper/src/duelTerminalPolicy";
-import { formatSolLamports } from "../../../../hyperbet-ui/src/lib/solanaOrderQuote";
+import {
+  parseDuelCancellationMetadata,
+  parseDuelLifecycleMetadata,
+} from "../../../keeper/src/duelTerminalPolicy";
+import {
+  formatSolLamports,
+  parseSolAmountToLamports,
+} from "../../../../hyperbet-ui/src/lib/solanaOrderQuote";
+import {
+  buildSyntheticDuelCommitment,
+  buildSyntheticPublicAgent,
+  buildSyntheticRendererHealth,
+  E2E_AGENT_A_IDENTITY,
+  E2E_AGENT_B_IDENTITY,
+  E2E_INITIAL_CYCLE_ID,
+} from "./syntheticDuelFixture";
+import {
+  HYPERIA_PREPARATION_FOOD,
+  resolveHyperiaCombatFixture,
+  resolveHyperiaFullHealthFoodReserve,
+  type HyperiaCombatRole,
+} from "./hyperiaCombatFixture";
 
 type E2eState = {
   solanaRpcUrl?: string;
@@ -120,6 +140,7 @@ type PredictionMarketsResponse = {
     phase: string | null;
     winner: string;
     betCloseTime: number | null;
+    syncedAt: number | null;
   };
   markets: Array<{
     chainKey: string;
@@ -163,6 +184,24 @@ type StreamingStateResponse = {
     cycleId?: string | null;
     duelId?: string | number | null;
     duelKeyHex?: string | null;
+    competitiveSnapshotVersion?: number | null;
+    competitiveSnapshotDigest?: string | null;
+    betOpenTime?: number | null;
+    betCloseTime?: number | null;
+    fightStartTime?: number | null;
+    competitiveSnapshot?: {
+      snapshotVersion?: number;
+      timing?: {
+        contractVersion?: number;
+        timeoutPolicy?: string;
+        countdownDurationMs?: number;
+        fightingDurationMs?: number;
+        endWarningDurationMs?: number;
+        maxFightDurationMs?: number;
+        fightStartTime?: number;
+        fightDeadline?: number;
+      };
+    } | null;
   } | null;
 };
 
@@ -173,6 +212,8 @@ type DuelStateAccountSnapshot = {
   betOpenTs?: unknown;
   betCloseTs?: unknown;
   duelStartTs?: unknown;
+  competitiveSnapshotVersion?: unknown;
+  competitiveSnapshotDigest?: readonly number[];
   metadataUri?: unknown;
 };
 
@@ -187,11 +228,13 @@ type SolanaTraderFixture = {
   marketWinner: string | null;
   duelStatus: string | null;
   pendingWinner: string | null;
+  pendingDuelEndTs: number;
   pendingProposedAt: number;
   finalizableAt: number | null;
   betOpenTs: number;
   betCloseTs: number;
   duelStartTs: number;
+  duelEndTs: number;
   aShares: bigint;
   bShares: bigint;
   aLockedLamports: bigint;
@@ -200,16 +243,104 @@ type SolanaTraderFixture = {
 
 type HarnessControl = {
   controlPath: string;
+  launchPath: string;
   services: {
     keeper: {
+      healthUrl: string;
       botHealthUrl: string;
     };
     solanaProxy: {
       faultControlPath: string;
     };
     hyperia?: {
+      pidFile: string;
       healthUrl: string;
+      authorityHealthUrl: string;
+      streamStateUrl: string;
+      logPath: string;
+      runtime?: "compact" | "full_3d";
+      combatRole?: "melee" | "ranged" | "mage";
+      terminalExpectation?: "natural_kill" | "short_kill" | "exact_timeout";
+      rendererStatusPath?: string | null;
+      captureStatusPath?: string | null;
+      preparationEvidencePath?: string | null;
+      preparationFramePath?: string | null;
+      startCommand?: string;
     };
+  };
+};
+
+type HyperiaRendererStatus = {
+  source?: string;
+  updatedAt?: number;
+  rendererHealth?: {
+    ready?: boolean;
+    degradedReason?: string | null;
+    phase?: string;
+    diagnostics?: {
+      sceneReadiness?: {
+        ready?: boolean;
+        cycleId?: string | null;
+        phase?: string;
+        equipmentVisualsReady?: boolean;
+        equipmentRequiredCount?: number;
+        equipmentReadyCount?: number;
+        equipmentRequiredPlayerCount?: number;
+        equipmentExpectedPlayerCount?: number;
+        equipmentActivePlayerCount?: number;
+        equipmentAttachmentMismatchCount?: number;
+        expectedAgentCount?: number;
+        loadedExpectedAgentCount?: number;
+        visibleExpectedAgentCount?: number;
+        damagePresentationAvailable?: boolean;
+        activeDamageSplatCount?: number | null;
+        renderedAgentCount?: number;
+        visibleAgentFramingCount?: number;
+        fullyFramedAgentSlots?: Array<"agent1" | "agent2">;
+        croppedVisibleAgentBodyCount?: number;
+        unobstructedVisibleAgentSlots?: Array<"agent1" | "agent2">;
+        occludedVisibleAgentBodyCount?: number;
+        missingVisibleAgentLineOfSightCount?: number;
+        minimumVisibleAgentHorizontalNdcSeparation?: number | null;
+        minimumVisibleAgentBodyNdcSpan?: number | null;
+        maximumVisibleAgentBodyNdcSpan?: number | null;
+        cameraTargetSlot?: "agent1" | "agent2" | null;
+        cameraTargetMatchesExpected?: boolean;
+        preparationActive?: boolean;
+        preparationShotActive?: boolean;
+        preparationPairShotActive?: boolean;
+      };
+    };
+  };
+  stats?: {
+    bytesReceived?: number;
+    droppedFrames?: number;
+    ffmpegRunning?: boolean;
+    audioSource?: string;
+    audioHealthy?: boolean;
+    audioChunks?: number;
+    audioDroppedChunks?: number;
+    audioTrimmedChunks?: number;
+  };
+  captureHealth?: {
+    targetFps?: number;
+    measuredFps?: number;
+    sourceFrames?: number;
+    emittedFrames?: number;
+    repeatedFrames?: number;
+    rejectedFrames?: number;
+    skippedFrames?: number;
+  };
+  browserAudioCaptureHealth?: {
+    contextState?: string | null;
+    sourceContextState?: string | null;
+    trackState?: string | null;
+    sampleRate?: number | null;
+    channels?: number | null;
+    chunks?: number;
+    contentChunks?: number;
+    droppedChunks?: number;
+    pendingWrites?: number;
   };
 };
 
@@ -226,7 +357,275 @@ type HyperiaAuthorityHealth = {
   competitiveSnapshotDiagnostic?: boolean | null;
 };
 
-type SolanaRpcFaultControl = {
+type HyperiaShutdownEvidence = {
+  event: "shutdown-complete";
+  sourceEpoch: number;
+  terminalFrameSeq: number;
+  duelId: string;
+  duelKeyHex: string;
+  competitiveSnapshotDigest: string;
+  outcome: "cancelled";
+  cancellationReason: "scheduler_shutdown";
+  downstreamAcknowledged: true;
+};
+
+type HyperiaStreamingState = {
+  type?: string;
+  seq?: number;
+  emittedAt?: number;
+  cycle?: {
+    cycleId?: string;
+    duelId?: string | null;
+    duelKeyHex?: string | null;
+    competitiveSnapshotDigest?: string | null;
+    phase?: string;
+    phaseVersion?: number;
+    agent1?: { id?: string | null; name?: string | null; hp?: number } | null;
+    agent2?: { id?: string | null; name?: string | null; hp?: number } | null;
+    winnerId?: string | null;
+    winnerName?: string | null;
+    loserId?: string | null;
+    outcome?: string | null;
+    winReason?: string | null;
+    seed?: string | null;
+    replayHash?: string | null;
+    duelEndTime?: number | null;
+    actionObservations?: HyperiaDuelActionObservation[];
+    competitiveSnapshot?: {
+      persisted?: boolean;
+      diagnostic?: boolean;
+      preparationId?: string | null;
+      frozenAt?: number;
+      contestants?: Array<{ agentId?: string }>;
+    } | null;
+  };
+  cameraTarget?: string | null;
+  preparation?: {
+    schemaVersion?: number;
+    status?: "preparing" | "ready";
+    selectedAt?: number;
+    expiresAt?: number;
+    agent1?: {
+      id?: string;
+      ready?: boolean;
+      activity?: string | null;
+      mode?: string | null;
+      activityTrail?: string[];
+    };
+    agent2?: {
+      id?: string;
+      ready?: boolean;
+      activity?: string | null;
+      mode?: string | null;
+      activityTrail?: string[];
+    };
+  } | null;
+};
+
+type HyperiaDuelActionObservation = {
+  schemaVersion: number;
+  sequence: number;
+  tick: number;
+  observedAt: number;
+  cycleId: string;
+  duelId: string;
+  actorId: string;
+  opponentId: string;
+  phase: "FIGHTING";
+  combatRole: "melee" | "ranged" | "mage";
+  tacticalMacro:
+    "pressure" | "hold_range" | "kite" | "orbit" | "defensive_reset" | "finish";
+  action:
+    | "movement"
+    | "engagement"
+    | "food"
+    | "prayer"
+    | "style"
+    | "role_switch"
+    | "damage";
+  outcome: "accepted" | "committed" | "deferred" | "rejected" | "error";
+  value: string;
+  amount: number | null;
+};
+
+type HyperiaCombatAIDiagnostic = {
+  characterId: string;
+  cycleId: string | null;
+  duelId: string | null;
+  active: boolean;
+  capturedAtMs: number;
+  combatRole: "melee" | "ranged" | "mage" | "prayer";
+  tickCount: number;
+  prayerToggleAttempts: number;
+  prayerToggleCommits: number;
+  prayerToggleRejects: number;
+  lastPrayerToggleFailureReason: string | null;
+};
+
+type HyperiaCombatAIDiagnosticsEvidence = {
+  schemaVersion: 1;
+  diagnosticScope: "operator_private";
+  trigger: "terminal_snapshot";
+  capturedAtMs: number;
+  cycleId: string;
+  duelId: string;
+  duelKeyHex: string;
+  competitiveSnapshotDigest: string;
+  combatAIs: HyperiaCombatAIDiagnostic[];
+};
+
+type Full3DPreparationEvidence = {
+  schemaVersion: 1;
+  capturedAtMs: number;
+  publicState: HyperiaStreamingState;
+  ordinaryPreparation: {
+    schemaVersion: 3;
+    status: "passed";
+    multiStyle: boolean;
+    availableCombatRoles: Array<"melee" | "ranged" | "mage">;
+    samePersistentAgentIds: string[];
+    agents: Array<{
+      agentId: string;
+      fishingXp: number;
+      fishingLevel: number;
+      cookingXp: number;
+      cookingLevel: number;
+      cookedFood: number;
+      rawFood: number;
+      burntFood: number;
+      toolCount: number;
+      gatheringOperations: number;
+      processingOperations: number;
+      ordinaryBankOperations: number;
+      progressionStarts: number;
+      progressionTerminals: number;
+    }>;
+    totals: {
+      gatheringOperations: number;
+      processingOperations: number;
+      ordinaryBankOperations: number;
+    };
+    liveWorldReports: Array<{
+      agentId: string;
+      path: string;
+      sha256: string;
+      preparationVerticalSlice: {
+        status?: string;
+        exactFinalCustodyAndXp?: boolean;
+        quiescent?: boolean;
+        movement?: { diagonalStep?: boolean };
+        presentation?: {
+          rotationPackets?: number;
+          processingRejections?: number;
+        };
+        cooking?: {
+          forcedBurnObserved?: boolean;
+          recoveryGatherActions?: number;
+        };
+      };
+    }>;
+    processDeathRecoveryCovered: boolean;
+    ordinaryAutonomySelectionCovered: boolean;
+    liveWorldNavigationCovered: boolean;
+    livePreparationPresentationCovered: boolean;
+    realPostgresqlCustodyCovered: boolean;
+    fullTopologySeedContractCovered: boolean;
+    ownedMultiStylePreparationCovered: boolean;
+    ordinaryForgingQuestCovered: boolean;
+    workerDatabaseSessionsDrained: boolean;
+    workerDatabaseSessionDrainElapsedMs: number;
+    remainingWorkerDatabaseSessionPids: number[];
+    scriptedCustodyBridgeCovered: boolean;
+    externalModelProviderCovered: boolean;
+  };
+  privateAuthority: {
+    preparationId: string;
+    agent1Id: string;
+    agent2Id: string;
+    status: "ready";
+    selectedAt: number;
+    expiresAt: number;
+    agent1ReadyAt: number;
+    agent2ReadyAt: number;
+    activityRows: Array<{
+      agentId: string;
+      activity: string;
+      mode: string;
+      occurredAt: number;
+      revision: number;
+    }>;
+    bankOpenCount: number;
+    planOperationCount: number;
+    planOperations: Array<{
+      agentId: string;
+      committedInventory: Array<{ itemId: string; quantity: number }>;
+      committedBank: Array<{ itemId: string; quantity: number }>;
+    }>;
+  };
+  frozenBettingSource: {
+    schemaVersion: number;
+    duelId: string;
+    duelKey: string;
+    competitiveSnapshotVersion: number;
+    competitiveSnapshotDigest: string;
+    competitiveSnapshot: {
+      persisted: boolean;
+      diagnostic: boolean;
+      preparationId: string;
+      frozenAt: number;
+      timing?: {
+        contractVersion?: number;
+        timeoutPolicy?: string;
+        countdownDurationMs?: number;
+        fightingDurationMs?: number;
+        endWarningDurationMs?: number;
+        maxFightDurationMs?: number;
+        fightStartTime?: number;
+        fightDeadline?: number;
+      };
+      contestants: Array<{
+        agentId: string;
+        maxHp: number;
+        equipment: Array<{ slot: string; itemId: string; quantity: number }>;
+        skillLevels: Array<{ skill: string; level: number }>;
+        inventory: Array<{ itemId: string; quantity: number }>;
+        selectedSpell: string | null;
+        initialCombatStyle: "melee" | "ranged" | "mage" | "prayer";
+        availableCombatStyles: Array<"melee" | "ranged" | "mage" | "prayer">;
+        preparation: {
+          planningSource: string;
+          tacticalStrategy: { prayer: string | null };
+        };
+      }>;
+    };
+  };
+  rendererStatus: HyperiaRendererStatus;
+  preparationCoverage: {
+    mode: "pair" | "directed_cuts";
+    shots: Array<{
+      slot: "agent1" | "agent2";
+      publicState: HyperiaStreamingState;
+      rendererStatus: HyperiaRendererStatus;
+      frame: {
+        source: "capture_browser";
+        path: string;
+        sha256: string;
+        width: number;
+        height: number;
+      };
+    }>;
+  };
+  hls: {
+    framePath: string;
+    frameSha256: string;
+    width: number;
+    height: number;
+    segmentName: string;
+    segmentSha256: string;
+  };
+};
+
+type ForwardedSolanaTransactionHold = {
   version: 1;
   mode: "hold_send_transaction_after_forward";
   state: "armed" | "observed";
@@ -238,6 +637,26 @@ type SolanaRpcFaultControl = {
   observedAtMs?: number;
   holdUntilMs?: number;
 };
+
+type FinalizedTransactionVisibilityGap = {
+  version: 1;
+  mode: "hide_get_transaction_after_forward";
+  state: "armed" | "observed" | "released";
+  faultId: string;
+  requiredAccount: string;
+  requiredProgramId: string;
+  armedAtMs: number;
+  signature?: string;
+  observedAtMs?: number;
+  hiddenLookupCount?: 0 | 1;
+  hiddenAtMs?: number;
+  releasedAtMs?: number;
+  requestedCommitment?: "finalized";
+  requestedLane?: "verifier";
+};
+
+type SolanaRpcFaultControl =
+  ForwardedSolanaTransactionHold | FinalizedTransactionVisibilityGap;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const statePath = path.resolve(__dirname, "./state.json");
@@ -256,12 +675,28 @@ const E2E_ARENA_WRITE_KEY =
   "";
 const E2E_DUEL_SOURCE =
   process.env.E2E_DUEL_SOURCE?.trim().toLowerCase() || "synthetic_publish";
+const E2E_HYPERIA_RUNTIME =
+  process.env.E2E_HYPERIA_RUNTIME?.trim().toLowerCase() || "compact";
+const HYPERIA_COMBAT_ROLE =
+  process.env.E2E_HYPERIA_COMBAT_ROLE?.trim().toLowerCase() || "ranged";
+const HYPERIA_MULTI_STYLE =
+  process.env.AGENT_DUEL_3D_E2E_MULTI_STYLE?.trim().toLowerCase() === "true";
 const EXPECT_KEEPER_BOT =
   (process.env.E2E_EXPECT_KEEPER_BOT?.trim().toLowerCase() ?? "true") !==
   "false";
 const REQUIRE_MATURED_SOLANA_WIN_CLAIM =
   (process.env.E2E_REQUIRE_MATURED_SOLANA_WIN_CLAIM?.trim().toLowerCase() ??
     "false") === "true";
+const REQUIRE_NATURAL_HYPERIA_TERMINAL =
+  (process.env.E2E_HYPERIA_NATURAL_TERMINAL?.trim().toLowerCase() ??
+    "false") === "true";
+const HYPERIA_TERMINAL_EXPECTATION =
+  process.env.E2E_HYPERIA_TERMINAL_EXPECTATION?.trim().toLowerCase() ||
+  "natural_kill";
+const EXPECT_EXACT_HYPERIA_TIMEOUT =
+  HYPERIA_TERMINAL_EXPECTATION === "exact_timeout";
+const EXPECT_SHORT_HYPERIA_KILL = HYPERIA_TERMINAL_EXPECTATION === "short_kill";
+const SHORT_HYPERIA_KILL_MAX_DURATION_MS = 45_000;
 const anchorIdlDir = path.resolve(__dirname, "../../../anchor/target/idl");
 const fightOracleIdl = JSON.parse(
   fs.readFileSync(path.join(anchorIdlDir, "fight_oracle.json"), "utf8"),
@@ -269,6 +704,7 @@ const fightOracleIdl = JSON.parse(
 const duelMarketIdl = JSON.parse(
   fs.readFileSync(path.join(anchorIdlDir, "duel_market.json"), "utf8"),
 ) as Idl;
+const duelMarketProgramId = duelMarketIdl.address;
 const PREPARED_LIVE_DUEL_MIN_OPEN_WINDOW_MS = 60_000;
 const COMPETITIVE_SNAPSHOT_RECOVERY_WINDOW_ELAPSED_REASON =
   "competitive_snapshot_recovery_window_elapsed";
@@ -279,6 +715,68 @@ function loadState(): E2eState {
 
 function loadControl(): HarnessControl {
   return JSON.parse(fs.readFileSync(controlPath, "utf8")) as HarnessControl;
+}
+
+function readOwnedProcessId(pidFile: string, label: string): number {
+  if (!path.isAbsolute(pidFile)) {
+    throw new Error(`${label} PID file must be absolute`);
+  }
+  const processId = Number(fs.readFileSync(pidFile, "utf8").trim());
+  if (!Number.isSafeInteger(processId) || processId <= 0) {
+    throw new Error(`${label} PID file does not contain a positive integer`);
+  }
+  process.kill(processId, 0);
+  return processId;
+}
+
+function readProcessCommand(processId: number): string {
+  const command = execFileSync(
+    "/bin/ps",
+    ["-p", String(processId), "-o", "command="],
+    { encoding: "utf8" },
+  ).trim();
+  if (!command) throw new Error(`process ${processId} has no command`);
+  return command;
+}
+
+function readHyperiaRendererStatus(
+  control: HarnessControl,
+): HyperiaRendererStatus | null {
+  const statusPath = control.services.hyperia?.rendererStatusPath?.trim() || "";
+  if (!path.isAbsolute(statusPath)) return null;
+  try {
+    return JSON.parse(
+      fs.readFileSync(statusPath, "utf8"),
+    ) as HyperiaRendererStatus;
+  } catch {
+    return null;
+  }
+}
+
+function readFull3DPreparationEvidence(
+  control: HarnessControl,
+): Full3DPreparationEvidence {
+  const evidencePath =
+    control.services.hyperia?.preparationEvidencePath?.trim() || "";
+  const framePath =
+    control.services.hyperia?.preparationFramePath?.trim() || "";
+  if (
+    !path.isAbsolute(evidencePath) ||
+    !path.isAbsolute(framePath) ||
+    !fs.existsSync(evidencePath) ||
+    !fs.existsSync(framePath)
+  ) {
+    throw new Error(
+      "full 3D preparation evidence requires absolute existing evidence and frame paths",
+    );
+  }
+  const evidence = JSON.parse(
+    fs.readFileSync(evidencePath, "utf8"),
+  ) as Full3DPreparationEvidence;
+  if (evidence.hls?.framePath !== framePath) {
+    throw new Error("full 3D preparation frame identity drifted");
+  }
+  return evidence;
 }
 
 function armForwardedSolanaTransactionHold(
@@ -307,6 +805,32 @@ function armForwardedSolanaTransactionHold(
   });
 }
 
+function armFinalizedTransactionVisibilityGap(
+  control: HarnessControl,
+  input: {
+    faultId: string;
+    requiredAccount: PublicKey;
+    requiredProgramId: PublicKey;
+  },
+): void {
+  const faultControlPath = control.services.solanaProxy.faultControlPath;
+  if (!path.isAbsolute(faultControlPath)) {
+    throw new Error("Solana RPC fault-control path must be absolute");
+  }
+  const payload: FinalizedTransactionVisibilityGap = {
+    version: 1,
+    mode: "hide_get_transaction_after_forward",
+    state: "armed",
+    faultId: input.faultId,
+    requiredAccount: input.requiredAccount.toBase58(),
+    requiredProgramId: input.requiredProgramId.toBase58(),
+    armedAtMs: Date.now(),
+  };
+  fs.writeFileSync(faultControlPath, `${JSON.stringify(payload, null, 2)}\n`, {
+    mode: 0o600,
+  });
+}
+
 function readSolanaRpcFaultControl(
   control: HarnessControl,
 ): SolanaRpcFaultControl | null {
@@ -321,7 +845,7 @@ function readSolanaRpcFaultControl(
 
 function runProcessControl(
   control: HarnessControl,
-  action: "start" | "kill" | "restart",
+  action: "start" | "stop" | "kill" | "restart",
   service: "keeper" | "keeperBot" | "solanaProxy" | "hyperia" | "hyperiaClient",
 ): void {
   execFileSync(
@@ -333,42 +857,213 @@ function runProcessControl(
   );
 }
 
+function readHyperiaShutdownEvidence(
+  control: HarnessControl,
+): HyperiaShutdownEvidence {
+  const logPath = control.services.hyperia?.logPath?.trim() || "";
+  if (!path.isAbsolute(logPath)) {
+    throw new Error("real Hyperia authority log path is missing or relative");
+  }
+  const lines = fs.readFileSync(logPath, "utf8").split(/\r?\n/).reverse();
+  for (const line of lines) {
+    if (!line.startsWith("{") || !line.includes('"shutdown-complete"')) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line) as Partial<HyperiaShutdownEvidence>;
+      if (parsed.event === "shutdown-complete") {
+        return parsed as HyperiaShutdownEvidence;
+      }
+    } catch {
+      // Ignore unrelated structured-log fragments and keep scanning.
+    }
+  }
+  throw new Error("Hyperia did not emit graceful shutdown completion evidence");
+}
+
 async function fetchHyperiaAuthorityHealth(
   request: APIRequestContext,
   control: HarnessControl,
 ): Promise<HyperiaAuthorityHealth> {
-  const healthUrl = control.services.hyperia?.healthUrl?.trim() || "";
+  const healthUrl = control.services.hyperia?.authorityHealthUrl?.trim() || "";
   if (!healthUrl) {
     throw new Error("real Hyperia authority health URL is missing");
   }
-  const response = await request.get(healthUrl, { failOnStatusCode: false });
+  const bearerToken =
+    process.env.E2E_HYPERIA_BET_SYNC_BEARER_TOKEN?.trim() || "";
+  const response = await request.get(healthUrl, {
+    failOnStatusCode: false,
+    headers: bearerToken
+      ? { authorization: `Bearer ${bearerToken}` }
+      : undefined,
+  });
   if (!response.ok()) {
     throw new Error(
       `Hyperia authority health returned HTTP ${response.status()}`,
     );
   }
-  return (await response.json()) as HyperiaAuthorityHealth;
+  return parseHyperiaAuthorityHealth(await response.json());
+}
+
+function parseHyperiaAuthorityHealth(value: unknown): HyperiaAuthorityHealth {
+  if (!value || typeof value !== "object") {
+    throw new Error("Hyperia authority health is not an object");
+  }
+  const health = value as Record<string, unknown>;
+  const nullableStringKeys = [
+    "duelId",
+    "duelKeyHex",
+    "snapshotDigest",
+    "phase",
+    "outcome",
+    "cancellationReason",
+  ] as const;
+  if (
+    typeof health.ready !== "boolean" ||
+    typeof health.sourceEpoch !== "number" ||
+    !Number.isSafeInteger(health.sourceEpoch) ||
+    typeof health.competitiveSnapshotPersisted !== "boolean" ||
+    !nullableStringKeys.every(
+      (key) => health[key] === null || typeof health[key] === "string",
+    ) ||
+    !(
+      health.competitiveSnapshotDiagnostic === null ||
+      typeof health.competitiveSnapshotDiagnostic === "boolean"
+    )
+  ) {
+    throw new Error("Hyperia authority health contract is malformed");
+  }
+  return health as HyperiaAuthorityHealth;
+}
+
+async function fetchHyperiaStreamingState(
+  request: APIRequestContext,
+  control: HarnessControl,
+): Promise<HyperiaStreamingState> {
+  const streamStateUrl = control.services.hyperia?.streamStateUrl?.trim() || "";
+  if (!streamStateUrl) {
+    throw new Error("real Hyperia streaming-state URL is missing");
+  }
+  const response = await request.get(streamStateUrl, {
+    failOnStatusCode: false,
+  });
+  if (!response.ok()) {
+    throw new Error(
+      `Hyperia streaming state returned HTTP ${response.status()}`,
+    );
+  }
+  return (await response.json()) as HyperiaStreamingState;
+}
+
+async function fetchHyperiaCombatAIDiagnostics(
+  request: APIRequestContext,
+  control: HarnessControl,
+): Promise<HyperiaCombatAIDiagnostic[]> {
+  const healthUrl = control.services.hyperia?.healthUrl?.trim() || "";
+  const adminCode = process.env.E2E_HYPERIA_ADMIN_CODE?.trim() || "";
+  if (!healthUrl || !adminCode) {
+    throw new Error(
+      "real Hyperia combat diagnostics require a health URL and private admin credential",
+    );
+  }
+  const diagnosticUrl = new URL("/admin/duels/combat-ai", healthUrl);
+  if (
+    diagnosticUrl.protocol !== "http:" ||
+    !["127.0.0.1", "localhost", "[::1]"].includes(diagnosticUrl.hostname)
+  ) {
+    throw new Error(
+      "Hyperia combat diagnostics are restricted to the owned loopback E2E authority",
+    );
+  }
+  const response = await request.get(diagnosticUrl.toString(), {
+    failOnStatusCode: false,
+    headers: { "x-admin-code": adminCode },
+  });
+  if (!response.ok()) {
+    throw new Error(
+      `Hyperia combat diagnostics returned HTTP ${response.status()}`,
+    );
+  }
+  const payload: unknown = await response.json();
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Hyperia combat diagnostics payload is not an object");
+  }
+  const entries = (payload as Record<string, unknown>).combatAIs;
+  if (!Array.isArray(entries)) {
+    throw new Error(
+      "Hyperia combat diagnostics payload has no combatAIs array",
+    );
+  }
+  return entries.map((entry, index) => {
+    if (!entry || typeof entry !== "object") {
+      throw new Error(`Hyperia combat diagnostic ${index} is not an object`);
+    }
+    const record = entry as Record<string, unknown>;
+    const combatRole = record.combatRole;
+    const lastFailure = record.lastPrayerToggleFailureReason;
+    const integerKeys = [
+      "capturedAtMs",
+      "tickCount",
+      "prayerToggleAttempts",
+      "prayerToggleCommits",
+      "prayerToggleRejects",
+    ] as const;
+    if (
+      typeof record.characterId !== "string" ||
+      !(record.cycleId === null || typeof record.cycleId === "string") ||
+      !(record.duelId === null || typeof record.duelId === "string") ||
+      typeof record.active !== "boolean" ||
+      !/^(melee|ranged|mage|prayer)$/.test(String(combatRole)) ||
+      !integerKeys.every(
+        (key) =>
+          typeof record[key] === "number" &&
+          Number.isSafeInteger(record[key]) &&
+          record[key] >= 0,
+      ) ||
+      !(lastFailure === null || typeof lastFailure === "string")
+    ) {
+      throw new Error(`Hyperia combat diagnostic ${index} is malformed`);
+    }
+    return {
+      characterId: record.characterId,
+      cycleId: record.cycleId as string | null,
+      duelId: record.duelId as string | null,
+      active: record.active,
+      capturedAtMs: record.capturedAtMs as number,
+      combatRole: combatRole as HyperiaCombatAIDiagnostic["combatRole"],
+      tickCount: record.tickCount as number,
+      prayerToggleAttempts: record.prayerToggleAttempts as number,
+      prayerToggleCommits: record.prayerToggleCommits as number,
+      prayerToggleRejects: record.prayerToggleRejects as number,
+      lastPrayerToggleFailureReason: lastFailure as string | null,
+    };
+  });
 }
 
 async function currentHyperiaAuthorityEpoch(
   control: HarnessControl,
 ): Promise<number | null> {
-  const healthUrl = control.services.hyperia?.healthUrl?.trim() || "";
+  const healthUrl = control.services.hyperia?.authorityHealthUrl?.trim() || "";
   if (!healthUrl) {
     throw new Error("real Hyperia authority health URL is missing");
   }
+  let response: Response;
   try {
-    const response = await fetch(healthUrl, {
+    const bearerToken =
+      process.env.E2E_HYPERIA_BET_SYNC_BEARER_TOKEN?.trim() || "";
+    response = await fetch(healthUrl, {
       cache: "no-store",
-      headers: { connection: "close" },
+      headers: {
+        connection: "close",
+        ...(bearerToken ? { authorization: `Bearer ${bearerToken}` } : {}),
+      },
       signal: AbortSignal.timeout(1_000),
     });
-    if (!response.ok) return null;
-    const health = (await response.json()) as HyperiaAuthorityHealth;
-    return typeof health.sourceEpoch === "number" ? health.sourceEpoch : -1;
   } catch {
     return null;
   }
+  if (!response.ok) return null;
+  return parseHyperiaAuthorityHealth(await response.json()).sourceEpoch ?? null;
 }
 
 type SignableTx = Transaction | VersionedTransaction;
@@ -394,10 +1089,7 @@ const BID_LIQUIDITY_MAKER_SEED = Uint8Array.from([
   188, 12, 240, 61, 109, 173, 28, 142, 215, 54, 167, 80, 31, 199, 114,
 ]);
 const E2E_SOLANA_AGENT_A = {
-  id: "e2e-solana-agent-a",
-  name: "Agent A",
-  provider: "Hyperia",
-  model: "alpha-local",
+  ...E2E_AGENT_A_IDENTITY,
   hp: 80,
   maxHp: 100,
   combatLevel: 88,
@@ -411,10 +1103,7 @@ const E2E_SOLANA_AGENT_A = {
   monologues: [],
 };
 const E2E_SOLANA_AGENT_B = {
-  id: "e2e-solana-agent-b",
-  name: "Agent B",
-  provider: "OpenRouter",
-  model: "beta-local",
+  ...E2E_AGENT_B_IDENTITY,
   hp: 76,
   maxHp: 100,
   combatLevel: 84,
@@ -1108,9 +1797,18 @@ async function createFreshSolanaOpenMarket(
   const betOpenTs = now - 60;
   const betCloseTs = now + (options?.betCloseOffsetSeconds ?? 600);
   const duelStartTs = Math.max(
-    betCloseTs,
+    betCloseTs + 1,
     now + (options?.duelStartOffsetSeconds ?? 660),
   );
+  const cycleId = `gate10-solana-${duelId}`;
+  const competitiveCommitment = buildSyntheticDuelCommitment({
+    cycleId,
+    duelId,
+    duelKeyHex,
+    betOpenTs,
+    betCloseTs,
+    duelStartTs,
+  });
   await ensureOracleReady(
     fightProgram as never,
     authority,
@@ -1128,6 +1826,12 @@ async function createFreshSolanaOpenMarket(
       betOpenTs,
       betCloseTs,
       duelStartTs,
+      participantAHash: competitiveCommitment.participantAHash,
+      participantBHash: competitiveCommitment.participantBHash,
+      competitiveSnapshotVersion:
+        competitiveCommitment.competitiveSnapshotVersion,
+      competitiveSnapshotDigest:
+        competitiveCommitment.competitiveSnapshotDigestBytes,
       metadataUri: canonicalDuelMetadata(duelId, duelKeyHex, "open"),
     },
   );
@@ -1135,7 +1839,7 @@ async function createFreshSolanaOpenMarket(
     clobProgram.programId,
     duelState,
   );
-  let marketState = derivedMarketState;
+  let marketState: PublicKey;
   try {
     ({ marketState } = await initializeCanonicalMarket(
       clobProgram as never,
@@ -1153,7 +1857,7 @@ async function createFreshSolanaOpenMarket(
   }
   await syncMarketFromDuel(clobProgram as never, marketState, duelState);
   await publishSolanaCycleState(request, {
-    cycleId: `gate10-solana-${duelId}`,
+    cycleId,
     duelId,
     duelKeyHex,
     betOpenTs,
@@ -1196,6 +1900,7 @@ function buildMockSolanaPredictionMarketsResponse(
 ): PredictionMarketsResponse {
   const duelKey = state.currentDuelKeyHex ?? null;
   const duelId = state.currentDuelId ?? null;
+  const updatedAt = Date.now();
   const phase =
     lifecycleStatus === "OPEN"
       ? "ANNOUNCEMENT"
@@ -1209,7 +1914,8 @@ function buildMockSolanaPredictionMarketsResponse(
       duelId,
       phase,
       winner,
-      betCloseTime: Date.now(),
+      betCloseTime: updatedAt,
+      syncedAt: updatedAt,
     },
     markets: [
       {
@@ -1220,14 +1926,14 @@ function buildMockSolanaPredictionMarketsResponse(
         marketRef: state.clobMarketState ?? null,
         lifecycleStatus,
         winner,
-        betCloseTime: Date.now(),
+        betCloseTime: updatedAt,
         contractAddress: null,
-        programId: null,
+        programId: duelMarketProgramId,
         txRef: null,
-        syncedAt: Date.now(),
+        syncedAt: updatedAt,
       },
     ],
-    updatedAt: Date.now(),
+    updatedAt,
   };
 }
 
@@ -1235,6 +1941,8 @@ function canonicalDuelIdFromMetadata(
   metadata: unknown,
   duelKeyHex: string,
 ): string {
+  const lifecycle = parseDuelLifecycleMetadata(metadata);
+  if (lifecycle?.duelKeyHex === duelKeyHex) return lifecycle.duelId;
   if (typeof metadata === "string") {
     try {
       const parsed = JSON.parse(metadata) as Record<string, unknown>;
@@ -1277,34 +1985,62 @@ async function publishSolanaCycleState(
     phase: SolanaCyclePhase;
     winner: "A" | "B" | "NONE";
     duelEndTs?: number | null;
+    duelEndTimeMs?: number | null;
     outcome?: "win" | "draw" | "cancelled" | null;
     cancellationReason?: string | null;
   },
 ): Promise<void> {
   assertSyntheticDuelSource("publishSolanaCycleState");
   const nowMs = Date.now();
+  if (args.duelEndTs != null && args.duelEndTimeMs != null) {
+    throw new Error(
+      `Synthetic terminal cycle ${args.cycleId} cannot supply two duel end timestamps`,
+    );
+  }
+  const duelEndTimeMs =
+    args.duelEndTimeMs ??
+    (args.duelEndTs != null ? args.duelEndTs * 1_000 : null);
+  if (
+    args.phase === "RESOLUTION" &&
+    (!Number.isSafeInteger(duelEndTimeMs) || Number(duelEndTimeMs) <= 0)
+  ) {
+    throw new Error(
+      `Synthetic terminal cycle ${args.cycleId} requires a positive authoritative duel end timestamp`,
+    );
+  }
   const countdownSeconds =
     args.phase === "ANNOUNCEMENT"
       ? Math.max(0, args.betCloseTs - Math.floor(nowMs / 1000))
       : args.phase === "COUNTDOWN"
         ? Math.max(0, args.duelStartTs - Math.floor(nowMs / 1000))
         : 0;
-  const winnerAgent =
-    args.winner === "A"
-      ? E2E_SOLANA_AGENT_A
-      : args.winner === "B"
-        ? E2E_SOLANA_AGENT_B
-        : null;
   const isDraw = args.outcome === "draw";
-  const competitiveSnapshot = buildTestCompetitiveSnapshot({
+  const competitiveSnapshot = buildSyntheticDuelCommitment({
     cycleId: args.cycleId,
     duelId: args.duelId,
-    duelKey: args.duelKeyHex,
-    betOpenTime: args.betOpenTs * 1000,
-    betCloseTime: args.betCloseTs * 1000,
+    duelKeyHex: args.duelKeyHex,
+    betOpenTs: args.betOpenTs,
+    betCloseTs: args.betCloseTs,
+    duelStartTs: args.duelStartTs,
     agent1: E2E_SOLANA_AGENT_A,
     agent2: E2E_SOLANA_AGENT_B,
   });
+  const publicAgent1 = buildSyntheticPublicAgent(
+    E2E_SOLANA_AGENT_A,
+    competitiveSnapshot.competitiveSnapshot,
+    "agent1",
+  );
+  const publicAgent2 = buildSyntheticPublicAgent(
+    E2E_SOLANA_AGENT_B,
+    competitiveSnapshot.competitiveSnapshot,
+    "agent2",
+  );
+  const winnerAgent =
+    args.winner === "A"
+      ? publicAgent1
+      : args.winner === "B"
+        ? publicAgent2
+        : null;
 
   await postJson<{ ok: boolean; seq: number }>(
     request,
@@ -1325,9 +2061,15 @@ async function publishSolanaCycleState(
                 : args.duelStartTs) * 1000,
         betOpenTime: args.betOpenTs * 1000,
         betCloseTime: args.betCloseTs * 1000,
-        fightStartTime: args.duelStartTs * 1000,
-        duelEndTime: args.duelEndTs != null ? args.duelEndTs * 1000 : null,
-        ...competitiveSnapshot,
+        fightStartTime:
+          competitiveSnapshot.competitiveSnapshot.timing?.fightStartTime ??
+          null,
+        duelEndTime: duelEndTimeMs,
+        competitiveSnapshotVersion:
+          competitiveSnapshot.competitiveSnapshotVersion,
+        competitiveSnapshotDigest:
+          competitiveSnapshot.competitiveSnapshotDigest,
+        competitiveSnapshot: competitiveSnapshot.competitiveSnapshot,
         countdown: countdownSeconds,
         timeRemaining: countdownSeconds * 1000,
         winnerId: winnerAgent?.id ?? null,
@@ -1344,12 +2086,13 @@ async function publishSolanaCycleState(
         winReason: winnerAgent ? "kill" : isDraw ? "draw" : null,
         seed: winnerAgent || isDraw ? "42" : null,
         replayHash: winnerAgent || isDraw ? "ab".repeat(32) : null,
-        agent1: E2E_SOLANA_AGENT_A,
-        agent2: E2E_SOLANA_AGENT_B,
+        agent1: publicAgent1,
+        agent2: publicAgent2,
         arenaPositions: {
           agent1: [-1, 0, 0],
           agent2: [1, 0, 0],
         },
+        rendererHealth: buildSyntheticRendererHealth(nowMs),
       },
       leaderboard: [],
       cameraTarget: null,
@@ -1383,34 +2126,100 @@ async function readText(page: Page, testId: string): Promise<string> {
   return ((await locator.textContent().catch(() => "")) || "").trim();
 }
 
-async function confirmSolanaOrder(page: Page): Promise<void> {
+function settlementEntriesForDuel(page: Page, duelId: string): Locator {
+  return page.getByTestId("solana-settlement-entry").filter({
+    has: page.getByTitle(duelId, { exact: true }),
+  });
+}
+
+type SolanaOrderTrackingEvidence = {
+  terminalStatus: 200;
+  attempts: string[];
+};
+
+async function confirmSolanaOrder(
+  page: Page,
+): Promise<SolanaOrderTrackingEvidence> {
   for (let quoteAttempt = 0; quoteAttempt < 2; quoteAttempt += 1) {
     const confirmation = page.getByRole("dialog", {
       name: /confirm sol order/i,
     });
     await expect(confirmation).toBeVisible({ timeout: 15_000 });
+    await expect
+      .poll(() => page.evaluate(() => document.body.style.overflow))
+      .toBe("hidden");
+    await expect
+      .poll(() => page.evaluate(() => document.body.style.overscrollBehavior))
+      .toBe("none");
+    const confirmationViewportPolicy = await confirmation.evaluate(
+      (element) => ({
+        maxHeight: getComputedStyle(element).maxHeight,
+        overscrollBehavior: getComputedStyle(element).overscrollBehavior,
+        boxSizing: getComputedStyle(element).boxSizing,
+      }),
+    );
+    expect(
+      Number.parseFloat(confirmationViewportPolicy.maxHeight),
+    ).toBeLessThanOrEqual(await page.evaluate(() => window.innerHeight - 32));
+    expect(confirmationViewportPolicy.overscrollBehavior).toBe("contain");
+    expect(confirmationViewportPolicy.boxSizing).toBe("border-box");
+    const yesSelected =
+      (await page
+        .getByTestId("prediction-select-yes")
+        .first()
+        .getAttribute("aria-pressed")) === "true";
+    const selectedSide = yesSelected ? "YES" : "NO";
+    const selectedFighter = (
+      (await page
+        .getByTestId(
+          yesSelected ? "prediction-select-yes" : "prediction-select-no",
+        )
+        .first()
+        .locator("div")
+        .first()
+        .textContent()) ?? ""
+    ).trim();
+    expect(selectedFighter).not.toBe("");
+    const grossPayoutInput = await page
+      .getByTestId("prediction-amount-input")
+      .first()
+      .inputValue();
+    const expectedGrossPayout = formatSolLamports(
+      parseSolAmountToLamports(grossPayoutInput),
+    );
+    const confirmationSummary = confirmation.getByTestId(
+      "solana-order-confirmation-summary",
+    );
+    await expect(confirmationSummary).toContainText(
+      `Buy ${selectedFighter} (${selectedSide})`,
+    );
+    await expect(confirmationSummary).toContainText(
+      `${expectedGrossPayout} SOL`,
+    );
     await expect(confirmation).toContainText("Maximum wallet funding required");
     await expect(confirmation).toContainText("not automatically resubmitted");
     const confirmButton = confirmation.getByRole("button", {
       name: /confirm and sign/i,
     });
+    const backButton = confirmation.getByRole("button", {
+      name: /back to edit/i,
+    });
     await expect(confirmButton).toBeEnabled();
-    await expect(confirmButton).toBeFocused();
-    await page.keyboard.press("Tab");
-    await expect(
-      confirmation.getByRole("button", { name: /back to edit/i }),
-    ).toBeFocused();
+    await expect(backButton).toBeFocused();
     await page.keyboard.press("Shift+Tab");
     await expect(confirmButton).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(backButton).toBeFocused();
 
     const trackingAttempts: string[] = [];
+    const pendingTrackingReads = new Set<Promise<void>>();
     let trackingResponse: Response | null = null;
     const recordTrackingAttempt = (response: Response): void => {
       if (!response.url().includes("/api/arena/bet/record-external")) return;
       if (response.status() !== 425 && response.status() !== 503) {
         trackingResponse ??= response;
       }
-      void response
+      const trackingRead = response
         .json()
         .then(
           (payload: {
@@ -1441,10 +2250,13 @@ async function confirmSolanaOrder(page: Page): Promise<void> {
           trackingAttempts.push(`${response.status()}:unreadable`);
           if (trackingAttempts.length > 12) trackingAttempts.shift();
         });
+      pendingTrackingReads.add(trackingRead);
+      void trackingRead.then(() => {
+        pendingTrackingReads.delete(trackingRead);
+      });
     };
     page.on("response", recordTrackingAttempt);
 
-    let quoteBecameStale = false;
     try {
       await confirmButton.click();
       await expect(confirmation).toHaveCount(0, { timeout: 45_000 });
@@ -1474,7 +2286,6 @@ async function confirmSolanaOrder(page: Page): Promise<void> {
           feedback.getByTestId("solana-order-transaction-signature"),
           "a stale quote must be rejected before signature or submission",
         ).toHaveCount(0);
-        quoteBecameStale = true;
       } else {
         if (submissionOutcome.startsWith("error:")) {
           throw new Error(submissionOutcome.slice("error:".length));
@@ -1499,22 +2310,35 @@ async function confirmSolanaOrder(page: Page): Promise<void> {
         if (!terminalResponse) {
           throw new Error("External-bet tracking completed without a response");
         }
+        await Promise.allSettled([...pendingTrackingReads]);
         const trackingPayload = (await terminalResponse.json()) as {
           ok?: unknown;
           error?: unknown;
         };
-        expect({
+        const terminalTrackingResult = {
           status: terminalResponse.status(),
           ok: trackingPayload.ok ?? null,
           error: trackingPayload.error ?? null,
-        }).toEqual({ status: 200, ok: true, error: null });
-        return;
+        };
+        if (
+          terminalTrackingResult.status !== 200 ||
+          terminalTrackingResult.ok !== true ||
+          terminalTrackingResult.error !== null
+        ) {
+          throw new Error(
+            `External-bet tracking failed: ${JSON.stringify(terminalTrackingResult)}; recent attempts: ${trackingAttempts.join(", ") || "none"}`,
+          );
+        }
+        return {
+          terminalStatus: 200,
+          attempts: [...trackingAttempts],
+        };
       }
     } finally {
       page.off("response", recordTrackingAttempt);
     }
 
-    if (!quoteBecameStale || quoteAttempt > 0) {
+    if (quoteAttempt > 0) {
       throw new Error("The refreshed Solana order quote did not remain stable");
     }
     const feedback = page
@@ -1526,8 +2350,35 @@ async function confirmSolanaOrder(page: Page): Promise<void> {
     await expect(feedback).toHaveCount(0, { timeout: 30_000 });
     const submitButton = page.getByTestId("prediction-submit");
     await expect(submitButton).toBeEnabled({ timeout: 60_000 });
-    await submitButton.click({ force: true });
+    await submitButton.click();
   }
+  throw new Error("The Solana order did not reach a terminal tracking state");
+}
+
+async function openSolanaBuyOrderEntry(
+  page: Page,
+  clobPanel: Locator,
+): Promise<void> {
+  await expect(page.locator(".hm-root")).toHaveAttribute(
+    "data-market-can-place-bet",
+    "true",
+    { timeout: 120_000 },
+  );
+  const buyTab = clobPanel.getByTestId("prediction-tab-buy");
+  await expect(buyTab).toBeVisible({ timeout: 120_000 });
+  await expect(buyTab).toBeEnabled();
+  await buyTab.click();
+}
+
+async function selectSolanaPredictionSide(
+  clobPanel: Locator,
+  side: "yes" | "no",
+): Promise<void> {
+  const sideButton = clobPanel.getByTestId(`prediction-select-${side}`);
+  await expect(sideButton).toBeVisible({ timeout: 120_000 });
+  await expect(sideButton).toBeEnabled();
+  await sideButton.click();
+  await expect(sideButton).toHaveAttribute("aria-pressed", "true");
 }
 
 async function confirmSolanaManagedOrder(
@@ -1541,24 +2392,24 @@ async function confirmSolanaManagedOrder(
     rentText: string;
     grossCreditText: string;
     historyEntry?: Locator;
+    auditDismissal?: boolean;
   },
 ): Promise<string> {
   const isCancellation = input.action === "CANCEL";
   const isFilledCleanup = input.action === "CLOSE_FILLED";
+  let actionButton: Locator;
   if (input.historyEntry) {
     await expect(input.historyEntry).toBeVisible({ timeout: 30_000 });
     await expect(input.historyEntry).toContainText(
       `Order #${input.orderId.toString()}`,
     );
-    await input.historyEntry
-      .getByRole("button", {
-        name: isFilledCleanup
-          ? /recover order rent/i
-          : isCancellation
-            ? /manage open order/i
-            : /reclaim resting order/i,
-      })
-      .click();
+    actionButton = input.historyEntry.getByRole("button", {
+      name: isFilledCleanup
+        ? /recover order rent/i
+        : isCancellation
+          ? /manage open order/i
+          : /reclaim resting order/i,
+    });
   } else {
     const managedOrderCard = page.getByTestId(
       `solana-managed-order-${input.orderId.toString()}`,
@@ -1583,10 +2434,17 @@ async function confirmSolanaManagedOrder(
       : isFilledCleanup
         ? `recover filled-order rent #${input.orderId}`
         : `reclaim resting order #${input.orderId}`;
-    await managedOrderCard
-      .getByRole("button", { name: new RegExp(actionLabel, "i") })
-      .click();
+    actionButton = managedOrderCard.getByRole("button", {
+      name: new RegExp(actionLabel, "i"),
+    });
   }
+  await expect(actionButton).toBeVisible();
+  expect(
+    await actionButton.evaluate(
+      (element) => element.getBoundingClientRect().height,
+    ),
+  ).toBeGreaterThanOrEqual(44);
+  await actionButton.click();
 
   const confirmation = page.getByRole("dialog", {
     name: isCancellation
@@ -1617,11 +2475,35 @@ async function confirmSolanaManagedOrder(
         ? /confirm rent recovery and sign/i
         : /confirm reclaim and sign/i,
   });
+  const backButton = confirmation.getByRole("button", {
+    name: /back to orders/i,
+  });
+  await expect(backButton).toBeFocused();
+  await expect(confirmButton).toBeInViewport({ ratio: 1 });
+  await expect(backButton).toBeInViewport({ ratio: 1 });
+  expect(
+    await confirmButton.evaluate(
+      (element) => element.getBoundingClientRect().height,
+    ),
+  ).toBeGreaterThanOrEqual(44);
+  expect(
+    await backButton.evaluate(
+      (element) => element.getBoundingClientRect().height,
+    ),
+  ).toBeGreaterThanOrEqual(44);
+  if (input.auditDismissal) {
+    await page.keyboard.press("Escape");
+    await expect(confirmation).toHaveCount(0);
+    await expect(actionButton).toBeFocused();
+    await actionButton.click();
+    await expect(confirmation).toBeVisible();
+    await expect(confirmation).toContainText(`#${input.orderId}`);
+    await expect(backButton).toBeFocused();
+  }
+  await page.keyboard.press("Shift+Tab");
   await expect(confirmButton).toBeFocused();
   await page.keyboard.press("Tab");
-  await expect(
-    confirmation.getByRole("button", { name: /back to orders/i }),
-  ).toBeFocused();
+  await expect(backButton).toBeFocused();
   await page.keyboard.press("Shift+Tab");
   await expect(confirmButton).toBeFocused();
   await confirmButton.click();
@@ -1668,9 +2550,13 @@ async function gotoApp(
     e2eSolanaDuelKey?: string | null;
     e2eSolanaDuelId?: string | null;
     e2eSolanaMarketRef?: string | null;
+    debug?: boolean;
   } = {},
 ): Promise<void> {
-  const params = new URLSearchParams({ debug: "1" });
+  const params = new URLSearchParams();
+  if (options.debug !== false) {
+    params.set("debug", "1");
+  }
   if (options.e2eSolanaDuelKey) {
     params.set(
       "e2eSolanaDuelKey",
@@ -1713,38 +2599,31 @@ async function gotoApp(
           },
         )
         .not.toBe("");
+
+      const appRoot = page.locator(".hm-root").first();
+      await expect(appRoot).toHaveAttribute(
+        "data-stream-sync-mode",
+        "program-date-time",
+        { timeout: 45_000 },
+      );
+      await expect
+        .poll(
+          async () => {
+            const video = page.locator("video").first();
+            if ((await video.count()) === 0) return 0;
+            return video.evaluate(
+              (element) => (element as HTMLVideoElement).currentTime,
+            );
+          },
+          { timeout: 45_000, intervals: [250, 500, 1_000, 2_000] },
+        )
+        .toBeGreaterThan(0);
       return;
     } catch (error) {
       if (attempt === 2) throw error;
       await page.goto("about:blank");
     }
   }
-}
-
-async function waitForNewText(
-  page: Page,
-  testId: string,
-  previousValue = "",
-  timeoutMs = 180_000,
-): Promise<string> {
-  let matched = "";
-  await expect
-    .poll(
-      async () => {
-        const next = await readText(page, testId);
-        if (!next || next === "-" || next === previousValue) {
-          return "";
-        }
-        matched = next;
-        return next;
-      },
-      {
-        timeout: timeoutMs,
-        intervals: [1_000, 2_000, 5_000],
-      },
-    )
-    .not.toBe("");
-  return matched;
 }
 
 async function ensureWalletConnected(page: Page): Promise<void> {
@@ -1767,7 +2646,7 @@ async function ensureWalletConnected(page: Page): Promise<void> {
       .getByRole("button", { name: /E2E Trader/i })
       .first();
     if (!(await walletOption.isVisible().catch(() => false))) return false;
-    await walletOption.click({ force: true });
+    await walletOption.click();
     await expect(
       page.getByRole("dialog", {
         name: /Connect a wallet on Solana to continue/i,
@@ -2275,10 +3154,12 @@ async function listSolanaTraderFixtures(
     )) as {
       status?: unknown;
       pendingWinner?: unknown;
+      pendingDuelEndTs?: unknown;
       pendingProposedAt?: unknown;
       betOpenTs?: unknown;
       betCloseTs?: unknown;
       duelStartTs?: unknown;
+      duelEndTs?: unknown;
       metadataUri?: unknown;
     };
     const pendingProposedAt = Number(duelState.pendingProposedAt ?? 0);
@@ -2299,11 +3180,13 @@ async function listSolanaTraderFixtures(
       marketWinner: enumName(marketState.winner),
       duelStatus: enumName(duelState.status),
       pendingWinner: enumName(duelState.pendingWinner),
+      pendingDuelEndTs: Number(duelState.pendingDuelEndTs ?? 0),
       pendingProposedAt,
       finalizableAt,
       betOpenTs: Number(duelState.betOpenTs ?? 0),
       betCloseTs: Number(duelState.betCloseTs ?? 0),
       duelStartTs: Number(duelState.duelStartTs ?? 0),
+      duelEndTs: Number(duelState.duelEndTs ?? 0),
       aShares,
       bShares,
       aLockedLamports,
@@ -2361,10 +3244,12 @@ async function fetchSolanaTraderFixtureByAddress(
   )) as {
     status?: unknown;
     pendingWinner?: unknown;
+    pendingDuelEndTs?: unknown;
     pendingProposedAt?: unknown;
     betOpenTs?: unknown;
     betCloseTs?: unknown;
     duelStartTs?: unknown;
+    duelEndTs?: unknown;
     metadataUri?: unknown;
   };
   const pendingProposedAt = Number(duelState.pendingProposedAt ?? 0);
@@ -2385,11 +3270,13 @@ async function fetchSolanaTraderFixtureByAddress(
     marketWinner: enumName(marketState.winner),
     duelStatus: enumName(duelState.status),
     pendingWinner: enumName(duelState.pendingWinner),
+    pendingDuelEndTs: Number(duelState.pendingDuelEndTs ?? 0),
     pendingProposedAt,
     finalizableAt,
     betOpenTs: Number(duelState.betOpenTs ?? 0),
     betCloseTs: Number(duelState.betCloseTs ?? 0),
     duelStartTs: Number(duelState.duelStartTs ?? 0),
+    duelEndTs: Number(duelState.duelEndTs ?? 0),
     aShares: bnLikeToBigInt(userBalanceAccount.aShares),
     bShares: bnLikeToBigInt(userBalanceAccount.bShares),
     aLockedLamports: bnLikeToBigInt(userBalanceAccount.aLockedLamports),
@@ -2435,10 +3322,12 @@ async function fetchPinnedSolanaFixture(
   )) as {
     status?: unknown;
     pendingWinner?: unknown;
+    pendingDuelEndTs?: unknown;
     pendingProposedAt?: unknown;
     betOpenTs?: unknown;
     betCloseTs?: unknown;
     duelStartTs?: unknown;
+    duelEndTs?: unknown;
   };
   const userBalanceAccount =
     (await clobProgram.account.userBalance.fetchNullable(
@@ -2461,11 +3350,13 @@ async function fetchPinnedSolanaFixture(
     marketWinner: enumName(marketState.winner),
     duelStatus: enumName(duelState.status),
     pendingWinner: enumName(duelState.pendingWinner),
+    pendingDuelEndTs: Number(duelState.pendingDuelEndTs ?? 0),
     pendingProposedAt,
     finalizableAt,
     betOpenTs: Number(duelState.betOpenTs ?? 0),
     betCloseTs: Number(duelState.betCloseTs ?? 0),
     duelStartTs: Number(duelState.duelStartTs ?? 0),
+    duelEndTs: Number(duelState.duelEndTs ?? 0),
     aShares: bnLikeToBigInt(userBalanceAccount?.aShares),
     bShares: bnLikeToBigInt(userBalanceAccount?.bShares),
     aLockedLamports: bnLikeToBigInt(userBalanceAccount?.aLockedLamports),
@@ -2548,6 +3439,110 @@ async function getTransactionFeeFromSignature(
 test.describe("market flows", () => {
   test.setTimeout(600_000);
 
+  test("schema-v4 sporting clock is identical across stream, oracle, market, and trade gate", async ({
+    page,
+    request,
+  }) => {
+    test.skip(
+      E2E_DUEL_SOURCE !== "synthetic_publish",
+      "the deterministic local commitment proof uses the synthetic Solana fixture",
+    );
+    const state = loadState();
+    const duelId = state.currentDuelId || "";
+    const duelKeyHex = state.currentDuelKeyHex || "";
+    const betOpenTime = state.currentBetOpenTimeMs;
+    const betCloseTime = state.currentBetCloseTimeMs;
+    const fightStartTime = state.currentFightStartTimeMs;
+    if (
+      !duelId ||
+      !/^[0-9a-f]{64}$/.test(duelKeyHex) ||
+      !Number.isSafeInteger(betOpenTime) ||
+      !Number.isSafeInteger(betCloseTime) ||
+      !Number.isSafeInteger(fightStartTime)
+    ) {
+      throw new Error("local schema-v4 commitment state is incomplete");
+    }
+
+    const expected = buildSyntheticDuelCommitment({
+      cycleId: E2E_INITIAL_CYCLE_ID,
+      duelId,
+      duelKeyHex,
+      betOpenTs: Number(betOpenTime) / 1_000,
+      betCloseTs: Number(betCloseTime) / 1_000,
+      duelStartTs: Number(fightStartTime) / 1_000,
+    });
+    const stream = await fetchJson<StreamingStateResponse>(
+      request,
+      "/api/streaming/state",
+    );
+    expect(stream.cycle).toMatchObject({
+      cycleId: E2E_INITIAL_CYCLE_ID,
+      duelId,
+      duelKeyHex,
+      competitiveSnapshotVersion: 4,
+      competitiveSnapshotDigest: expected.competitiveSnapshotDigest,
+      betOpenTime,
+      betCloseTime,
+      fightStartTime,
+      competitiveSnapshot: {
+        snapshotVersion: 4,
+        timing: expected.competitiveSnapshot.timing,
+      },
+    });
+
+    const connection = createConfirmedConnection(
+      state.solanaRpcUrl || "http://127.0.0.1:8899",
+      state.solanaWsUrl,
+    );
+    const fightProgram = createReadonlyFightProgram(connection, state);
+    const duelStateAddress = new PublicKey(state.clobDuelState || "");
+    const duelState = (await fightProgram.account.duelState.fetch(
+      duelStateAddress,
+    )) as DuelStateAccountSnapshot;
+    expect(Number(duelState.competitiveSnapshotVersion)).toBe(4);
+    expect(
+      Buffer.from(duelState.competitiveSnapshotDigest ?? []).toString("hex"),
+    ).toBe(expected.competitiveSnapshotDigest);
+    expect(bnLikeToBigInt(duelState.betOpenTs)).toBe(
+      BigInt(Number(betOpenTime) / 1_000),
+    );
+    expect(bnLikeToBigInt(duelState.betCloseTs)).toBe(
+      BigInt(Number(betCloseTime) / 1_000),
+    );
+    expect(bnLikeToBigInt(duelState.duelStartTs)).toBe(
+      BigInt(Number(fightStartTime) / 1_000),
+    );
+
+    const clobProgram = createReadonlyClobProgram(connection, state);
+    const market = (await clobProgram.account.marketState.fetch(
+      new PublicKey(state.clobMarketState || ""),
+    )) as { duelState?: PublicKey; status?: unknown };
+    expect(market.duelState?.toBase58()).toBe(duelStateAddress.toBase58());
+    expect(enumName(market.status)).toBe("open");
+
+    await gotoApp(page, {
+      e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
+      e2eSolanaMarketRef: state.clobMarketState || "",
+    });
+    await selectChain(page, "solana");
+    const expandButton = page.locator('button[title="Expand panel"]').first();
+    if (await expandButton.isVisible().catch(() => false)) {
+      await expandButton.click();
+    }
+    await ensureWalletConnected(page);
+    await expect(page.locator(".hm-root")).toHaveAttribute(
+      "data-market-competitive-disclosure",
+      "verified",
+      { timeout: 60_000 },
+    );
+    await expect(page.locator(".hm-root")).toHaveAttribute(
+      "data-market-can-place-bet",
+      "true",
+      { timeout: 60_000 },
+    );
+  });
+
   test("solana lifecycle shell and claim CTA follow the normalized lifecycle API", async ({
     page,
   }) => {
@@ -2610,7 +3605,11 @@ test.describe("market flows", () => {
     await expect(page.getByTestId("market-status")).toContainText(/locked/i, {
       timeout: 15_000,
     });
-    await expect(submitButton).toBeDisabled({ timeout: 15_000 });
+    await expect(page.getByTestId("solana-clob-panel").first()).toContainText(
+      "Betting locked.",
+      { timeout: 15_000 },
+    );
+    await expect(submitButton).toHaveCount(0);
     await expect(claimButton).toHaveCount(0);
 
     lifecycleStatus = "OPEN";
@@ -2621,7 +3620,7 @@ test.describe("market flows", () => {
     await expect(submitButton).toBeEnabled({ timeout: 15_000 });
 
     await page.getByTestId("prediction-amount-input").fill("999999999");
-    await page.getByTestId("prediction-select-yes").click({ force: true });
+    await page.getByTestId("prediction-select-yes").click();
     const orderQuote = page.getByTestId("solana-order-quote");
     await expect(orderQuote).toContainText("Order details before signature");
     await expect(orderQuote).toContainText("Maximum locked collateral");
@@ -2783,11 +3782,2020 @@ test.describe("market flows", () => {
     await expect(claimButton).toContainText(/claim/i);
   });
 
+  test("a cancelled-only bettor recovers exact empty-balance rent after the market closes", async ({
+    page,
+    request,
+  }, testInfo) => {
+    test.skip(
+      E2E_DUEL_SOURCE === "real_hyperia",
+      "empty-balance rent recovery remains a synthetic Solana browser lane for now",
+    );
+    test.setTimeout(360_000);
+
+    const state = loadState();
+    const connection = createConfirmedConnection(
+      state.solanaRpcUrl || "http://127.0.0.1:8899",
+      state.solanaWsUrl,
+    );
+    const trader = new PublicKey(state.solanaTraderPublicKey || "");
+    const clobProgram = createReadonlyClobProgram(connection, state);
+    const {
+      authority,
+      fightProgram,
+      clobProgram: writableClobProgram,
+    } = await createWritablePrograms(connection, state);
+    const {
+      duelKey,
+      duelKeyHex,
+      duelId,
+      duelState,
+      marketState,
+      betOpenTs,
+      betCloseTs,
+      duelStartTs,
+    } = await createFreshSolanaOpenMarket(
+      request,
+      state,
+      authority,
+      fightProgram,
+      writableClobProgram,
+      "gate10-solana-empty-balance-rent",
+      {
+        betCloseOffsetSeconds: 120,
+        duelStartOffsetSeconds: 120,
+      },
+    );
+    const userBalanceAddress = deriveUserBalancePda(
+      clobProgram.programId,
+      marketState,
+      trader,
+    );
+    const restingOrder = await placeE2eTraderRestingOrder(connection, state, {
+      marketState,
+      duelState,
+      side: SIDE_BID,
+      price: 1,
+      amount: 50_000_000n,
+    });
+    const orderRentLamports = BigInt(
+      await connection.getBalance(restingOrder.orderAddress, "confirmed"),
+    );
+    expect(orderRentLamports).toBeGreaterThan(0n);
+
+    await gotoApp(page, {
+      e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
+      e2eSolanaMarketRef: marketState.toBase58(),
+    });
+    await selectChain(page, "solana");
+    const expandButton = page.locator('button[title="Expand panel"]').first();
+    if (await expandButton.isVisible().catch(() => false)) {
+      await expandButton.click();
+    }
+    await ensureWalletConnected(page);
+    await page.getByTestId("refresh-market").click();
+
+    const expectedCollateralLamports = 50_000n;
+    const cancelSignature = await confirmSolanaManagedOrder(page, {
+      orderId: restingOrder.orderId,
+      action: "CANCEL",
+      outcomeText: "YES 0.1%",
+      remainingText: "0.05",
+      refundText: `${formatSolLamports(expectedCollateralLamports, 9)} SOL`,
+      rentText: `${formatSolLamports(orderRentLamports, 9)} SOL`,
+      grossCreditText: `${formatSolLamports(expectedCollateralLamports + orderRentLamports, 9)} SOL`,
+    });
+    await expect
+      .poll(
+        async () => {
+          const [walletDelta, transactionFee] = await Promise.all([
+            getWalletLamportDeltaFromSignature(
+              connection,
+              cancelSignature,
+              trader,
+            ),
+            getTransactionFeeFromSignature(connection, cancelSignature),
+          ]);
+          return walletDelta == null || transactionFee == null
+            ? null
+            : (walletDelta + transactionFee).toString();
+        },
+        { timeout: 30_000, intervals: [500, 1_000, 2_000] },
+      )
+      .toBe((expectedCollateralLamports + orderRentLamports).toString());
+
+    const emptyBalance = (await clobProgram.account.userBalance.fetch(
+      userBalanceAddress,
+    )) as UserBalanceAccount;
+    expect({
+      aShares: bnLikeToBigInt(emptyBalance.aShares),
+      bShares: bnLikeToBigInt(emptyBalance.bShares),
+      aLockedLamports: bnLikeToBigInt(emptyBalance.aLockedLamports),
+      bLockedLamports: bnLikeToBigInt(emptyBalance.bLockedLamports),
+      tradeTreasuryFeeLamports: bnLikeToBigInt(
+        emptyBalance.tradeTreasuryFeeLamports,
+      ),
+      tradeMarketMakerFeeLamports: bnLikeToBigInt(
+        emptyBalance.tradeMarketMakerFeeLamports,
+      ),
+    }).toEqual({
+      aShares: 0n,
+      bShares: 0n,
+      aLockedLamports: 0n,
+      bLockedLamports: 0n,
+      tradeTreasuryFeeLamports: 0n,
+      tradeMarketMakerFeeLamports: 0n,
+    });
+    const balanceRentLamports = BigInt(
+      await connection.getBalance(userBalanceAddress, "confirmed"),
+    );
+    expect(balanceRentLamports).toBeGreaterThan(0n);
+    await page.getByTestId("refresh-market").click();
+    await expect(
+      page.getByTestId("solana-clob-recover-balance-rent"),
+      "open markets must never expose balance closure while an order could still require that PDA",
+    ).toHaveCount(0);
+
+    await cancelDuel(
+      fightProgram as never,
+      authority,
+      duelKey,
+      canonicalDuelMetadata(duelId, duelKeyHex, "cancelled"),
+    );
+    await syncMarketFromDuel(
+      writableClobProgram as never,
+      marketState,
+      duelState,
+    );
+    await publishSolanaCycleState(request, {
+      cycleId: `gate10-solana-${duelId}`,
+      duelId,
+      duelKeyHex,
+      betOpenTs,
+      betCloseTs,
+      duelStartTs,
+      phase: "RESOLUTION",
+      winner: "NONE",
+      duelEndTs: await currentChainUnixTimestamp(connection),
+      cancellationReason: COMPETITIVE_SNAPSHOT_RECOVERY_WINDOW_ELAPSED_REASON,
+    });
+    await expect
+      .poll(
+        async () => {
+          const predictionMarkets = await fetchPredictionMarkets(request);
+          return (
+            findPredictionMarket(predictionMarkets, "solana")
+              ?.lifecycleStatus ?? "missing"
+          );
+        },
+        { timeout: 60_000, intervals: [1_000, 2_000, 5_000] },
+      )
+      .toBe("CANCELLED");
+
+    await page.getByTestId("refresh-market").click();
+    const recoverRentButton = page.getByTestId(
+      "solana-clob-recover-balance-rent",
+    );
+    await expect(recoverRentButton).toBeEnabled({ timeout: 30_000 });
+    await expect(recoverRentButton).toContainText(/recover rent/i);
+    expect(
+      await recoverRentButton.evaluate(
+        (element) => element.getBoundingClientRect().height,
+      ),
+    ).toBeGreaterThanOrEqual(44);
+    await recoverRentButton.click();
+    const recoverySignature = await expectSolanaSettlementReceipt(
+      page,
+      /account-rent recovery confirmed on-chain/i,
+    );
+    await expect
+      .poll(
+        async () => {
+          const [walletDelta, transactionFee] = await Promise.all([
+            getWalletLamportDeltaFromSignature(
+              connection,
+              recoverySignature,
+              trader,
+            ),
+            getTransactionFeeFromSignature(connection, recoverySignature),
+          ]);
+          return walletDelta == null || transactionFee == null
+            ? null
+            : (walletDelta + transactionFee).toString();
+        },
+        { timeout: 30_000, intervals: [500, 1_000, 2_000] },
+      )
+      .toBe(balanceRentLamports.toString());
+    expect(
+      await clobProgram.account.userBalance.fetchNullable(userBalanceAddress),
+    ).toBeNull();
+
+    await testInfo.attach("solana-empty-balance-rent-evidence", {
+      body: Buffer.from(
+        JSON.stringify(
+          {
+            duelId,
+            duelKeyHex,
+            marketState: marketState.toBase58(),
+            cancelSignature,
+            recoverySignature,
+            orderRentLamports: orderRentLamports.toString(),
+            balanceRentLamports: balanceRentLamports.toString(),
+          },
+          null,
+          2,
+        ),
+      ),
+      contentType: "application/json",
+    });
+  });
+
+  test("natural Hyperia combat drives public stream truth through SOL settlement and claim", async ({
+    page,
+    request,
+  }, testInfo) => {
+    test.skip(
+      E2E_DUEL_SOURCE !== "real_hyperia" || !REQUIRE_NATURAL_HYPERIA_TERMINAL,
+      "the natural-terminal qualification requires the persisted real Hyperia source and its explicit acceptance mode",
+    );
+    test.setTimeout(600_000);
+
+    const state = loadState();
+    const control = loadControl();
+    let preparationEvidence: Full3DPreparationEvidence | null = null;
+    if (E2E_HYPERIA_RUNTIME === "full_3d") {
+      expect(control.services.hyperia?.runtime).toBe("full_3d");
+      expect(control.services.hyperia?.combatRole).toBe(HYPERIA_COMBAT_ROLE);
+      expect(control.services.hyperia?.terminalExpectation).toBe(
+        HYPERIA_TERMINAL_EXPECTATION,
+      );
+      expect(
+        path.isAbsolute(
+          control.services.hyperia?.rendererStatusPath?.trim() || "",
+        ),
+      ).toBe(true);
+      expect(
+        path.isAbsolute(
+          control.services.hyperia?.captureStatusPath?.trim() || "",
+        ),
+      ).toBe(true);
+      preparationEvidence = readFull3DPreparationEvidence(control);
+      const preparationFrame = fs.readFileSync(
+        preparationEvidence.hls.framePath,
+      );
+      expect({
+        schemaVersion: preparationEvidence.schemaVersion,
+        publicPhase: preparationEvidence.publicState.cycle?.phase,
+        publicPreparationStatus:
+          preparationEvidence.publicState.preparation?.status,
+        privateStatus: preparationEvidence.privateAuthority.status,
+        rendererPhase: preparationEvidence.rendererStatus.rendererHealth?.phase,
+        rendererReady: preparationEvidence.rendererStatus.rendererHealth?.ready,
+        frameDimensions: `${preparationEvidence.hls.width}x${preparationEvidence.hls.height}`,
+        frameSha256: createHash("sha256")
+          .update(preparationFrame)
+          .digest("hex"),
+        expectedFrameSha256: preparationEvidence.hls.frameSha256,
+      }).toEqual({
+        schemaVersion: 1,
+        publicPhase: "IDLE",
+        publicPreparationStatus: expect.stringMatching(/^(preparing|ready)$/),
+        privateStatus: "ready",
+        rendererPhase: "IDLE",
+        rendererReady: true,
+        frameDimensions: "1280x720",
+        frameSha256: preparationEvidence.hls.frameSha256,
+        expectedFrameSha256: preparationEvidence.hls.frameSha256,
+      });
+      expect(preparationEvidence.preparationCoverage.shots).toHaveLength(2);
+      expect(
+        preparationEvidence.preparationCoverage.shots.map((shot) => shot.slot),
+      ).toEqual(["agent1", "agent2"]);
+      for (const shot of preparationEvidence.preparationCoverage.shots) {
+        const framing =
+          shot.rendererStatus.rendererHealth?.diagnostics?.sceneReadiness;
+        const directedFrame = fs.readFileSync(shot.frame.path);
+        const expectedAgentId =
+          shot.slot === "agent1"
+            ? preparationEvidence.privateAuthority.agent1Id
+            : preparationEvidence.privateAuthority.agent2Id;
+        const isPairShot = framing?.preparationPairShotActive === true;
+        if (isPairShot) {
+          expect([
+            preparationEvidence.privateAuthority.agent1Id,
+            preparationEvidence.privateAuthority.agent2Id,
+          ]).toContain(shot.publicState.cameraTarget);
+          expect(["agent1", "agent2"]).toContain(framing?.cameraTargetSlot);
+        } else {
+          expect(shot.publicState.cameraTarget).toBe(expectedAgentId);
+          expect(framing?.cameraTargetSlot).toBe(shot.slot);
+        }
+        expect({
+          phase: shot.publicState.cycle?.phase,
+          preparationStatus: shot.publicState.preparation?.status,
+          rendererReady: shot.rendererStatus.rendererHealth?.ready,
+          rendererPhase: shot.rendererStatus.rendererHealth?.phase,
+          expectedAgentCount: framing?.expectedAgentCount,
+          loadedExpectedAgentCount: framing?.loadedExpectedAgentCount,
+          renderedAgentCount: framing?.renderedAgentCount,
+          targetMatches: framing?.cameraTargetMatchesExpected,
+          preparationActive: framing?.preparationActive,
+          preparationShotActive: framing?.preparationShotActive,
+          targetFullyFramed: framing?.fullyFramedAgentSlots?.includes(
+            shot.slot,
+          ),
+          targetUnobstructed: framing?.unobstructedVisibleAgentSlots?.includes(
+            shot.slot,
+          ),
+          croppedBodies: framing?.croppedVisibleAgentBodyCount,
+          frameSource: shot.frame.source,
+          frameDimensions: `${shot.frame.width}x${shot.frame.height}`,
+          frameSha256: createHash("sha256").update(directedFrame).digest("hex"),
+          expectedFrameSha256: shot.frame.sha256,
+        }).toEqual({
+          phase: "IDLE",
+          preparationStatus: expect.stringMatching(/^(preparing|ready)$/),
+          rendererReady: true,
+          rendererPhase: "IDLE",
+          expectedAgentCount: 2,
+          loadedExpectedAgentCount: 2,
+          renderedAgentCount: 2,
+          targetMatches: true,
+          preparationActive: true,
+          preparationShotActive: true,
+          targetFullyFramed: true,
+          targetUnobstructed: true,
+          croppedBodies: 0,
+          frameSource: "capture_browser",
+          frameDimensions: "1280x720",
+          frameSha256: shot.frame.sha256,
+          expectedFrameSha256: shot.frame.sha256,
+        });
+        expect(framing?.minimumVisibleAgentBodyNdcSpan).toBeGreaterThanOrEqual(
+          0.55,
+        );
+        expect(framing?.maximumVisibleAgentBodyNdcSpan).toBeLessThanOrEqual(
+          0.75,
+        );
+        if (framing?.preparationPairShotActive) {
+          expect(framing.visibleAgentFramingCount).toBe(2);
+          expect(framing.unobstructedVisibleAgentSlots).toEqual([
+            "agent1",
+            "agent2",
+          ]);
+          expect(framing.occludedVisibleAgentBodyCount).toBe(0);
+          expect(framing.missingVisibleAgentLineOfSightCount).toBe(0);
+          expect(
+            framing.minimumVisibleAgentHorizontalNdcSeparation,
+          ).toBeGreaterThanOrEqual(0.24);
+        } else {
+          expect(framing?.visibleAgentFramingCount).toBe(1);
+          expect(
+            framing?.minimumVisibleAgentHorizontalNdcSeparation,
+          ).toBeNull();
+        }
+        await testInfo.attach(
+          `natural-hyperia-3d-public-preparation-${shot.slot}`,
+          {
+            path: shot.frame.path,
+            contentType: "image/png",
+          },
+        );
+      }
+      expect({
+        bankOpenCount: preparationEvidence.privateAuthority.bankOpenCount,
+        planOperationCount:
+          preparationEvidence.privateAuthority.planOperationCount,
+      }).toEqual({ bankOpenCount: 2, planOperationCount: 2 });
+      const ordinaryPreparation = preparationEvidence.ordinaryPreparation;
+      expect({
+        schemaVersion: ordinaryPreparation.schemaVersion,
+        status: ordinaryPreparation.status,
+        multiStyle: ordinaryPreparation.multiStyle,
+        availableCombatRoles: ordinaryPreparation.availableCombatRoles,
+        agentCount: ordinaryPreparation.agents.length,
+        gatheringOperations: ordinaryPreparation.totals.gatheringOperations,
+        processingOperations: ordinaryPreparation.totals.processingOperations,
+        ordinaryBankOperations:
+          ordinaryPreparation.totals.ordinaryBankOperations,
+        processDeathRecoveryCovered:
+          ordinaryPreparation.processDeathRecoveryCovered,
+        ordinaryAutonomySelectionCovered:
+          ordinaryPreparation.ordinaryAutonomySelectionCovered,
+        liveWorldNavigationCovered:
+          ordinaryPreparation.liveWorldNavigationCovered,
+        livePreparationPresentationCovered:
+          ordinaryPreparation.livePreparationPresentationCovered,
+        realPostgresqlCustodyCovered:
+          ordinaryPreparation.realPostgresqlCustodyCovered,
+        fullTopologySeedContractCovered:
+          ordinaryPreparation.fullTopologySeedContractCovered,
+        ownedMultiStylePreparationCovered:
+          ordinaryPreparation.ownedMultiStylePreparationCovered,
+        ordinaryForgingQuestCovered:
+          ordinaryPreparation.ordinaryForgingQuestCovered,
+        workerDatabaseSessionsDrained:
+          ordinaryPreparation.workerDatabaseSessionsDrained,
+        scriptedCustodyBridgeCovered:
+          ordinaryPreparation.scriptedCustodyBridgeCovered,
+      }).toEqual({
+        schemaVersion: 3,
+        status: "passed",
+        multiStyle: HYPERIA_MULTI_STYLE,
+        availableCombatRoles: HYPERIA_MULTI_STYLE
+          ? ["melee", "ranged", "mage"]
+          : [HYPERIA_COMBAT_ROLE],
+        agentCount: 2,
+        gatheringOperations: expect.any(Number),
+        processingOperations: expect.any(Number),
+        ordinaryBankOperations: 2,
+        processDeathRecoveryCovered: true,
+        ordinaryAutonomySelectionCovered: true,
+        liveWorldNavigationCovered: true,
+        livePreparationPresentationCovered: true,
+        realPostgresqlCustodyCovered: true,
+        fullTopologySeedContractCovered: true,
+        ownedMultiStylePreparationCovered: HYPERIA_MULTI_STYLE,
+        ordinaryForgingQuestCovered: HYPERIA_MULTI_STYLE,
+        workerDatabaseSessionsDrained: true,
+        scriptedCustodyBridgeCovered: false,
+      });
+      expect(
+        ordinaryPreparation.workerDatabaseSessionDrainElapsedMs,
+      ).toBeGreaterThanOrEqual(0);
+      expect(
+        ordinaryPreparation.workerDatabaseSessionDrainElapsedMs,
+      ).toBeLessThanOrEqual(30_000);
+      expect(ordinaryPreparation.remainingWorkerDatabaseSessionPids).toEqual(
+        [],
+      );
+      expect(
+        ordinaryPreparation.totals.gatheringOperations,
+      ).toBeGreaterThanOrEqual(8);
+      expect(
+        ordinaryPreparation.totals.processingOperations,
+      ).toBeGreaterThanOrEqual(8);
+      expect(
+        [...ordinaryPreparation.agents.map((agent) => agent.agentId)].sort(),
+      ).toEqual(
+        [
+          preparationEvidence.privateAuthority.agent1Id,
+          preparationEvidence.privateAuthority.agent2Id,
+        ].sort(),
+      );
+      const frozenContestants =
+        preparationEvidence.frozenBettingSource.competitiveSnapshot.contestants;
+      expect(HYPERIA_COMBAT_ROLE).toMatch(/^(melee|ranged|mage)$/);
+      const maxFightDurationMs =
+        preparationEvidence.frozenBettingSource.competitiveSnapshot.timing
+          ?.maxFightDurationMs;
+      const combatFixture = resolveHyperiaCombatFixture(
+        HYPERIA_COMBAT_ROLE as HyperiaCombatRole,
+        maxFightDurationMs ?? Number.NaN,
+      );
+      for (const agent of ordinaryPreparation.agents) {
+        expect(agent.cookedFood).toBeGreaterThanOrEqual(4);
+        expect(agent.toolCount).toBe(1);
+        expect(agent.gatheringOperations).toBeGreaterThanOrEqual(4);
+        expect(agent.processingOperations).toBeGreaterThanOrEqual(4);
+        expect(agent.ordinaryBankOperations).toBe(1);
+        expect(agent.progressionStarts).toBe(agent.progressionTerminals);
+        const contestant = frozenContestants.find(
+          (candidate) => candidate.agentId === agent.agentId,
+        );
+        expect(contestant).toBeDefined();
+        expect(contestant!.initialCombatStyle).toBe(HYPERIA_COMBAT_ROLE);
+        expect(contestant!.availableCombatStyles).toContain(
+          HYPERIA_COMBAT_ROLE,
+        );
+        expect(
+          contestant!.equipment.find((item) => item.slot === "weapon"),
+        ).toMatchObject({ itemId: combatFixture.weaponId, quantity: 1 });
+        expect(contestant!.selectedSpell).toBe(combatFixture.selectedSpell);
+        const ammunition = contestant!.equipment.find(
+          (item) => item.slot === "arrows",
+        );
+        if (combatFixture.ammunition === null) {
+          expect(ammunition).toBeUndefined();
+        } else {
+          expect(ammunition).toMatchObject(combatFixture.ammunition);
+        }
+        for (const supply of combatFixture.inventorySupplies) {
+          expect(
+            contestant!.inventory
+              .filter((item) => item.itemId === supply.itemId)
+              .reduce((total, item) => total + item.quantity, 0),
+          ).toBe(supply.quantity);
+        }
+        const planOperation =
+          preparationEvidence.privateAuthority.planOperations.find(
+            (operation) => operation.agentId === agent.agentId,
+          );
+        expect(planOperation).toBeDefined();
+        const frozenFood = contestant!.inventory
+          .filter((item) => item.itemId === HYPERIA_PREPARATION_FOOD.itemId)
+          .reduce((total, item) => total + item.quantity, 0);
+        const bankedFood = planOperation!.committedBank
+          .filter((item) => item.itemId === HYPERIA_PREPARATION_FOOD.itemId)
+          .reduce((total, item) => total + item.quantity, 0);
+        expect(frozenFood).toBe(
+          Math.min(
+            agent.cookedFood,
+            resolveHyperiaFullHealthFoodReserve(
+              contestant!.maxHp,
+              HYPERIA_PREPARATION_FOOD.healAmount,
+            ),
+          ),
+        );
+        expect(frozenFood + bankedFood).toBe(agent.cookedFood);
+        expect(
+          contestant!.inventory.filter((item) =>
+            [
+              "lobster",
+              "raw_shrimp",
+              "burnt_shrimp",
+              "small_fishing_net",
+            ].includes(item.itemId),
+          ),
+        ).toEqual([]);
+        // The live-world report is a quiescent point-in-time proof, not the
+        // duel selection boundary. Persisted agents intentionally resume
+        // ordinary play while the renderer/stream topology starts, so an
+        // authoritative skill may advance before the later digest-backed
+        // competitive snapshot is frozen. Require monotonic carry-forward;
+        // the frozenAt/readyAt and announcement digest assertions below prove
+        // the actual betting boundary remains immutable.
+        expect(
+          contestant!.skillLevels.find((skill) => skill.skill === "fishing")
+            ?.level,
+        ).toBeGreaterThanOrEqual(agent.fishingLevel);
+        expect(
+          contestant!.skillLevels.find((skill) => skill.skill === "cooking")
+            ?.level,
+        ).toBeGreaterThanOrEqual(agent.cookingLevel);
+        expect(contestant!.preparation.planningSource).toBe("deterministic");
+      }
+      expect(ordinaryPreparation.liveWorldReports).toHaveLength(2);
+      for (const [
+        index,
+        report,
+      ] of ordinaryPreparation.liveWorldReports.entries()) {
+        expect(path.isAbsolute(report.path)).toBe(true);
+        const reportBytes = fs.readFileSync(report.path);
+        expect(createHash("sha256").update(reportBytes).digest("hex")).toBe(
+          report.sha256,
+        );
+        expect({
+          status: report.preparationVerticalSlice.status,
+          exactFinalCustodyAndXp:
+            report.preparationVerticalSlice.exactFinalCustodyAndXp,
+          quiescent: report.preparationVerticalSlice.quiescent,
+          diagonalStep: report.preparationVerticalSlice.movement?.diagonalStep,
+          forcedBurnObserved:
+            report.preparationVerticalSlice.cooking?.forcedBurnObserved,
+          processingRejections:
+            report.preparationVerticalSlice.presentation?.processingRejections,
+        }).toEqual({
+          status: "passed",
+          exactFinalCustodyAndXp: true,
+          quiescent: true,
+          diagonalStep: true,
+          forcedBurnObserved: true,
+          processingRejections: 0,
+        });
+        await testInfo.attach(
+          `natural-hyperia-ordinary-preparation-live-world-${index + 1}`,
+          { path: report.path, contentType: "application/json" },
+        );
+      }
+      for (const agentId of [
+        preparationEvidence.privateAuthority.agent1Id,
+        preparationEvidence.privateAuthority.agent2Id,
+      ]) {
+        const activities = preparationEvidence.privateAuthority.activityRows
+          .filter((row) => row.agentId === agentId)
+          .map((row) => row.activity);
+        expect(activities).toContain("planning");
+        expect(activities).toContain("provisioning");
+      }
+      expect([
+        preparationEvidence.privateAuthority.agent1Id,
+        preparationEvidence.privateAuthority.agent2Id,
+      ]).toContain(preparationEvidence.publicState.cameraTarget);
+      expect(
+        JSON.stringify(preparationEvidence.publicState.preparation),
+      ).not.toContain(preparationEvidence.privateAuthority.preparationId);
+      await testInfo.attach("natural-hyperia-3d-public-preparation-evidence", {
+        path: control.services.hyperia!.preparationEvidencePath!,
+        contentType: "application/json",
+      });
+      await testInfo.attach(
+        "natural-hyperia-3d-public-preparation-hls-decoded-frame",
+        {
+          path: preparationEvidence.hls.framePath,
+          contentType: "image/png",
+        },
+      );
+    }
+    const connection = createConfirmedConnection(
+      state.solanaRpcUrl || "http://127.0.0.1:8899",
+      state.solanaWsUrl,
+    );
+    const trader = new PublicKey(state.solanaTraderPublicKey || "");
+    const duelId = state.currentDuelId || "";
+    const duelKeyHex = state.currentDuelKeyHex || "";
+    const duelState = new PublicKey(state.clobDuelState || "");
+    const marketState = new PublicKey(state.clobMarketState || "");
+    const clobProgram = createReadonlyClobProgram(connection, state);
+    const userBalanceAddress = deriveUserBalancePda(
+      clobProgram.programId,
+      marketState,
+      trader,
+    );
+    let hlsPlaybackEvidence: {
+      source: string;
+      videoWidth: number;
+      videoHeight: number;
+      firstCurrentTime: number;
+      secondCurrentTime: number;
+      firstTotalVideoFrames: number;
+      secondTotalVideoFrames: number;
+    } | null = null;
+    let postTerminalPresentationEvidence: {
+      mode: "same_cycle_resolution" | "advanced_cycle_with_historical_claim";
+      pinnedDuelId: string;
+      presentedStreamDuelId: string;
+      historicalActivityCount: number;
+      marketCanPlaceBet: boolean;
+      playbackAdvanceSeconds: number | null;
+      playbackFrameAdvance: number | null;
+    };
+    let terminalVisualEvidence: {
+      capturedAt: number;
+      videoWidth: number;
+      videoHeight: number;
+      videoCurrentTime: number;
+      totalVideoFrames: number;
+      streamScreenshot: string;
+      streamScreenshotSha256: string;
+      pageScreenshot: string;
+      pageScreenshotSha256: string;
+    } | null = null;
+
+    const announced = await fetchHyperiaStreamingState(request, control);
+    expect({
+      type: announced.type,
+      duelId: announced.cycle?.duelId,
+      duelKeyHex: announced.cycle?.duelKeyHex,
+      phase: announced.cycle?.phase,
+      digest: announced.cycle?.competitiveSnapshotDigest,
+    }).toEqual({
+      type: "STREAMING_STATE_UPDATE",
+      duelId,
+      duelKeyHex,
+      phase: "ANNOUNCEMENT",
+      digest: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    const snapshotDigest = announced.cycle?.competitiveSnapshotDigest || "";
+    const agent1Id = announced.cycle?.agent1?.id || "";
+    const agent2Id = announced.cycle?.agent2?.id || "";
+    const agent1Name = announced.cycle?.agent1?.name?.trim() || "";
+    const agent2Name = announced.cycle?.agent2?.name?.trim() || "";
+    const cycleId = announced.cycle?.cycleId || "";
+    expect(agent1Id).not.toBe("");
+    expect(agent2Id).not.toBe("");
+    expect(agent1Id).not.toBe(agent2Id);
+    expect(agent1Name).not.toBe("");
+    expect(agent2Name).not.toBe("");
+    expect(cycleId).not.toBe("");
+    const actionObservationsBySequence = new Map<
+      number,
+      HyperiaDuelActionObservation
+    >();
+    const capturedVisualRoles = new Set<"melee" | "ranged" | "mage">();
+    const roleSwitchVisualEvidence: Array<{
+      sequence: number;
+      observedAt: number;
+      capturedAt: number;
+      actorId: string;
+      actorName: string;
+      fromRole: "melee" | "ranged" | "mage";
+      toRole: "melee" | "ranged" | "mage";
+      postSwitchCombatSequence: number;
+      postSwitchCombatAction: "engagement" | "damage";
+      feedText: string;
+      videoWidth: number;
+      videoHeight: number;
+      videoCurrentTime: number;
+      totalVideoFrames: number;
+      streamScreenshot: string;
+      streamScreenshotSha256: string;
+      pageScreenshot: string;
+      pageScreenshotSha256: string;
+    }> = [];
+    const captureActionObservations = (state: HyperiaStreamingState): void => {
+      for (const observation of state.cycle?.actionObservations ?? []) {
+        expect({
+          schemaVersion: observation.schemaVersion,
+          phase: observation.phase,
+          cycleId: observation.cycleId,
+          duelId: observation.duelId,
+          actorKnown: [agent1Id, agent2Id].includes(observation.actorId),
+          opponentKnown: [agent1Id, agent2Id].includes(observation.opponentId),
+          selfTargeted: observation.actorId === observation.opponentId,
+          sequence: observation.sequence,
+          tick: observation.tick,
+          observedAt: observation.observedAt,
+        }).toEqual({
+          schemaVersion: 1,
+          phase: "FIGHTING",
+          cycleId,
+          duelId,
+          actorKnown: true,
+          opponentKnown: true,
+          selfTargeted: false,
+          sequence: expect.any(Number),
+          tick: expect.any(Number),
+          observedAt: expect.any(Number),
+        });
+        expect(Number.isSafeInteger(observation.sequence)).toBe(true);
+        expect(observation.sequence).toBeGreaterThan(0);
+        expect(Number.isSafeInteger(observation.tick)).toBe(true);
+        expect(observation.tick).toBeGreaterThan(0);
+        expect(Number.isSafeInteger(observation.observedAt)).toBe(true);
+        expect(observation.observedAt).toBeGreaterThan(0);
+        const prior = actionObservationsBySequence.get(observation.sequence);
+        if (prior) {
+          expect(observation).toEqual(prior);
+        } else {
+          actionObservationsBySequence.set(observation.sequence, observation);
+        }
+      }
+    };
+    const captureRoleSwitchVisualEvidence = async (
+      state: HyperiaStreamingState,
+    ): Promise<void> => {
+      if (!HYPERIA_MULTI_STYLE || E2E_HYPERIA_RUNTIME !== "full_3d") return;
+      const observations = [...(state.cycle?.actionObservations ?? [])].sort(
+        (left, right) => left.sequence - right.sequence,
+      );
+      const candidate = observations
+        .filter(
+          (observation) =>
+            observation.action === "role_switch" &&
+            observation.outcome === "committed" &&
+            /^(melee|ranged|mage)$/.test(observation.value) &&
+            !capturedVisualRoles.has(
+              observation.value as "melee" | "ranged" | "mage",
+            ),
+        )
+        .map((roleSwitch) => ({
+          roleSwitch,
+          postSwitchCombat: observations.find(
+            (observation) =>
+              observation.actorId === roleSwitch.actorId &&
+              observation.sequence > roleSwitch.sequence &&
+              observation.combatRole === roleSwitch.value &&
+              ((observation.action === "engagement" &&
+                observation.outcome === "accepted") ||
+                (observation.action === "damage" &&
+                  observation.outcome === "committed" &&
+                  (observation.amount ?? 0) > 0)),
+          ),
+        }))
+        .find(({ postSwitchCombat }) => postSwitchCombat !== undefined);
+      if (!candidate?.postSwitchCombat) return;
+
+      const observation = candidate.roleSwitch;
+      const postSwitchCombat = candidate.postSwitchCombat;
+
+      const toRole = observation.value as "melee" | "ranged" | "mage";
+      const actorName =
+        observation.actorId === agent1Id ? agent1Name : agent2Name;
+      const feedText = `${actorName} switches to ${toRole}.`;
+      const actionFeed = page.getByTestId("spectator-combat-action-feed");
+      await expect(actionFeed).toContainText(feedText, { timeout: 15_000 });
+
+      // The decision feed and HLS are both public delayed surfaces. Give the
+      // next decoded video frame enough time to carry the committed equipment
+      // state, then retain both the clean stream pixels and their surrounding
+      // spectator context for direct product review.
+      await page.waitForTimeout(1_250);
+      await expect(actionFeed).toContainText(feedText, { timeout: 5_000 });
+      const video = page.locator("video[data-stream-source]").first();
+      await expect(video).toBeVisible();
+      const playback = await video.evaluate((element: HTMLVideoElement) => ({
+        videoWidth: element.videoWidth,
+        videoHeight: element.videoHeight,
+        currentTime: element.currentTime,
+        totalVideoFrames:
+          typeof element.getVideoPlaybackQuality === "function"
+            ? element.getVideoPlaybackQuality().totalVideoFrames
+            : 0,
+      }));
+      expect(playback.videoWidth).toBe(1280);
+      expect(playback.videoHeight).toBe(720);
+      expect(playback.currentTime).toBeGreaterThan(0);
+      expect(playback.totalVideoFrames).toBeGreaterThan(0);
+
+      const prefix = `natural-hyperia-role-switch-${toRole}-seq-${observation.sequence}`;
+      const streamScreenshotPath = testInfo.outputPath(`${prefix}-stream.png`);
+      const pageScreenshotPath = testInfo.outputPath(`${prefix}-page.png`);
+      const nativeStreamFrame = await video.evaluate(
+        (element: HTMLVideoElement) => {
+          const canvas = document.createElement("canvas");
+          canvas.width = element.videoWidth;
+          canvas.height = element.videoHeight;
+          const context = canvas.getContext("2d");
+          if (!context) throw new Error("2D canvas context is unavailable");
+          context.drawImage(element, 0, 0, canvas.width, canvas.height);
+          return canvas.toDataURL("image/png");
+        },
+      );
+      expect(nativeStreamFrame).toMatch(/^data:image\/png;base64,/);
+      const nativeStreamFrameBytes = Buffer.from(
+        nativeStreamFrame.replace(/^data:image\/png;base64,/, ""),
+        "base64",
+      );
+      expect(nativeStreamFrameBytes.length).toBeGreaterThan(1_000);
+      fs.writeFileSync(streamScreenshotPath, nativeStreamFrameBytes, {
+        flag: "wx",
+        mode: 0o600,
+      });
+      await page.screenshot({
+        path: pageScreenshotPath,
+        fullPage: true,
+        animations: "disabled",
+        style: '[data-testid="e2e-debug-panel"] { display: none !important; }',
+      });
+      fs.chmodSync(streamScreenshotPath, 0o600);
+      fs.chmodSync(pageScreenshotPath, 0o600);
+      const streamScreenshotSha256 = createHash("sha256")
+        .update(fs.readFileSync(streamScreenshotPath))
+        .digest("hex");
+      const pageScreenshotSha256 = createHash("sha256")
+        .update(fs.readFileSync(pageScreenshotPath))
+        .digest("hex");
+      await testInfo.attach(`${prefix}-stream`, {
+        path: streamScreenshotPath,
+        contentType: "image/png",
+      });
+      await testInfo.attach(`${prefix}-page`, {
+        path: pageScreenshotPath,
+        contentType: "image/png",
+      });
+      capturedVisualRoles.add(toRole);
+      roleSwitchVisualEvidence.push({
+        sequence: observation.sequence,
+        observedAt: observation.observedAt,
+        capturedAt: Date.now(),
+        actorId: observation.actorId,
+        actorName,
+        fromRole: observation.combatRole,
+        toRole,
+        postSwitchCombatSequence: postSwitchCombat.sequence,
+        postSwitchCombatAction: postSwitchCombat.action as
+          "engagement" | "damage",
+        feedText,
+        videoWidth: playback.videoWidth,
+        videoHeight: playback.videoHeight,
+        videoCurrentTime: playback.currentTime,
+        totalVideoFrames: playback.totalVideoFrames,
+        streamScreenshot: path.basename(streamScreenshotPath),
+        streamScreenshotSha256,
+        pageScreenshot: path.basename(pageScreenshotPath),
+        pageScreenshotSha256,
+      });
+    };
+    captureActionObservations(announced);
+    const committedTiming =
+      preparationEvidence?.frozenBettingSource.competitiveSnapshot.timing ??
+      null;
+    if (EXPECT_EXACT_HYPERIA_TIMEOUT || EXPECT_SHORT_HYPERIA_KILL) {
+      expect(committedTiming).toMatchObject({
+        contractVersion: 2,
+        timeoutPolicy: "hp_percentage_then_damage_then_draw_v1",
+        fightingDurationMs: 150_000,
+        endWarningDurationMs: 10_000,
+        maxFightDurationMs: 160_000,
+        fightStartTime: expect.any(Number),
+        fightDeadline: expect.any(Number),
+      });
+      expect(committedTiming!.fightDeadline).toBe(
+        committedTiming!.fightStartTime! + committedTiming!.maxFightDurationMs!,
+      );
+    }
+    if (preparationEvidence) {
+      const frozenBettingSource = preparationEvidence.frozenBettingSource;
+      expect({
+        duelId: frozenBettingSource.duelId,
+        duelKey: frozenBettingSource.duelKey,
+        digest: frozenBettingSource.competitiveSnapshotDigest,
+        preparationId: frozenBettingSource.competitiveSnapshot.preparationId,
+        persisted: frozenBettingSource.competitiveSnapshot.persisted,
+        diagnostic: frozenBettingSource.competitiveSnapshot.diagnostic,
+        frozenAt: frozenBettingSource.competitiveSnapshot.frozenAt,
+        contestantIds: frozenBettingSource.competitiveSnapshot.contestants.map(
+          (contestant) => contestant.agentId,
+        ),
+        announcedAgentIds: [agent1Id, agent2Id],
+      }).toEqual({
+        duelId,
+        duelKey: duelKeyHex,
+        digest: snapshotDigest,
+        preparationId: preparationEvidence.privateAuthority.preparationId,
+        persisted: true,
+        diagnostic: false,
+        frozenAt: expect.any(Number),
+        contestantIds: [
+          preparationEvidence.privateAuthority.agent1Id,
+          preparationEvidence.privateAuthority.agent2Id,
+        ],
+        announcedAgentIds: [
+          preparationEvidence.privateAuthority.agent1Id,
+          preparationEvidence.privateAuthority.agent2Id,
+        ],
+      });
+      expect(
+        frozenBettingSource.competitiveSnapshot.frozenAt,
+      ).toBeGreaterThanOrEqual(
+        Math.max(
+          preparationEvidence.privateAuthority.agent1ReadyAt,
+          preparationEvidence.privateAuthority.agent2ReadyAt,
+        ),
+      );
+    }
+
+    await expect
+      .poll(
+        async () => {
+          const predictionMarkets = await fetchPredictionMarkets(request);
+          const solanaMarket = findPredictionMarket(
+            predictionMarkets,
+            "solana",
+          );
+          return {
+            duelKey: predictionMarkets.duel.duelKey,
+            marketRef: solanaMarket?.marketRef ?? null,
+            lifecycleStatus: solanaMarket?.lifecycleStatus ?? null,
+          };
+        },
+        { timeout: 60_000, intervals: [500, 1_000, 2_000] },
+      )
+      .toEqual({
+        duelKey: duelKeyHex,
+        marketRef: marketState.toBase58(),
+        lifecycleStatus: "OPEN",
+      });
+
+    await gotoApp(page, {
+      e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
+      e2eSolanaMarketRef: marketState.toBase58(),
+    });
+    await selectChain(page, "solana");
+    const expandButton = page.locator('button[title="Expand panel"]').first();
+    if (await expandButton.isVisible().catch(() => false)) {
+      await expandButton.click();
+    }
+    await ensureWalletConnected(page);
+    const clobPanel = page.getByTestId("solana-clob-panel").first();
+
+    if (E2E_HYPERIA_RUNTIME === "full_3d") {
+      const video = page.locator("video[data-stream-source]").first();
+      await expect
+        .poll(
+          () =>
+            video.evaluate((element: HTMLVideoElement) => ({
+              readyState: element.readyState,
+              paused: element.paused,
+              videoWidth: element.videoWidth,
+              videoHeight: element.videoHeight,
+              currentTime: element.currentTime,
+            })),
+          { timeout: 30_000, intervals: [250, 500, 1_000] },
+        )
+        .toMatchObject({
+          readyState: expect.any(Number),
+          paused: false,
+          videoWidth: 1280,
+          videoHeight: 720,
+          currentTime: expect.any(Number),
+        });
+      const samplePlayback = () =>
+        video.evaluate((element: HTMLVideoElement) => ({
+          source: element.dataset.streamSource || "",
+          videoWidth: element.videoWidth,
+          videoHeight: element.videoHeight,
+          currentTime: element.currentTime,
+          totalVideoFrames:
+            typeof element.getVideoPlaybackQuality === "function"
+              ? element.getVideoPlaybackQuality().totalVideoFrames
+              : 0,
+        }));
+      const firstPlayback = await samplePlayback();
+      await page.waitForTimeout(2_500);
+      const secondPlayback = await samplePlayback();
+      expect(firstPlayback.source).toMatch(/\/live\/stream\.m3u8$/);
+      expect(firstPlayback.currentTime).toBeGreaterThan(0);
+      expect(
+        secondPlayback.currentTime - firstPlayback.currentTime,
+      ).toBeGreaterThan(1);
+      expect(secondPlayback.totalVideoFrames).toBeGreaterThan(
+        firstPlayback.totalVideoFrames,
+      );
+      hlsPlaybackEvidence = {
+        source: firstPlayback.source,
+        videoWidth: firstPlayback.videoWidth,
+        videoHeight: firstPlayback.videoHeight,
+        firstCurrentTime: firstPlayback.currentTime,
+        secondCurrentTime: secondPlayback.currentTime,
+        firstTotalVideoFrames: firstPlayback.totalVideoFrames,
+        secondTotalVideoFrames: secondPlayback.totalVideoFrames,
+      };
+    }
+
+    const buyMatchedOutcome = async (
+      outcome: "yes" | "no",
+      liquiditySide: number,
+      shareField: "aShares" | "bShares",
+    ): Promise<void> => {
+      const before = (await clobProgram.account.userBalance.fetchNullable(
+        userBalanceAddress,
+      )) as UserBalanceAccount | null;
+      const beforeShares = bnLikeToBigInt(before?.[shareField]);
+      await seedClobLiquidity(connection, state, liquiditySide, {
+        marketState,
+        duelState,
+      });
+      await page.getByTestId("refresh-market").click();
+      await openSolanaBuyOrderEntry(page, clobPanel);
+      await clobPanel
+        .getByTestId("prediction-amount-input")
+        .fill(SOLANA_PREDICTION_AMOUNT);
+      await selectSolanaPredictionSide(clobPanel, outcome);
+      const priceInput = clobPanel.getByTestId("solana-clob-price-input");
+      if (await priceInput.isVisible().catch(() => false)) {
+        await priceInput.fill(String(ORDER_PRICE));
+      }
+      const submit = clobPanel
+        .getByRole("button", { name: new RegExp(`buy ${outcome}`, "i") })
+        .first();
+      await expect(submit).toBeEnabled({ timeout: 30_000 });
+      await submit.click();
+      await confirmSolanaOrder(page);
+      await expect
+        .poll(
+          async () => {
+            const status = await readText(page, "solana-clob-status");
+            if (/Order failed:/i.test(status)) throw new Error(status);
+            const balance =
+              (await clobProgram.account.userBalance.fetchNullable(
+                userBalanceAddress,
+              )) as UserBalanceAccount | null;
+            return bnLikeToBigInt(balance?.[shareField]).toString();
+          },
+          { timeout: 120_000, intervals: [500, 1_000, 2_000, 5_000] },
+        )
+        .toBe((beforeShares + 50_000_000n).toString());
+    };
+
+    await buyMatchedOutcome("yes", SIDE_ASK, "aShares");
+    await buyMatchedOutcome("no", SIDE_BID, "bShares");
+    const fundedBalance = (await clobProgram.account.userBalance.fetch(
+      userBalanceAddress,
+    )) as UserBalanceAccount;
+    expect({
+      aShares: bnLikeToBigInt(fundedBalance.aShares),
+      bShares: bnLikeToBigInt(fundedBalance.bShares),
+      aLockedLamports: bnLikeToBigInt(fundedBalance.aLockedLamports),
+      bLockedLamports: bnLikeToBigInt(fundedBalance.bLockedLamports),
+    }).toEqual({
+      aShares: 50_000_000n,
+      bShares: 50_000_000n,
+      aLockedLamports: 25_000_000n,
+      bLockedLamports: 25_000_000n,
+    });
+
+    const phaseTimeline: Array<{
+      phase: string;
+      phaseVersion: number | null;
+      observedAt: number;
+    }> = [
+      {
+        phase: announced.cycle?.phase || "missing",
+        phaseVersion: announced.cycle?.phaseVersion ?? null,
+        observedAt: Date.now(),
+      },
+    ];
+    let terminal: HyperiaStreamingState | null = null;
+    const naturalTerminalDeadline = Date.now() + 360_000;
+    while (Date.now() < naturalTerminalDeadline) {
+      const current = await fetchHyperiaStreamingState(request, control);
+      const cycle = current.cycle;
+      if (
+        cycle?.duelId !== duelId ||
+        cycle.duelKeyHex !== duelKeyHex ||
+        cycle.competitiveSnapshotDigest !== snapshotDigest
+      ) {
+        throw new Error(
+          `public stream identity drifted during natural combat: ${JSON.stringify(cycle)}`,
+        );
+      }
+      captureActionObservations(current);
+      const phase = cycle.phase || "missing";
+      if (phase === "FIGHTING") {
+        await captureRoleSwitchVisualEvidence(current);
+      }
+      if (phaseTimeline.at(-1)?.phase !== phase) {
+        phaseTimeline.push({
+          phase,
+          phaseVersion: cycle.phaseVersion ?? null,
+          observedAt: Date.now(),
+        });
+      }
+      if (phase === "RESOLUTION") {
+        terminal = current;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!terminal?.cycle) {
+      throw new Error(
+        `natural Hyperia terminal was not observed: ${JSON.stringify(phaseTimeline)}`,
+      );
+    }
+    expect(phaseTimeline.map((entry) => entry.phase)).toEqual([
+      "ANNOUNCEMENT",
+      "COUNTDOWN",
+      "FIGHTING",
+      "RESOLUTION",
+    ]);
+    const terminalCycle = terminal.cycle;
+    const fightDurationMs =
+      committedTiming &&
+      Number.isSafeInteger(committedTiming.fightStartTime) &&
+      Number.isSafeInteger(terminalCycle.duelEndTime)
+        ? terminalCycle.duelEndTime! - committedTiming.fightStartTime!
+        : null;
+    captureActionObservations(terminal);
+    const actionObservations = [...actionObservationsBySequence.values()].sort(
+      (left, right) => left.sequence - right.sequence,
+    );
+    expect(actionObservations.length).toBeGreaterThan(0);
+    expect(actionObservations[0]?.sequence).toBe(1);
+    for (let index = 1; index < actionObservations.length; index += 1) {
+      expect(actionObservations[index]!.sequence).toBe(
+        actionObservations[index - 1]!.sequence + 1,
+      );
+    }
+    const combatActionAgents = [agent1Id, agent2Id].map((agentId) => {
+      const observations = actionObservations.filter(
+        (observation) => observation.actorId === agentId,
+      );
+      const committedRoleSwitches = observations.filter(
+        (observation) =>
+          observation.action === "role_switch" &&
+          observation.outcome === "committed",
+      );
+      const committedDamage = observations.filter(
+        (observation) =>
+          observation.action === "damage" &&
+          observation.outcome === "committed" &&
+          (observation.amount ?? 0) > 0,
+      );
+      const acceptedEngagements = observations.filter(
+        (observation) =>
+          observation.action === "engagement" &&
+          observation.outcome === "accepted",
+      );
+      const plannedPrayer = preparationEvidence
+        ? (preparationEvidence.frozenBettingSource.competitiveSnapshot.contestants.find(
+            (contestant) => contestant.agentId === agentId,
+          )?.preparation.tacticalStrategy.prayer ?? null)
+        : undefined;
+      const prayerObservations = observations.filter(
+        (observation) => observation.action === "prayer",
+      );
+      const executedCombatRoles = [
+        ...new Set(
+          [...acceptedEngagements, ...committedDamage].map(
+            (observation) => observation.combatRole,
+          ),
+        ),
+      ].sort();
+      const damagedCombatRoles = [
+        ...new Set(
+          committedDamage.map((observation) => observation.combatRole),
+        ),
+      ].sort();
+      const roleSwitchesWithPostSwitchDamage = committedRoleSwitches.filter(
+        (roleSwitch) =>
+          actionObservations.some(
+            (observation) =>
+              observation.actorId === agentId &&
+              observation.sequence > roleSwitch.sequence &&
+              observation.combatRole === roleSwitch.value &&
+              observation.action === "damage" &&
+              observation.outcome === "committed" &&
+              (observation.amount ?? 0) > 0,
+          ),
+      ).length;
+      const roleSwitchesWithPostSwitchCombat = committedRoleSwitches.filter(
+        (roleSwitch) =>
+          actionObservations.some(
+            (observation) =>
+              observation.actorId === agentId &&
+              observation.sequence > roleSwitch.sequence &&
+              observation.combatRole === roleSwitch.value &&
+              ((observation.action === "engagement" &&
+                observation.outcome === "accepted") ||
+                (observation.action === "damage" &&
+                  observation.outcome === "committed" &&
+                  (observation.amount ?? 0) > 0)),
+          ),
+      ).length;
+      return {
+        agentId,
+        observations: observations.length,
+        committedRoleSwitches: committedRoleSwitches.length,
+        roleSwitchTargets: committedRoleSwitches.map(
+          (observation) => observation.value,
+        ),
+        rejectedOrErroredRoleSwitches: observations.filter(
+          (observation) =>
+            observation.action === "role_switch" &&
+            (observation.outcome === "rejected" ||
+              observation.outcome === "error"),
+        ).length,
+        acceptedEngagements: acceptedEngagements.length,
+        committedDamageHits: committedDamage.length,
+        committedDamageTotal: committedDamage.reduce(
+          (total, observation) => total + (observation.amount ?? 0),
+          0,
+        ),
+        plannedPrayer,
+        committedPrayerActions: prayerObservations.filter(
+          (observation) => observation.outcome === "committed",
+        ).length,
+        rejectedOrErroredPrayerActions: prayerObservations.filter(
+          (observation) =>
+            observation.outcome === "rejected" ||
+            observation.outcome === "error",
+        ).length,
+        unplannedOpeningPrayerActions:
+          plannedPrayer === null
+            ? prayerObservations.filter((observation) => observation.tick <= 2)
+                .length
+            : 0,
+        damagedCombatRoles,
+        executedCombatRoles,
+        roleSwitchesWithPostSwitchDamage,
+        roleSwitchesWithPostSwitchCombat,
+      };
+    });
+    const finalCombatAIs = await fetchHyperiaCombatAIDiagnostics(
+      request,
+      control,
+    );
+    const combatAIDiagnosticsEvidence: HyperiaCombatAIDiagnosticsEvidence = {
+      schemaVersion: 1,
+      diagnosticScope: "operator_private",
+      trigger: "terminal_snapshot",
+      capturedAtMs: Date.now(),
+      cycleId,
+      duelId,
+      duelKeyHex,
+      competitiveSnapshotDigest: snapshotDigest,
+      combatAIs: finalCombatAIs,
+    };
+    const hasPrayerFailure = finalCombatAIs.some(
+      (diagnostic) => diagnostic.prayerToggleRejects > 0,
+    );
+    const combatAIDiagnosticsFileName = hasPrayerFailure
+      ? "natural-hyperia-combat-ai-prayer-failure.json"
+      : "natural-hyperia-combat-ai-final.json";
+    const combatAIDiagnosticsPath = testInfo.outputPath(
+      combatAIDiagnosticsFileName,
+    );
+    const combatAIDiagnosticsBytes = Buffer.from(
+      `${JSON.stringify(combatAIDiagnosticsEvidence, null, 2)}\n`,
+    );
+    const combatAIDiagnosticsSha256 = createHash("sha256")
+      .update(combatAIDiagnosticsBytes)
+      .digest("hex");
+    fs.writeFileSync(combatAIDiagnosticsPath, combatAIDiagnosticsBytes, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await testInfo.attach("natural-hyperia-combat-ai-final", {
+      path: combatAIDiagnosticsPath,
+      contentType: "application/json",
+    });
+    const combatActionEvidence = {
+      schemaVersion: 1,
+      capturedAtMs: Date.now(),
+      cycleId,
+      duelId,
+      duelKeyHex,
+      snapshotDigest,
+      contiguousSequence: true,
+      firstSequence: actionObservations[0]!.sequence,
+      lastSequence: actionObservations.at(-1)!.sequence,
+      observations: actionObservations,
+      agents: combatActionAgents,
+      operatorPrivateCombatAIDiagnostics: {
+        fileName: combatAIDiagnosticsFileName,
+        sha256: combatAIDiagnosticsSha256,
+      },
+    };
+    const combatActionEvidenceBytes = Buffer.from(
+      `${JSON.stringify(combatActionEvidence, null, 2)}\n`,
+    );
+    const combatActionEvidenceSha256 = createHash("sha256")
+      .update(combatActionEvidenceBytes)
+      .digest("hex");
+    const combatActionEvidencePath = testInfo.outputPath(
+      "natural-hyperia-combat-actions.json",
+    );
+    fs.writeFileSync(combatActionEvidencePath, combatActionEvidenceBytes, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    await testInfo.attach("natural-hyperia-combat-actions", {
+      path: combatActionEvidencePath,
+      contentType: "application/json",
+    });
+    expect(
+      finalCombatAIs
+        .map((diagnostic) => ({
+          characterId: diagnostic.characterId,
+          cycleId: diagnostic.cycleId,
+          duelId: diagnostic.duelId,
+          prayerToggleRejects: diagnostic.prayerToggleRejects,
+          lastPrayerToggleFailureReason:
+            diagnostic.lastPrayerToggleFailureReason,
+        }))
+        .sort((left, right) =>
+          left.characterId.localeCompare(right.characterId),
+        ),
+    ).toEqual(
+      [agent1Id, agent2Id].sort().map((characterId) => ({
+        characterId,
+        cycleId,
+        duelId,
+        prayerToggleRejects: 0,
+        lastPrayerToggleFailureReason: null,
+      })),
+    );
+    expect(
+      combatActionAgents.map((agent) => ({
+        agentId: agent.agentId,
+        rejectedOrErroredPrayerActions: agent.rejectedOrErroredPrayerActions,
+      })),
+    ).toEqual([
+      { agentId: agent1Id, rejectedOrErroredPrayerActions: 0 },
+      { agentId: agent2Id, rejectedOrErroredPrayerActions: 0 },
+    ]);
+    if (preparationEvidence) {
+      expect(
+        combatActionAgents.map((agent) => ({
+          agentId: agent.agentId,
+          plannedPrayer: agent.plannedPrayer,
+          unplannedOpeningPrayerActions: agent.unplannedOpeningPrayerActions,
+        })),
+      ).toEqual([
+        {
+          agentId: agent1Id,
+          plannedPrayer:
+            preparationEvidence.frozenBettingSource.competitiveSnapshot.contestants.find(
+              (contestant) => contestant.agentId === agent1Id,
+            )?.preparation.tacticalStrategy.prayer ?? null,
+          unplannedOpeningPrayerActions: 0,
+        },
+        {
+          agentId: agent2Id,
+          plannedPrayer:
+            preparationEvidence.frozenBettingSource.competitiveSnapshot.contestants.find(
+              (contestant) => contestant.agentId === agent2Id,
+            )?.preparation.tacticalStrategy.prayer ?? null,
+          unplannedOpeningPrayerActions: 0,
+        },
+      ]);
+    }
+    let roleSwitchVisualEvidenceSha256: string | null = null;
+    if (HYPERIA_MULTI_STYLE && E2E_HYPERIA_RUNTIME === "full_3d") {
+      const roleSwitchVisualEvidenceBytes = Buffer.from(
+        `${JSON.stringify(
+          {
+            schemaVersion: 1,
+            capturedAtMs: Date.now(),
+            cycleId,
+            duelId,
+            duelKeyHex,
+            snapshotDigest,
+            roles: [...capturedVisualRoles].sort(),
+            samples: roleSwitchVisualEvidence,
+          },
+          null,
+          2,
+        )}\n`,
+      );
+      roleSwitchVisualEvidenceSha256 = createHash("sha256")
+        .update(roleSwitchVisualEvidenceBytes)
+        .digest("hex");
+      const roleSwitchVisualEvidencePath = testInfo.outputPath(
+        "natural-hyperia-role-switch-visual-evidence.json",
+      );
+      fs.writeFileSync(
+        roleSwitchVisualEvidencePath,
+        roleSwitchVisualEvidenceBytes,
+        { flag: "wx", mode: 0o600 },
+      );
+      await testInfo.attach("natural-hyperia-role-switch-visual-evidence", {
+        path: roleSwitchVisualEvidencePath,
+        contentType: "application/json",
+      });
+      expect([...capturedVisualRoles].sort()).toEqual([
+        "mage",
+        "melee",
+        "ranged",
+      ]);
+      expect(roleSwitchVisualEvidence).toHaveLength(3);
+    }
+    if (HYPERIA_MULTI_STYLE) {
+      const frozenContestants =
+        preparationEvidence?.frozenBettingSource.competitiveSnapshot
+          .contestants ?? [];
+      for (const agent of combatActionAgents) {
+        const frozen = frozenContestants.find(
+          (contestant) => contestant.agentId === agent.agentId,
+        );
+        expect(frozen).toBeDefined();
+        expect(agent.committedRoleSwitches).toBeGreaterThan(0);
+        expect(agent.rejectedOrErroredRoleSwitches).toBe(0);
+        expect(agent.acceptedEngagements).toBeGreaterThan(0);
+        expect(agent.committedDamageHits).toBeGreaterThan(0);
+        expect(agent.executedCombatRoles.length).toBeGreaterThanOrEqual(2);
+        expect(agent.roleSwitchesWithPostSwitchCombat).toBeGreaterThan(0);
+        for (const targetRole of agent.roleSwitchTargets) {
+          expect(targetRole).toMatch(/^(melee|ranged|mage)$/);
+          expect(frozen!.availableCombatStyles).toContain(targetRole);
+        }
+        for (const roleSwitch of actionObservations.filter(
+          (observation) =>
+            observation.actorId === agent.agentId &&
+            observation.action === "role_switch" &&
+            observation.outcome === "committed",
+        )) {
+          expect(roleSwitch.value).not.toBe(roleSwitch.combatRole);
+        }
+      }
+      expect(
+        new Set(
+          combatActionAgents.flatMap((agent) => agent.executedCombatRoles),
+        ).size,
+      ).toBe(3);
+    }
+    const winnerSide =
+      terminalCycle.winnerId === agent1Id
+        ? "a"
+        : terminalCycle.winnerId === agent2Id
+          ? "b"
+          : null;
+    expect(winnerSide).not.toBeNull();
+    const winnerName = winnerSide === "a" ? agent1Name : agent2Name;
+    const terminalReasonLabel =
+      terminalCycle.winReason === "hp_advantage"
+        ? "Health advantage at the time limit"
+        : terminalCycle.winReason === "damage_advantage"
+          ? "Damage advantage at the time limit"
+          : "Knockout";
+    expect({
+      outcome: terminalCycle.outcome,
+      winReason: terminalCycle.winReason,
+      winnerName: terminalCycle.winnerName,
+      seed: terminalCycle.seed,
+      replayHash: terminalCycle.replayHash,
+      duelEndTime: terminalCycle.duelEndTime,
+    }).toEqual({
+      outcome: "win",
+      winReason: EXPECT_EXACT_HYPERIA_TIMEOUT
+        ? expect.stringMatching(/^(hp_advantage|damage_advantage)$/)
+        : "kill",
+      winnerName,
+      seed: expect.stringMatching(/^[0-9]{1,20}$/),
+      replayHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      duelEndTime: EXPECT_EXACT_HYPERIA_TIMEOUT
+        ? committedTiming!.fightDeadline
+        : expect.any(Number),
+    });
+    if (EXPECT_EXACT_HYPERIA_TIMEOUT) {
+      const terminalObservedAfterDeadlineMs =
+        Date.now() - committedTiming!.fightDeadline!;
+      expect(terminalObservedAfterDeadlineMs).toBeGreaterThanOrEqual(0);
+      expect(terminalObservedAfterDeadlineMs).toBeLessThan(10_000);
+    }
+    if (EXPECT_SHORT_HYPERIA_KILL) {
+      expect(fightDurationMs).not.toBeNull();
+      expect(fightDurationMs!).toBeGreaterThan(0);
+      expect(fightDurationMs!).toBeLessThanOrEqual(
+        SHORT_HYPERIA_KILL_MAX_DURATION_MS,
+      );
+      expect(terminalCycle.duelEndTime).toBeLessThan(
+        committedTiming!.fightDeadline!,
+      );
+    }
+
+    let rendererEvidence: HyperiaRendererStatus | null = null;
+    if (E2E_HYPERIA_RUNTIME === "full_3d") {
+      await expect
+        .poll(
+          () => {
+            const status = readHyperiaRendererStatus(control);
+            const rendererHealth = status?.rendererHealth;
+            const scene = rendererHealth?.diagnostics?.sceneReadiness;
+            const browserAudio = status?.browserAudioCaptureHealth;
+            const captureHealth = status?.captureHealth;
+            const requiredEquipment = scene?.equipmentRequiredCount;
+            const emittedFrames = captureHealth?.emittedFrames ?? 0;
+            const repeatedFrames = captureHealth?.repeatedFrames ?? 0;
+            return {
+              source: status?.source ?? null,
+              rendererReady: rendererHealth?.ready ?? false,
+              degradedReason:
+                rendererHealth && "degradedReason" in rendererHealth
+                  ? rendererHealth.degradedReason
+                  : "missing",
+              rendererPhase: rendererHealth?.phase ?? null,
+              sceneReady: scene?.ready ?? false,
+              sceneCycleId: scene?.cycleId ?? null,
+              scenePhase: scene?.phase ?? null,
+              equipmentComplete:
+                Number.isSafeInteger(requiredEquipment) &&
+                (requiredEquipment ?? 0) > 0 &&
+                scene?.equipmentReadyCount === requiredEquipment,
+              requiredPlayers: scene?.equipmentRequiredPlayerCount ?? null,
+              expectedPlayers: scene?.equipmentExpectedPlayerCount ?? null,
+              attachmentMismatches:
+                scene?.equipmentAttachmentMismatchCount ?? null,
+              damagePresentationAvailable:
+                scene?.damagePresentationAvailable ?? false,
+              activeDamageSplatCount: scene?.activeDamageSplatCount ?? null,
+              ffmpegRunning: status?.stats?.ffmpegRunning ?? false,
+              audioSource: status?.stats?.audioSource ?? null,
+              audioHealthy: status?.stats?.audioHealthy ?? false,
+              audioDroppedChunks: status?.stats?.audioDroppedChunks ?? null,
+              bridgeAudioTrimmedChunks:
+                status?.stats?.audioTrimmedChunks ?? null,
+              browserAudioContextState: browserAudio?.contextState ?? null,
+              browserAudioSourceContextState:
+                browserAudio?.sourceContextState ?? null,
+              browserAudioTrackState: browserAudio?.trackState ?? null,
+              browserAudioSampleRate: browserAudio?.sampleRate ?? null,
+              browserAudioChannels: browserAudio?.channels ?? null,
+              browserAudioHasContent:
+                (browserAudio?.chunks ?? 0) > 0 &&
+                (browserAudio?.contentChunks ?? 0) > 0,
+              browserAudioDroppedChunks: browserAudio?.droppedChunks ?? null,
+              browserAudioPendingWrites: browserAudio?.pendingWrites ?? null,
+              captureFrameCadenceHealthy:
+                (captureHealth?.targetFps ?? 0) > 0 &&
+                captureHealth?.measuredFps === captureHealth?.targetFps &&
+                (captureHealth?.sourceFrames ?? 0) > 0 &&
+                emittedFrames > 0 &&
+                repeatedFrames / emittedFrames <= 0.05 &&
+                captureHealth?.rejectedFrames === 0 &&
+                captureHealth?.skippedFrames === 0,
+            };
+          },
+          { timeout: 15_000, intervals: [100, 250, 500, 1_000] },
+        )
+        .toEqual({
+          source: "external-rtmp-bridge",
+          rendererReady: true,
+          degradedReason: null,
+          rendererPhase: "RESOLUTION",
+          sceneReady: true,
+          sceneCycleId: terminalCycle.cycleId,
+          scenePhase: "RESOLUTION",
+          equipmentComplete: true,
+          requiredPlayers: 2,
+          expectedPlayers: 2,
+          attachmentMismatches: 0,
+          damagePresentationAvailable: true,
+          activeDamageSplatCount: 0,
+          ffmpegRunning: true,
+          audioSource: "browser",
+          audioHealthy: true,
+          audioDroppedChunks: 0,
+          bridgeAudioTrimmedChunks: 0,
+          browserAudioContextState: "running",
+          browserAudioSourceContextState: "running",
+          browserAudioTrackState: "live",
+          browserAudioSampleRate: 48_000,
+          browserAudioChannels: 2,
+          browserAudioHasContent: true,
+          browserAudioDroppedChunks: 0,
+          browserAudioPendingWrites: 0,
+          captureFrameCadenceHealthy: true,
+        });
+      rendererEvidence = readHyperiaRendererStatus(control);
+      expect(rendererEvidence?.stats?.bytesReceived ?? 0).toBeGreaterThan(0);
+      expect(rendererEvidence?.stats?.audioChunks ?? 0).toBeGreaterThan(0);
+      expect(rendererEvidence?.stats?.droppedFrames ?? 0).toBe(0);
+      const emittedFrames = rendererEvidence?.captureHealth?.emittedFrames ?? 0;
+      const repeatedFrames =
+        rendererEvidence?.captureHealth?.repeatedFrames ?? 0;
+      expect(rendererEvidence?.captureHealth).toMatchObject({
+        targetFps: 30,
+        measuredFps: 30,
+        rejectedFrames: 0,
+        skippedFrames: 0,
+      });
+      expect(
+        rendererEvidence?.captureHealth?.sourceFrames ?? 0,
+      ).toBeGreaterThan(0);
+      expect(emittedFrames).toBeGreaterThan(0);
+      expect(repeatedFrames / emittedFrames).toBeLessThanOrEqual(0.05);
+
+      await expect(
+        page.getByTestId("spectator-terminal-outcome"),
+      ).toContainText(`${winnerName} wins — ${terminalReasonLabel}.`, {
+        timeout: 30_000,
+      });
+      await expect(
+        page
+          .getByTestId("solana-clob-panel")
+          .getByText("Duel complete. On-chain settlement is pending.", {
+            exact: true,
+          }),
+      ).toBeVisible({ timeout: 30_000 });
+      const terminalDuelActivity = settlementEntriesForDuel(page, duelId);
+      await expect(terminalDuelActivity).toHaveCount(2, { timeout: 30_000 });
+      await expect(
+        terminalDuelActivity.filter({ hasText: "Settlement pending" }),
+      ).toHaveCount(2);
+      await expect(
+        terminalDuelActivity.getByRole("button", {
+          name: /recover order rent/i,
+        }),
+      ).toHaveCount(0);
+      await expect(
+        terminalDuelActivity.getByRole("button", {
+          name: /clear position/i,
+        }),
+      ).toHaveCount(0);
+      await expect(
+        page.getByText("Awaiting result", { exact: true }),
+      ).toHaveCount(0);
+      const terminalVideo = page.locator("video[data-stream-source]").first();
+      await expect(terminalVideo).toBeVisible();
+      const terminalPlayback = await terminalVideo.evaluate(
+        (element: HTMLVideoElement) => ({
+          videoWidth: element.videoWidth,
+          videoHeight: element.videoHeight,
+          currentTime: element.currentTime,
+          totalVideoFrames:
+            typeof element.getVideoPlaybackQuality === "function"
+              ? element.getVideoPlaybackQuality().totalVideoFrames
+              : 0,
+        }),
+      );
+      expect(terminalPlayback.videoWidth).toBe(1280);
+      expect(terminalPlayback.videoHeight).toBe(720);
+      expect(terminalPlayback.currentTime).toBeGreaterThan(0);
+      expect(terminalPlayback.totalVideoFrames).toBeGreaterThan(0);
+      const terminalStreamDataUrl = await terminalVideo.evaluate(
+        (element: HTMLVideoElement) => {
+          const canvas = document.createElement("canvas");
+          canvas.width = element.videoWidth;
+          canvas.height = element.videoHeight;
+          const context = canvas.getContext("2d");
+          if (!context) throw new Error("2D canvas context is unavailable");
+          context.drawImage(element, 0, 0, canvas.width, canvas.height);
+          return canvas.toDataURL("image/png");
+        },
+      );
+      expect(terminalStreamDataUrl).toMatch(/^data:image\/png;base64,/);
+      const terminalStreamBytes = Buffer.from(
+        terminalStreamDataUrl.replace(/^data:image\/png;base64,/, ""),
+        "base64",
+      );
+      expect(terminalStreamBytes.length).toBeGreaterThan(1_000);
+      const terminalStreamPath = testInfo.outputPath(
+        "natural-hyperia-3d-terminal-stream.png",
+      );
+      const terminalPagePath = testInfo.outputPath(
+        "natural-hyperia-3d-terminal-page.png",
+      );
+      fs.writeFileSync(terminalStreamPath, terminalStreamBytes, {
+        flag: "wx",
+        mode: 0o600,
+      });
+      await page.screenshot({
+        path: terminalPagePath,
+        fullPage: true,
+        animations: "disabled",
+        style: '[data-testid="e2e-debug-panel"] { display: none !important; }',
+      });
+      fs.chmodSync(terminalStreamPath, 0o600);
+      fs.chmodSync(terminalPagePath, 0o600);
+      terminalVisualEvidence = {
+        capturedAt: Date.now(),
+        videoWidth: terminalPlayback.videoWidth,
+        videoHeight: terminalPlayback.videoHeight,
+        videoCurrentTime: terminalPlayback.currentTime,
+        totalVideoFrames: terminalPlayback.totalVideoFrames,
+        streamScreenshot: path.basename(terminalStreamPath),
+        streamScreenshotSha256: createHash("sha256")
+          .update(fs.readFileSync(terminalStreamPath))
+          .digest("hex"),
+        pageScreenshot: path.basename(terminalPagePath),
+        pageScreenshotSha256: createHash("sha256")
+          .update(fs.readFileSync(terminalPagePath))
+          .digest("hex"),
+      };
+      await testInfo.attach("natural-hyperia-3d-terminal-stream", {
+        path: terminalStreamPath,
+        contentType: "image/png",
+      });
+      await testInfo.attach("natural-hyperia-3d-terminal-ui", {
+        path: terminalPagePath,
+        contentType: "image/png",
+      });
+    }
+
+    await expect
+      .poll(
+        async () => {
+          const fixtures = await listSolanaTraderFixtures(connection, state);
+          const fixture =
+            fixtures.find((entry) => entry.marketState.equals(marketState)) ??
+            null;
+          return `${fixture?.duelStatus ?? "missing"}:${fixture?.pendingWinner ?? "missing"}`;
+        },
+        { timeout: 60_000, intervals: [250, 500, 1_000, 2_000] },
+      )
+      .toBe(`proposed:${winnerSide}`);
+
+    await expect
+      .poll(
+        async () => {
+          const fixtures = await listSolanaTraderFixtures(connection, state);
+          const fixture =
+            fixtures.find((entry) => entry.marketState.equals(marketState)) ??
+            null;
+          return `${fixture?.duelStatus ?? "missing"}:${fixture?.marketStatus ?? "missing"}:${fixture?.marketWinner ?? "missing"}`;
+        },
+        { timeout: 150_000, intervals: [1_000, 2_000, 5_000] },
+      )
+      .toBe(`resolved:resolved:${winnerSide}`);
+
+    await expect
+      .poll(
+        async () => {
+          const payload = await fetchBotHealth(request);
+          const market = payload.health?.markets.find(
+            (entry) => entry.marketRef === marketState.toBase58(),
+          );
+          return `${market?.lifecycleStatus ?? "missing"}:${market?.winner ?? "missing"}`;
+        },
+        { timeout: 60_000, intervals: [500, 1_000, 2_000, 5_000] },
+      )
+      .toBe(`RESOLVED:${winnerSide === "a" ? "A" : "B"}`);
+
+    const market = (await clobProgram.account.marketState.fetch(
+      marketState,
+    )) as { winningsMarketMakerFeeBpsSnapshot?: unknown };
+    const winningShares =
+      winnerSide === "a"
+        ? bnLikeToBigInt(fundedBalance.aShares)
+        : bnLikeToBigInt(fundedBalance.bShares);
+    const winningsFeeBps = bnLikeToBigInt(
+      market.winningsMarketMakerFeeBpsSnapshot,
+    );
+    const expectedPayoutLamports =
+      winningShares - (winningShares * winningsFeeBps) / 10_000n;
+    const userBalanceRentLamports = BigInt(
+      await connection.getBalance(userBalanceAddress, "confirmed"),
+    );
+    const beforeClaimWalletLamports = BigInt(
+      await connection.getBalance(trader, "confirmed"),
+    );
+
+    await gotoApp(page, {
+      e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
+      e2eSolanaMarketRef: marketState.toBase58(),
+      debug: false,
+    });
+    await selectChain(page, "solana");
+    await ensureWalletConnected(page);
+    const productRoot = page.locator(".hm-root").first();
+    await expect
+      .poll(
+        async () =>
+          (await productRoot.getAttribute("data-stream-duel-id")) ?? "",
+        { timeout: 60_000, intervals: [250, 500, 1_000, 2_000] },
+      )
+      .not.toBe("");
+    const presentedStreamDuelId =
+      (await productRoot.getAttribute("data-stream-duel-id")) ?? "";
+    const streamAdvancedToNextCycle = presentedStreamDuelId !== duelId;
+    if (E2E_HYPERIA_RUNTIME === "full_3d") {
+      expect(streamAdvancedToNextCycle).toBe(true);
+    }
+
+    const exactDuelActivity = settlementEntriesForDuel(page, duelId);
+    if (streamAdvancedToNextCycle) {
+      await expect(productRoot).toHaveAttribute(
+        "data-market-can-place-bet",
+        "false",
+      );
+      await expect(page.getByTestId("spectator-terminal-outcome")).toHaveCount(
+        0,
+      );
+      await expect(page.getByTestId("duels-bottom-panel-news")).toContainText(
+        "Matchup locked — fighters are preparing in the arena.",
+      );
+      await expect(exactDuelActivity).toHaveCount(2, { timeout: 60_000 });
+      await expect(
+        exactDuelActivity.filter({ hasText: "Winnings ready to claim" }),
+      ).toHaveCount(1);
+      await expect(
+        exactDuelActivity.filter({ hasText: "Resolved · no payout" }),
+      ).toHaveCount(1);
+
+      let playbackAdvanceSeconds: number | null = null;
+      let playbackFrameAdvance: number | null = null;
+      if (E2E_HYPERIA_RUNTIME === "full_3d") {
+        const video = page.locator("video[data-stream-source]").first();
+        const samplePlayback = () =>
+          video.evaluate((element: HTMLVideoElement) => ({
+            currentTime: element.currentTime,
+            totalVideoFrames:
+              typeof element.getVideoPlaybackQuality === "function"
+                ? element.getVideoPlaybackQuality().totalVideoFrames
+                : 0,
+          }));
+        const before = await samplePlayback();
+        await page.waitForTimeout(2_500);
+        const after = await samplePlayback();
+        playbackAdvanceSeconds = after.currentTime - before.currentTime;
+        playbackFrameAdvance = after.totalVideoFrames - before.totalVideoFrames;
+        expect(playbackAdvanceSeconds).toBeGreaterThan(1);
+        expect(playbackFrameAdvance).toBeGreaterThan(0);
+      }
+      postTerminalPresentationEvidence = {
+        mode: "advanced_cycle_with_historical_claim",
+        pinnedDuelId: duelId,
+        presentedStreamDuelId,
+        historicalActivityCount: await exactDuelActivity.count(),
+        marketCanPlaceBet:
+          (await productRoot.getAttribute("data-market-can-place-bet")) ===
+          "true",
+        playbackAdvanceSeconds,
+        playbackFrameAdvance,
+      };
+      await testInfo.attach("natural-hyperia-sol-rollover-claim-ready", {
+        body: await page.screenshot({
+          fullPage: true,
+          animations: "disabled",
+        }),
+        contentType: "image/png",
+      });
+    } else {
+      await expect(page.getByTestId("duels-bottom-panel-news")).toContainText(
+        `${winnerName} wins the round.`,
+        { timeout: 60_000 },
+      );
+      await expect(
+        page.getByTestId("spectator-terminal-outcome"),
+      ).toContainText(`${winnerName} wins — ${terminalReasonLabel}.`);
+      postTerminalPresentationEvidence = {
+        mode: "same_cycle_resolution",
+        pinnedDuelId: duelId,
+        presentedStreamDuelId,
+        historicalActivityCount: await exactDuelActivity.count(),
+        marketCanPlaceBet:
+          (await productRoot.getAttribute("data-market-can-place-bet")) ===
+          "true",
+        playbackAdvanceSeconds: null,
+        playbackFrameAdvance: null,
+      };
+    }
+    await expect(
+      page.getByTestId("solana-clob-settlement-action"),
+    ).toContainText("Claim winnings", { timeout: 60_000 });
+    const claimButton = page
+      .getByRole("button", { name: /claim winnings/i })
+      .first();
+    await expect(claimButton).toBeEnabled({ timeout: 30_000 });
+    await claimButton.click();
+    const claimSignature = await expectSolanaSettlementReceipt(
+      page,
+      /claim confirmed on-chain/i,
+    );
+    const [claimWalletDelta, claimTransactionFee] = await Promise.all([
+      getWalletLamportDeltaFromSignature(connection, claimSignature, trader),
+      getTransactionFeeFromSignature(connection, claimSignature),
+    ]);
+    expect(claimWalletDelta).not.toBeNull();
+    expect(claimTransactionFee).not.toBeNull();
+    expect((claimWalletDelta ?? 0n) + (claimTransactionFee ?? 0n)).toBe(
+      expectedPayoutLamports + userBalanceRentLamports,
+    );
+    await expect
+      .poll(
+        async () => {
+          const balance = (await clobProgram.account.userBalance.fetchNullable(
+            userBalanceAddress,
+          )) as UserBalanceAccount | null;
+          return `${bnLikeToBigInt(balance?.aShares)}:${bnLikeToBigInt(balance?.bShares)}`;
+        },
+        { timeout: 60_000, intervals: [500, 1_000, 2_000, 5_000] },
+      )
+      .toBe("0:0");
+    const afterClaimWalletLamports = BigInt(
+      await connection.getBalance(trader, "confirmed"),
+    );
+    expect(afterClaimWalletLamports).toBeGreaterThan(beforeClaimWalletLamports);
+
+    const terminalEvidence = {
+      duelId,
+      duelKeyHex,
+      snapshotDigest,
+      agent1Id,
+      agent1Name,
+      agent2Id,
+      agent2Name,
+      winnerId: terminalCycle.winnerId,
+      winnerName,
+      winnerSide,
+      outcome: terminalCycle.outcome,
+      winReason: terminalCycle.winReason,
+      terminalExpectation: HYPERIA_TERMINAL_EXPECTATION,
+      fightDurationMs,
+      shortFightMaximumMs: EXPECT_SHORT_HYPERIA_KILL
+        ? SHORT_HYPERIA_KILL_MAX_DURATION_MS
+        : null,
+      committedTiming,
+      seed: terminalCycle.seed,
+      replayHash: terminalCycle.replayHash,
+      phaseTimeline,
+      marketState: marketState.toBase58(),
+      duelState: duelState.toBase58(),
+      claimSignature,
+      claimWalletDelta: claimWalletDelta?.toString() ?? null,
+      claimTransactionFee: claimTransactionFee?.toString() ?? null,
+      expectedPayoutLamports: expectedPayoutLamports.toString(),
+      userBalanceRentLamports: userBalanceRentLamports.toString(),
+      hyperiaRuntime: E2E_HYPERIA_RUNTIME,
+      hlsPlaybackEvidence,
+      rendererEvidence,
+      terminalVisualEvidence,
+      postTerminalPresentationEvidence,
+      combatActionEvidence: {
+        sha256: combatActionEvidenceSha256,
+        observations: actionObservations.length,
+        firstSequence: actionObservations[0]!.sequence,
+        lastSequence: actionObservations.at(-1)!.sequence,
+        agents: combatActionAgents,
+      },
+      roleSwitchVisualEvidence:
+        roleSwitchVisualEvidenceSha256 === null
+          ? null
+          : {
+              sha256: roleSwitchVisualEvidenceSha256,
+              roles: [...capturedVisualRoles].sort(),
+              samples: roleSwitchVisualEvidence,
+            },
+    };
+    const terminalEvidencePath = testInfo.outputPath(
+      "natural-hyperia-sol-terminal.json",
+    );
+    fs.writeFileSync(
+      terminalEvidencePath,
+      `${JSON.stringify(terminalEvidence, null, 2)}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+    await testInfo.attach("natural-hyperia-sol-terminal", {
+      path: terminalEvidencePath,
+      contentType: "application/json",
+    });
+    await testInfo.attach("natural-hyperia-sol-terminal-ui", {
+      body: await page.screenshot({ fullPage: true, animations: "disabled" }),
+      contentType: "image/png",
+    });
+  });
+
   test("solana predictions place YES and NO orders and stage a proposed winner claim", async ({
     page,
     request,
-  }) => {
+  }, testInfo) => {
     const state = loadState();
+    const control = loadControl();
     const connection = createConfirmedConnection(
       state.solanaRpcUrl || "http://127.0.0.1:8899",
       state.solanaWsUrl,
@@ -2874,11 +5882,11 @@ test.describe("market flows", () => {
     });
     await page.getByTestId("refresh-market").click();
 
-    await clobPanel.getByTestId("prediction-tab-buy").click({ force: true });
+    await openSolanaBuyOrderEntry(page, clobPanel);
     await clobPanel
       .getByTestId("prediction-amount-input")
       .fill(SOLANA_PREDICTION_AMOUNT);
-    await clobPanel.getByTestId("prediction-select-yes").click({ force: true });
+    await selectSolanaPredictionSide(clobPanel, "yes");
     const orderQuote = clobPanel.getByTestId("solana-order-quote");
     await expect(orderQuote).toContainText("Order details before signature");
     await expect(orderQuote).toContainText("Maximum locked collateral");
@@ -2894,8 +5902,104 @@ test.describe("market flows", () => {
       .getByRole("button", { name: /buy yes/i })
       .first();
     await expect(buyYesButton).toBeEnabled({ timeout: 30_000 });
-    await buyYesButton.click({ force: true });
-    await confirmSolanaOrder(page);
+    const visibilityFaultId = `finalized-place-order-visibility-${duelId}`;
+    armFinalizedTransactionVisibilityGap(control, {
+      faultId: visibilityFaultId,
+      requiredAccount: marketState,
+      requiredProgramId: new PublicKey(duelMarketProgramId),
+    });
+    await buyYesButton.click();
+    const trackingEvidence = await confirmSolanaOrder(page);
+    expect(trackingEvidence.terminalStatus).toBe(200);
+    expect(
+      trackingEvidence.attempts.some((attempt) => attempt.startsWith("425:")),
+    ).toBe(true);
+    await expect
+      .poll(
+        () => {
+          const observed = readSolanaRpcFaultControl(control);
+          return {
+            faultId: observed?.faultId ?? null,
+            mode: observed?.mode ?? null,
+            state: observed?.state ?? null,
+            signature: observed?.signature ?? null,
+            hiddenLookupCount:
+              observed?.mode === "hide_get_transaction_after_forward"
+                ? (observed.hiddenLookupCount ?? null)
+                : null,
+            requestedCommitment:
+              observed?.mode === "hide_get_transaction_after_forward"
+                ? (observed.requestedCommitment ?? null)
+                : null,
+            requestedLane:
+              observed?.mode === "hide_get_transaction_after_forward"
+                ? (observed.requestedLane ?? null)
+                : null,
+          };
+        },
+        { timeout: 30_000, intervals: [100, 250, 500, 1_000] },
+      )
+      .toEqual({
+        faultId: visibilityFaultId,
+        mode: "hide_get_transaction_after_forward",
+        state: "released",
+        signature: expect.stringMatching(/^[1-9A-HJ-NP-Za-km-z]{32,88}$/),
+        hiddenLookupCount: 1,
+        requestedCommitment: "finalized",
+        requestedLane: "verifier",
+      });
+    const releasedVisibilityFault = readSolanaRpcFaultControl(control);
+    if (
+      releasedVisibilityFault?.mode !== "hide_get_transaction_after_forward" ||
+      releasedVisibilityFault.state !== "released" ||
+      !releasedVisibilityFault.signature
+    ) {
+      throw new Error("Finalized transaction visibility fault did not release");
+    }
+    const [visibleSignatureStatus] = (
+      await connection.getSignatureStatuses(
+        [releasedVisibilityFault.signature],
+        { searchTransactionHistory: true },
+      )
+    ).value;
+    expect(visibleSignatureStatus).toMatchObject({
+      err: null,
+      confirmationStatus: "finalized",
+    });
+    const visibleTransaction = await connection.getTransaction(
+      releasedVisibilityFault.signature,
+      { commitment: "finalized", maxSupportedTransactionVersion: 0 },
+    );
+    expect(visibleTransaction).not.toBeNull();
+    expect(visibleTransaction?.meta?.err).toBeNull();
+    const visibilityEvidence = {
+      schemaVersion: 1,
+      duelId,
+      duelKeyHex,
+      marketState: marketState.toBase58(),
+      fault: releasedVisibilityFault,
+      tracking: trackingEvidence,
+      finalizedStatus: {
+        err: visibleSignatureStatus?.err ?? null,
+        confirmationStatus: visibleSignatureStatus?.confirmationStatus ?? null,
+      },
+      visibleTransaction: {
+        slot: visibleTransaction?.slot ?? null,
+        err: visibleTransaction?.meta?.err ?? null,
+      },
+    };
+    const visibilityEvidencePath = testInfo.outputPath(
+      "solana-finalized-transaction-visibility-recovery.json",
+    );
+    fs.writeFileSync(
+      visibilityEvidencePath,
+      `${JSON.stringify(visibilityEvidence, null, 2)}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+    await testInfo.attach("solana-finalized-transaction-visibility-recovery", {
+      path: visibilityEvidencePath,
+      contentType: "application/json",
+    });
 
     const yesStatus = await page
       .getByTestId("solana-clob-status")
@@ -2948,14 +6052,27 @@ test.describe("market flows", () => {
           `orderTx=${currentOrderTx || "<empty>"}`,
           `marketBalances=${JSON.stringify(marketBalances)}`,
         ].join("\n"),
+        { cause: error },
       );
     }
 
     await page.getByTestId("refresh-market").click();
-    await clobPanel.getByTestId("prediction-tab-buy").click({ force: true });
-    await clobPanel.getByTestId("prediction-select-no").click({ force: true });
+    await openSolanaBuyOrderEntry(page, clobPanel);
+    await selectSolanaPredictionSide(clobPanel, "no");
     const noPriceInput = clobPanel.getByTestId("solana-clob-price-input");
     if (await noPriceInput.isVisible().catch(() => false)) {
+      await expect(noPriceInput).toHaveAccessibleName(
+        "Selected-outcome limit probability (per mille)",
+      );
+      await expect(noPriceInput).toHaveAttribute("inputmode", "numeric");
+      await expect(noPriceInput).toHaveAttribute("maxlength", "3");
+      await expect(noPriceInput).toHaveAttribute("pattern", "[0-9]{1,3}");
+      await expect(noPriceInput).toHaveAttribute("aria-invalid", "false");
+      expect(
+        await noPriceInput.evaluate((element) =>
+          Number.parseFloat(getComputedStyle(element).minHeight),
+        ),
+      ).toBeGreaterThanOrEqual(44);
       await noPriceInput.fill("500");
     }
     const submitButton = clobPanel
@@ -2990,7 +6107,7 @@ test.describe("market flows", () => {
       noOrderId,
     );
     await expect(submitButton).toBeEnabled({ timeout: 30_000 });
-    await submitButton.click({ force: true });
+    await submitButton.click();
     await confirmSolanaOrder(page);
 
     const noStatus = await page
@@ -3132,6 +6249,7 @@ test.describe("market flows", () => {
           `orderTx=${currentOrderTx || "<empty>"}`,
           `marketBalances=${JSON.stringify(marketBalances)}`,
         ].join("\n"),
+        { cause: error },
       );
     }
 
@@ -3364,11 +6482,25 @@ test.describe("market flows", () => {
       duelStartTs,
       120_000,
     );
+    const competitiveCommitment = buildSyntheticDuelCommitment({
+      cycleId: `gate10-solana-${duelId}`,
+      duelId,
+      duelKeyHex,
+      betOpenTs,
+      betCloseTs,
+      duelStartTs,
+    });
     await upsertDuel(fightProgram as never, authority, duelKey, {
       status: duelStatusLocked(),
       betOpenTs,
       betCloseTs,
       duelStartTs,
+      competitiveSnapshotVersion:
+        competitiveCommitment.competitiveSnapshotVersion,
+      competitiveSnapshotDigest:
+        competitiveCommitment.competitiveSnapshotDigestBytes,
+      participantAHash: competitiveCommitment.participantAHash,
+      participantBHash: competitiveCommitment.participantBHash,
       metadataUri: canonicalDuelMetadata(duelId, duelKeyHex, "locked"),
     });
     await syncMarketFromDuel(
@@ -3529,8 +6661,8 @@ test.describe("market flows", () => {
     let beforeWalletLamports = BigInt(
       await connection.getBalance(trader, "confirmed"),
     );
-    let afterWalletLamports = beforeWalletLamports;
-    let finalizeResultSig: string | null = null;
+    let afterWalletLamports: bigint;
+    let finalizeResultSig: string | null;
     let claimTx: string | null = null;
     let claimWalletLamportsDelta: bigint | null = null;
     let expectedClaimPayoutLamports: bigint | null = null;
@@ -3646,6 +6778,10 @@ test.describe("market flows", () => {
       );
     }
     if (!alreadyClaimedFixture && E2E_DUEL_SOURCE === "synthetic_publish") {
+      const authoritativeDuelEndTs =
+        activeFixture.duelEndTs > 0
+          ? activeFixture.duelEndTs
+          : activeFixture.pendingDuelEndTs;
       await publishSolanaCycleState(request, {
         cycleId: `gate10-solana-${activeFixture.duelId}`,
         duelId: activeFixture.duelId,
@@ -3655,7 +6791,7 @@ test.describe("market flows", () => {
         duelStartTs: activeFixture.duelStartTs,
         phase: "RESOLUTION",
         winner: "A",
-        duelEndTs: Math.floor(Date.now() / 1000),
+        duelEndTs: authoritativeDuelEndTs,
       });
     }
 
@@ -3708,23 +6844,92 @@ test.describe("market flows", () => {
         .toBe("RESOLVED:A");
     }
 
-    await page.getByTestId("refresh-market").click();
+    await gotoApp(page, {
+      e2eSolanaDuelKey: activeFixture.duelKeyHex,
+      e2eSolanaDuelId: activeFixture.duelId,
+      e2eSolanaMarketRef: activeFixture.marketState.toBase58(),
+      debug: false,
+    });
+    await selectChain(page, "solana");
+    await ensureWalletConnected(page);
+    const publicWinnerLog = page.getByTestId("duels-bottom-panel-news");
+    await expect(publicWinnerLog).toContainText("Agent A wins the round.", {
+      timeout: 60_000,
+    });
+    await expect(page.getByTestId("spectator-terminal-outcome")).toContainText(
+      "Agent A wins — Knockout.",
+    );
+    await testInfo.attach("solana-winner-public-desktop", {
+      body: await page.screenshot({ animations: "disabled" }),
+      contentType: "image/png",
+    });
+
+    const winningHistoryEntries = settlementEntriesForDuel(
+      page,
+      activeFixture.duelId,
+    );
+    let claimStartedAtMs: number | null = null;
+    let claimToIndexedHistoryMs: number | null = null;
     if (!alreadyClaimedFixture) {
-      const claimButton = page.getByRole("button", { name: /claim/i }).first();
-      await expect(claimButton).toBeEnabled({ timeout: 30_000 });
-      const previousClaimTx = await readText(page, "solana-clob-claim-tx");
-      await claimButton.click({ force: true });
+      await expect(
+        page.getByTestId("solana-clob-settlement-action"),
+      ).toContainText("Claim winnings", { timeout: 60_000 });
+      await page.setViewportSize({ width: 390, height: 844 });
+      await expect(page.getByTestId("mobile-watch-summary")).toContainText(
+        "RESOLVED",
+      );
+      expect(
+        await page.evaluate(() => ({
+          clientWidth: document.documentElement.clientWidth,
+          scrollWidth: document.documentElement.scrollWidth,
+        })),
+      ).toEqual({ clientWidth: 390, scrollWidth: 390 });
+      const winnerReviewButton = page.locator(".hm-bet-fab");
+      await expect(winnerReviewButton).toBeVisible();
+      expect(
+        await winnerReviewButton.evaluate(
+          (element) => element.getBoundingClientRect().height,
+        ),
+      ).toBeGreaterThanOrEqual(44);
+      await winnerReviewButton.click();
+      const mobileWinnerSheet = page.getByRole("dialog", {
+        name: /trading controls/i,
+      });
+      await expect(mobileWinnerSheet).toBeVisible();
+      await expect(mobileWinnerSheet).toContainText("RESOLVED");
+      const claimButton = mobileWinnerSheet
+        .getByRole("button", { name: /claim winnings/i })
+        .first();
+      await expect(claimButton).toBeVisible({ timeout: 30_000 });
+      await expect(claimButton).toBeEnabled();
+      expect(
+        await claimButton.evaluate(
+          (element) => element.getBoundingClientRect().height,
+        ),
+      ).toBeGreaterThanOrEqual(44);
+      await testInfo.attach("solana-winner-public-mobile", {
+        body: await page.screenshot({ animations: "disabled" }),
+        contentType: "image/png",
+      });
+
+      claimStartedAtMs = Date.now();
+      await claimButton.click();
       claimTx = await expectSolanaSettlementReceipt(
         page,
         /claim confirmed on-chain/i,
       );
-      const debugClaimTx = await waitForNewText(
-        page,
-        "solana-clob-claim-tx",
-        previousClaimTx,
-        120_000,
+      await expect(
+        winningHistoryEntries.getByRole("button", {
+          name: /claim winnings/i,
+        }),
+      ).toHaveCount(0, { timeout: 2_000 });
+      await expect(mobileWinnerSheet).toContainText(
+        "Settlement history is catching up",
       );
-      expect(debugClaimTx).toContain(claimTx);
+      await testInfo.attach("solana-winner-claim-indexing", {
+        body: await page.screenshot({ animations: "disabled" }),
+        contentType: "image/png",
+      });
       const [signatureWalletDelta, transactionFee] = await Promise.all([
         getWalletLamportDeltaFromSignature(connection, claimTx, trader),
         getTransactionFeeFromSignature(connection, claimTx),
@@ -3764,77 +6969,72 @@ test.describe("market flows", () => {
       claimWalletLamportsDelta = afterWalletLamports - beforeWalletLamports;
       expect(afterWalletLamports).toBeGreaterThan(beforeWalletLamports);
     }
-    if (alreadyClaimedFixture) {
-      await expect(page.getByTestId("solana-clob-status")).toContainText(
-        /result finalized/i,
-        {
-          timeout: 30_000,
-        },
-      );
-      const lifecycleDebug = page.getByTestId("solana-clob-lifecycle-debug");
-      await expect(lifecycleDebug).toContainText(
-        `duelKey=${activeFixture.duelKeyHex}`,
-        {
-          timeout: 30_000,
-        },
-      );
-      await expect(lifecycleDebug).toContainText(
-        `pinned=${activeFixture.duelKeyHex}`,
-        {
-          timeout: 30_000,
-        },
-      );
-      await expect(lifecycleDebug).toContainText("claimKind=NONE", {
-        timeout: 30_000,
-      });
-      await expect(lifecycleDebug).toContainText("canClaim=false", {
-        timeout: 30_000,
-      });
-      await expect(page.getByTestId("solana-clob-wallet-debug")).toContainText(
-        ["aShares=0", "bShares=0"].join("\n"),
-        {
-          timeout: 30_000,
-        },
-      );
-    } else if (E2E_DUEL_SOURCE === "real_hyperia") {
-      await expect(
-        page.getByTestId("solana-clob-lifecycle-debug"),
-      ).toContainText(
-        [
-          "lifecycleStatus=RESOLVED",
-          "winner=A",
-          "marketStatus=resolved",
-          "marketWinner=a",
-          "canClaim=false",
-        ].join("\n"),
-        {
-          timeout: 30_000,
-        },
-      );
-      await expect(page.getByTestId("solana-clob-wallet-debug")).toContainText(
-        ["aShares=0", "bShares=0"].join("\n"),
-        {
-          timeout: 30_000,
-        },
-      );
-    } else {
-      await expect(page.getByTestId("solana-clob-status")).toContainText(
-        /result finalized/i,
-        {
-          timeout: 30_000,
-        },
-      );
-      await expect(
-        page.getByTestId("solana-clob-lifecycle-debug"),
-      ).toContainText("claimKind=NONE", { timeout: 30_000 });
-      await expect(page.getByTestId("solana-clob-wallet-debug")).toContainText(
-        ["aShares=0", "bShares=0"].join("\n"),
-        { timeout: 30_000 },
-      );
-    }
     await expect(page.getByTestId("solana-clob-claim-payout")).toHaveCount(0, {
       timeout: 30_000,
     });
+    await expect(page.getByTestId("solana-clob-settlement-action")).toHaveCount(
+      0,
+      { timeout: 30_000 },
+    );
+    if (!alreadyClaimedFixture && claimTx) {
+      const readWinnerSettlementHistory = async () => {
+        const response = await fetchJson<{
+          ledger?: { current?: boolean };
+          entries?: Array<{
+            duelId?: string;
+            marketPda?: string;
+            settlementState?: string;
+            claimSignature?: string | null;
+          }>;
+        }>(
+          request,
+          `/api/arena/settlements/${encodeURIComponent(
+            trader.toBase58(),
+          )}?limit=100&offset=0`,
+        );
+        const exactEntries = (response.entries ?? []).filter(
+          (entry) =>
+            entry.duelId === activeFixture.duelId &&
+            entry.marketPda === activeFixture.marketState.toBase58(),
+        );
+        return {
+          ledgerCurrent: response.ledger?.current === true,
+          hasPaidWinner: exactEntries.some(
+            (entry) =>
+              entry.settlementState === "PAID" &&
+              entry.claimSignature === claimTx,
+          ),
+          hasClaimableWinner: exactEntries.some(
+            (entry) => entry.settlementState === "PAYOUT_CLAIMABLE",
+          ),
+        };
+      };
+      await expect
+        .poll(readWinnerSettlementHistory, {
+          timeout: 90_000,
+          intervals: [250, 500, 1_000, 2_000, 5_000],
+        })
+        .toEqual({
+          ledgerCurrent: true,
+          hasPaidWinner: true,
+          hasClaimableWinner: false,
+        });
+      await expect
+        .poll(
+          async () => ({
+            hasPaidWinner: (await winningHistoryEntries.allTextContents()).some(
+              (value) => value.includes("Winnings paid"),
+            ),
+            claimButtons: await winningHistoryEntries
+              .getByRole("button", { name: /claim winnings/i })
+              .count(),
+          }),
+          { timeout: 15_000, intervals: [250, 500, 1_000, 2_000, 5_000] },
+        )
+        .toEqual({ hasPaidWinner: true, claimButtons: 0 });
+      expect(claimStartedAtMs).not.toBeNull();
+      claimToIndexedHistoryMs = Date.now() - (claimStartedAtMs ?? Date.now());
+    }
     if (E2E_DUEL_SOURCE === "real_hyperia") {
       expect(finalizeResultSig).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
       expect(claimTx).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
@@ -3861,6 +7061,7 @@ test.describe("market flows", () => {
               expectedClaimPayoutLamports?.toString() ?? null,
             reclaimedBalanceRentLamports:
               reclaimedBalanceRentLamports?.toString() ?? null,
+            claimToIndexedHistoryMs,
             finalizableAt: activeFixture.finalizableAt,
             alreadyClaimedFixture,
           },
@@ -3883,6 +7084,7 @@ test.describe("market flows", () => {
     test.setTimeout(300_000);
 
     const state = loadState();
+    const control = loadControl();
     const connection = createConfirmedConnection(
       state.solanaRpcUrl || "http://127.0.0.1:8899",
       state.solanaWsUrl,
@@ -3953,11 +7155,11 @@ test.describe("market flows", () => {
     });
     await page.getByTestId("refresh-market").click();
     const clobPanel = page.getByTestId("solana-clob-panel").first();
-    await clobPanel.getByTestId("prediction-tab-buy").click({ force: true });
+    await openSolanaBuyOrderEntry(page, clobPanel);
     await clobPanel
       .getByTestId("prediction-amount-input")
       .fill(SOLANA_PREDICTION_AMOUNT);
-    await clobPanel.getByTestId("prediction-select-no").click({ force: true });
+    await selectSolanaPredictionSide(clobPanel, "no");
     const noPriceInput = clobPanel.getByTestId("solana-clob-price-input");
     if (await noPriceInput.isVisible().catch(() => false)) {
       await noPriceInput.fill(String(ORDER_PRICE));
@@ -3966,7 +7168,7 @@ test.describe("market flows", () => {
       .getByRole("button", { name: /buy no/i })
       .first();
     await expect(buyNoButton).toBeEnabled({ timeout: 30_000 });
-    await buyNoButton.click({ force: true });
+    await buyNoButton.click();
     await confirmSolanaOrder(page);
 
     await expect
@@ -3991,11 +7193,25 @@ test.describe("market flows", () => {
       duelStartTs,
       120_000,
     );
+    const competitiveCommitment = buildSyntheticDuelCommitment({
+      cycleId: `gate10-solana-${duelId}`,
+      duelId,
+      duelKeyHex,
+      betOpenTs,
+      betCloseTs,
+      duelStartTs,
+    });
     await upsertDuel(fightProgram as never, authority, duelKey, {
       status: duelStatusLocked(),
       betOpenTs,
       betCloseTs,
       duelStartTs,
+      competitiveSnapshotVersion:
+        competitiveCommitment.competitiveSnapshotVersion,
+      competitiveSnapshotDigest:
+        competitiveCommitment.competitiveSnapshotDigestBytes,
+      participantAHash: competitiveCommitment.participantAHash,
+      participantBHash: competitiveCommitment.participantBHash,
       metadataUri: canonicalDuelMetadata(duelId, duelKeyHex, "locked"),
     });
     await syncMarketFromDuel(
@@ -4070,31 +7286,62 @@ test.describe("market flows", () => {
       )
       .toBe("RESOLVED:A");
 
-    await page.getByTestId("refresh-market").click();
-    const lifecycleDebug = page.getByTestId("solana-clob-lifecycle-debug");
-    await expect(lifecycleDebug).toContainText("claimKind=LOSER_CLEANUP", {
-      timeout: 30_000,
+    const rolloverMarket = await createFreshSolanaOpenMarket(
+      request,
+      state,
+      authority,
+      fightProgram,
+      writableClobProgram,
+      "gate10-solana-post-loser-cleanup-rollover",
+    );
+    await gotoApp(page, {
+      e2eSolanaDuelKey: rolloverMarket.duelKeyHex,
+      e2eSolanaDuelId: rolloverMarket.duelId,
+      e2eSolanaMarketRef: rolloverMarket.marketState.toBase58(),
+      debug: false,
     });
-    await expect(lifecycleDebug).toContainText("canClaim=true", {
-      timeout: 30_000,
-    });
-    const cleanupButton = page
-      .getByRole("button", { name: /clear position/i })
+    await selectChain(page, "solana");
+    const rolloverExpandButton = page
+      .locator('button[title="Expand panel"]')
       .first();
+    if (await rolloverExpandButton.isVisible().catch(() => false)) {
+      await rolloverExpandButton.click();
+    }
+    await ensureWalletConnected(page);
+    const rolloverRoot = page.locator(".hm-root").first();
+    await expect(rolloverRoot).toHaveAttribute(
+      "data-stream-duel-id",
+      rolloverMarket.duelId,
+      { timeout: 60_000 },
+    );
+    await expect(rolloverRoot).toHaveAttribute(
+      "data-market-duel-id",
+      rolloverMarket.duelId,
+    );
+    await expect(rolloverRoot).toHaveAttribute(
+      "data-market-can-place-bet",
+      "true",
+    );
+
+    const historicalLosingActivity = settlementEntriesForDuel(page, duelId);
+    await expect(historicalLosingActivity).toHaveCount(1, { timeout: 60_000 });
+    await expect(historicalLosingActivity).toContainText(
+      "Resolved · no payout",
+    );
+    await expect(
+      historicalLosingActivity.getByRole("button", {
+        name: /recover order rent/i,
+      }),
+    ).toHaveCount(0);
+    const cleanupButton = historicalLosingActivity.getByRole("button", {
+      name: /clear position/i,
+    });
     await expect(cleanupButton).toBeEnabled({ timeout: 30_000 });
-    const previousCleanupTx = await readText(page, "solana-clob-claim-tx");
-    await cleanupButton.click({ force: true });
+    await cleanupButton.click();
     const cleanupTx = await expectSolanaSettlementReceipt(
       page,
       /position cleanup confirmed on-chain/i,
     );
-    const debugCleanupTx = await waitForNewText(
-      page,
-      "solana-clob-claim-tx",
-      previousCleanupTx,
-      120_000,
-    );
-    expect(debugCleanupTx).toContain(cleanupTx);
     const [cleanupWalletDelta, cleanupTransactionFee] = await Promise.all([
       getWalletLamportDeltaFromSignature(connection, cleanupTx, trader),
       getTransactionFeeFromSignature(connection, cleanupTx),
@@ -4110,6 +7357,78 @@ test.describe("market flows", () => {
     await expect(page.getByTestId("solana-clob-claim-payout")).toHaveCount(0, {
       timeout: 30_000,
     });
+    await expect
+      .poll(
+        async () =>
+          page.evaluate(
+            async ({ keeperOrigin, wallet, exactDuelId, exactCleanupTx }) => {
+              const response = await fetch(
+                `${keeperOrigin}/api/arena/settlements/${encodeURIComponent(wallet)}?limit=4&offset=0`,
+                { cache: "no-store" },
+              );
+              if (!response.ok) {
+                return {
+                  status: response.status,
+                  current: false,
+                  terminalKind: null,
+                  claimMatches: false,
+                };
+              }
+              const body = (await response.json()) as {
+                ledger?: { current?: unknown };
+                entries?: Array<{
+                  duelId?: unknown;
+                  terminalKind?: unknown;
+                  claimSignature?: unknown;
+                }>;
+              };
+              const entry = body.entries?.find(
+                (candidate) => candidate.duelId === exactDuelId,
+              );
+              return {
+                status: response.status,
+                current: body.ledger?.current === true,
+                terminalKind: entry?.terminalKind ?? null,
+                claimMatches: entry?.claimSignature === exactCleanupTx,
+              };
+            },
+            {
+              keeperOrigin: new URL(control.services.keeper.healthUrl).origin,
+              wallet: trader.toBase58(),
+              exactDuelId: duelId,
+              exactCleanupTx: cleanupTx,
+            },
+          ),
+        { timeout: 60_000, intervals: [500, 1_000, 2_000, 5_000] },
+      )
+      .toEqual({
+        status: 200,
+        current: true,
+        terminalKind: "LOSER_CLEANUP",
+        claimMatches: true,
+      });
+    await page.getByTestId("solana-settlement-refresh").click();
+    await expect
+      .poll(
+        async () => ({
+          cleanupButtons: await historicalLosingActivity
+            .getByRole("button", { name: /clear position/i })
+            .count(),
+          positionClosed:
+            (await historicalLosingActivity.textContent())?.includes(
+              "Position closed · no payout",
+            ) ?? false,
+          rentButtons: await historicalLosingActivity
+            .getByRole("button", { name: /recover order rent/i })
+            .count(),
+        }),
+        { timeout: 30_000, intervals: [250, 500, 1_000, 2_000] },
+      )
+      .toEqual({
+        cleanupButtons: 0,
+        positionClosed: true,
+        rentButtons: 1,
+      });
 
     await testInfo.attach("solana-loser-cleanup-ui", {
       body: await page.screenshot({ fullPage: true }),
@@ -4139,12 +7458,24 @@ test.describe("market flows", () => {
   test("solana open prediction markets recover after keeper and proxy restarts", async ({
     page,
     request,
-  }) => {
+  }, testInfo) => {
     let browserRpcRequestCount = 0;
+    const browserRpcMethods = new Map<string, number>();
     page.on("request", (browserRequest) => {
       try {
         if (new URL(browserRequest.url()).pathname === "/__solana/rpc") {
           browserRpcRequestCount += 1;
+          const payload = browserRequest.postDataJSON() as
+            { method?: unknown } | Array<{ method?: unknown }>;
+          const entries = Array.isArray(payload) ? payload : [payload];
+          for (const entry of entries) {
+            const method =
+              typeof entry?.method === "string" ? entry.method : "unknown";
+            browserRpcMethods.set(
+              method,
+              (browserRpcMethods.get(method) ?? 0) + 1,
+            );
+          }
         }
       } catch {
         // Ignore non-URL browser-internal requests.
@@ -4163,7 +7494,7 @@ test.describe("market flows", () => {
       fightProgram,
       clobProgram: writableClobProgram,
     } = await createWritablePrograms(connection, state);
-    const { duelKeyHex, duelState, marketState } =
+    const { duelId, duelKeyHex, duelState, marketState } =
       await createFreshSolanaOpenMarket(
         request,
         state,
@@ -4209,6 +7540,7 @@ test.describe("market flows", () => {
 
     await gotoApp(page, {
       e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
       e2eSolanaMarketRef: marketState.toBase58(),
     });
     await selectChain(page, "solana");
@@ -4225,7 +7557,7 @@ test.describe("market flows", () => {
     await page
       .getByTestId("prediction-amount-input")
       .fill(SOLANA_PREDICTION_AMOUNT);
-    await page.getByTestId("prediction-select-yes").click({ force: true });
+    await page.getByTestId("prediction-select-yes").click();
 
     const beforeBalance = (await clobProgram.account.userBalance.fetchNullable(
       userBalanceAddress,
@@ -4234,7 +7566,7 @@ test.describe("market flows", () => {
 
     const restartSubmitButton = page.getByTestId("prediction-submit");
     await expect(restartSubmitButton).toBeEnabled({ timeout: 30_000 });
-    await restartSubmitButton.click({ force: true });
+    await restartSubmitButton.click();
     await confirmSolanaOrder(page);
 
     await expect
@@ -4286,6 +7618,7 @@ test.describe("market flows", () => {
     await page.reload({ waitUntil: "domcontentloaded" });
     await gotoApp(page, {
       e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
       e2eSolanaMarketRef: marketState.toBase58(),
     });
     if (await expandButton.isVisible().catch(() => false)) {
@@ -4312,22 +7645,77 @@ test.describe("market flows", () => {
       )
       .toBeGreaterThan(0);
 
+    const browserRpcEvidence = {
+      requestCount: browserRpcRequestCount,
+      methodCounts: Object.fromEntries(
+        [...browserRpcMethods].sort(([left], [right]) =>
+          left.localeCompare(right),
+        ),
+      ),
+    };
+    console.info(
+      `[e2e] browser RPC evidence ${JSON.stringify(browserRpcEvidence)}`,
+    );
+    await testInfo.attach("browser-rpc-evidence", {
+      body: Buffer.from(JSON.stringify(browserRpcEvidence, null, 2)),
+      contentType: "application/json",
+    });
+
     expect(
       browserRpcRequestCount,
       "the prediction-market panel must not enter a render-triggered RPC refresh loop",
     ).toBeLessThanOrEqual(250);
+    for (const [method, budget] of [
+      ["getGenesisHash", 15],
+      ["getProgramAccounts", 70],
+      ["getAccountInfo", 100],
+    ] as const) {
+      expect(
+        browserRpcMethods.get(method) ?? 0,
+        `${method} must remain within the restart-recovery browser RPC budget`,
+      ).toBeLessThanOrEqual(budget);
+    }
   });
 
-  test("solana open prediction markets recover after Hyperia restarts", async ({
+  test("solana open prediction markets recover after Hyperia restarts and settle exactly", async ({
     page,
     request,
-  }) => {
+  }, testInfo) => {
     test.skip(
       E2E_DUEL_SOURCE !== "real_hyperia",
       "Hyperia restart recovery is only meaningful in real-duel mode",
     );
+    test.setTimeout(600_000);
+    const runtimeErrors: string[] = [];
+    page.on("pageerror", (error) => runtimeErrors.push(error.message));
     const state = loadState();
     const control = loadControl();
+    const hyperiaControl = control.services.hyperia;
+    if (!hyperiaControl) {
+      throw new Error("real Hyperia process control is missing");
+    }
+    const launchPathEntries = control.launchPath.split(":");
+    expect(launchPathEntries).not.toContain("");
+    expect(launchPathEntries.every((entry) => path.isAbsolute(entry))).toBe(
+      true,
+    );
+    const configuredNodePath =
+      hyperiaControl.startCommand?.match(/^exec "([^"]+)" /)?.[1] ?? null;
+    expect(configuredNodePath).toMatch(/\/node$/);
+    const reuseGameBuilds =
+      hyperiaControl.startCommand?.includes("--reuse-game-builds") ?? false;
+    expect(reuseGameBuilds).toBe(process.env.E2E_SKIP_PREBUILD === "true");
+    const resolvedLaunchNodePath =
+      launchPathEntries
+        .map((entry) => path.join(entry, "node"))
+        .find((candidate) => fs.existsSync(candidate)) ?? null;
+    expect(resolvedLaunchNodePath).not.toBeNull();
+    expect(
+      configuredNodePath && resolvedLaunchNodePath
+        ? fs.realpathSync(resolvedLaunchNodePath) ===
+            fs.realpathSync(configuredNodePath)
+        : false,
+    ).toBe(true);
     const connection = createConfirmedConnection(
       state.solanaRpcUrl || "http://127.0.0.1:8899",
       state.solanaWsUrl,
@@ -4339,7 +7727,7 @@ test.describe("market flows", () => {
       fightProgram,
       clobProgram: writableClobProgram,
     } = await createWritablePrograms(connection, state);
-    const { duelKeyHex, duelState, marketState } =
+    const { duelKeyHex, duelId, duelState, marketState } =
       await createFreshSolanaOpenMarket(
         request,
         state,
@@ -4397,18 +7785,145 @@ test.describe("market flows", () => {
       marketState,
       duelState,
     });
+    const clobPanel = page.getByTestId("solana-clob-panel").first();
+    const browserOrders: Array<{
+      outcome: "yes" | "no";
+      signature: string;
+      shareDelta: string;
+    }> = [];
+    const buyMatchedOutcome = async (
+      outcome: "yes" | "no",
+      liquiditySide: number,
+      shareField: "aShares" | "bShares",
+    ): Promise<void> => {
+      const before = (await clobProgram.account.userBalance.fetchNullable(
+        userBalanceAddress,
+      )) as UserBalanceAccount | null;
+      const beforeShares = bnLikeToBigInt(before?.[shareField]);
+      await seedClobLiquidity(connection, state, liquiditySide, {
+        marketState,
+        duelState,
+      });
+      await page.getByTestId("refresh-market").click();
+      await openSolanaBuyOrderEntry(page, clobPanel);
+      await clobPanel
+        .getByTestId("prediction-amount-input")
+        .fill(SOLANA_PREDICTION_AMOUNT);
+      await selectSolanaPredictionSide(clobPanel, outcome);
+      const priceInput = clobPanel.getByTestId("solana-clob-price-input");
+      if (await priceInput.isVisible().catch(() => false)) {
+        await priceInput.fill(String(ORDER_PRICE));
+      }
+      const submit = clobPanel
+        .getByRole("button", { name: new RegExp(`buy ${outcome}`, "i") })
+        .first();
+      await expect(submit).toBeEnabled({ timeout: 30_000 });
+      await submit.click();
+      await confirmSolanaOrder(page);
+      const signature = (
+        (await page
+          .getByTestId("solana-order-transaction-signature")
+          .first()
+          .textContent()) ?? ""
+      ).trim();
+      expect(signature).toMatch(/^[1-9A-HJ-NP-Za-km-z]{64,88}$/);
+      await expect
+        .poll(
+          async () => {
+            const balance =
+              (await clobProgram.account.userBalance.fetchNullable(
+                userBalanceAddress,
+              )) as UserBalanceAccount | null;
+            return bnLikeToBigInt(balance?.[shareField]).toString();
+          },
+          { timeout: 120_000, intervals: [500, 1_000, 2_000, 5_000] },
+        )
+        .toBe((beforeShares + 50_000_000n).toString());
+      browserOrders.push({
+        outcome,
+        signature,
+        shareDelta: "50000000",
+      });
+    };
 
+    // Commit both sides before process loss. Recovery must preserve these exact
+    // funds and settle them against the immutable duel; renderer requalification
+    // is allowed to cross the already-committed betting close and never extends it.
+    await buyMatchedOutcome("yes", SIDE_ASK, "aShares");
+    await buyMatchedOutcome("no", SIDE_BID, "bShares");
+    const fundedBalanceBeforeRestart =
+      (await clobProgram.account.userBalance.fetch(
+        userBalanceAddress,
+      )) as UserBalanceAccount;
+    expect({
+      aShares: bnLikeToBigInt(fundedBalanceBeforeRestart.aShares),
+      bShares: bnLikeToBigInt(fundedBalanceBeforeRestart.bShares),
+      aLockedLamports: bnLikeToBigInt(
+        fundedBalanceBeforeRestart.aLockedLamports,
+      ),
+      bLockedLamports: bnLikeToBigInt(
+        fundedBalanceBeforeRestart.bLockedLamports,
+      ),
+    }).toEqual({
+      aShares: 50_000_000n,
+      bShares: 50_000_000n,
+      aLockedLamports: 25_000_000n,
+      bLockedLamports: 25_000_000n,
+    });
+    const exactMarketBeforeRestart =
+      (await clobProgram.account.marketState.fetch(
+        marketState,
+      )) as MarketStateAccount & {
+        status?: unknown;
+      };
+    expect(enumName(exactMarketBeforeRestart.status)).toBe("open");
+    expect(runtimeErrors).toEqual([]);
+
+    const sourceBefore = await fetchHyperiaAuthorityHealth(request, control);
+    expect(sourceBefore).toMatchObject({
+      ready: true,
+      duelId,
+      duelKeyHex,
+      outcome: null,
+      cancellationReason: null,
+      competitiveSnapshotPersisted: true,
+      competitiveSnapshotDiagnostic: false,
+    });
+    expect(sourceBefore.sourceEpoch).toEqual(expect.any(Number));
+    expect(sourceBefore.snapshotDigest).toEqual(expect.any(String));
+    const initialPid = readOwnedProcessId(
+      hyperiaControl.pidFile,
+      "initial Hyperia supervisor",
+    );
+    const initialProcessCommand = readProcessCommand(initialPid);
+    expect(initialProcessCommand).toContain(configuredNodePath ?? "");
+    expect(initialProcessCommand).toContain("scripts/duel-stack.mjs");
+    expect(initialProcessCommand.includes("--reuse-game-builds")).toBe(
+      reuseGameBuilds,
+    );
+    const controlSha256 = createHash("sha256")
+      .update(fs.readFileSync(control.controlPath))
+      .digest("hex");
+
+    const restartStartedAtMs = Date.now();
     runProcessControl(control, "restart", "hyperia");
 
     await expect
       .poll(
         async () => {
-          const streamState = await fetchJson<{
+          const response = await request.get(
+            `${GAME_API_URL}/api/streaming/state`,
+            { failOnStatusCode: false },
+          );
+          if (!response.ok()) {
+            return { duelKey: null, duelId: null };
+          }
+          const streamState = (await response.json()) as {
             cycle?: {
               duelId?: string | number | null;
               duelKeyHex?: string | null;
             } | null;
-          }>(request, "/api/streaming/state");
+          };
           return {
             duelKey: streamState.cycle?.duelKeyHex ?? null,
             duelId:
@@ -4426,6 +7941,110 @@ test.describe("market flows", () => {
         duelKey: duelKeyHex,
         duelId: state.currentDuelId ?? null,
       });
+    const restartRecoveredMs = Date.now() - restartStartedAtMs;
+    await expect
+      .poll(
+        async () => {
+          try {
+            const recovered = await fetchHyperiaAuthorityHealth(
+              request,
+              control,
+            );
+            return {
+              status: "ready",
+              duelId: recovered.duelId ?? null,
+              duelKeyHex: recovered.duelKeyHex ?? null,
+              snapshotDigest: recovered.snapshotDigest ?? null,
+            };
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              error.message === "Hyperia authority health returned HTTP 503"
+            ) {
+              return {
+                status: "temporarily_unavailable",
+                duelId: null,
+                duelKeyHex: null,
+                snapshotDigest: null,
+              };
+            }
+            throw error;
+          }
+        },
+        { timeout: 90_000, intervals: [250, 500, 1_000, 2_000, 5_000] },
+      )
+      .toEqual({
+        status: "ready",
+        duelId,
+        duelKeyHex,
+        snapshotDigest: sourceBefore.snapshotDigest,
+      });
+    const sourceAfter = await fetchHyperiaAuthorityHealth(request, control);
+    expect(sourceAfter).toMatchObject({
+      ready: true,
+      duelId,
+      duelKeyHex,
+      snapshotDigest: sourceBefore.snapshotDigest,
+      outcome: null,
+      cancellationReason: null,
+      competitiveSnapshotPersisted: true,
+      competitiveSnapshotDiagnostic: false,
+    });
+    expect(sourceAfter.sourceEpoch).toEqual(expect.any(Number));
+    expect(sourceAfter.sourceEpoch).not.toBe(sourceBefore.sourceEpoch);
+    const restartedPid = readOwnedProcessId(
+      hyperiaControl.pidFile,
+      "restarted Hyperia supervisor",
+    );
+    expect(restartedPid).not.toBe(initialPid);
+    const restartedProcessCommand = readProcessCommand(restartedPid);
+    expect(restartedProcessCommand).toContain(configuredNodePath ?? "");
+    expect(restartedProcessCommand).toContain("scripts/duel-stack.mjs");
+    expect(restartedProcessCommand.includes("--reuse-game-builds")).toBe(
+      reuseGameBuilds,
+    );
+
+    let rendererRestartEvidence: Record<string, unknown> | null = null;
+    if (E2E_HYPERIA_RUNTIME === "full_3d") {
+      await expect
+        .poll(
+          () => {
+            const renderer = readHyperiaRendererStatus(control);
+            return {
+              source: renderer?.source ?? null,
+              updatedAfterRestart:
+                (renderer?.updatedAt ?? 0) >= restartStartedAtMs,
+              ready: renderer?.rendererHealth?.ready ?? false,
+              degradedReason:
+                renderer?.rendererHealth &&
+                "degradedReason" in renderer.rendererHealth
+                  ? renderer.rendererHealth.degradedReason
+                  : "missing",
+            };
+          },
+          { timeout: 60_000, intervals: [250, 500, 1_000, 2_000] },
+        )
+        .toEqual({
+          source: "external-rtmp-bridge",
+          updatedAfterRestart: true,
+          ready: true,
+          degradedReason: null,
+        });
+      const renderer = readHyperiaRendererStatus(control);
+      rendererRestartEvidence = {
+        source: renderer?.source ?? null,
+        updatedAt: renderer?.updatedAt ?? null,
+        phase: renderer?.rendererHealth?.phase ?? null,
+        sceneCycleId:
+          renderer?.rendererHealth?.diagnostics?.sceneReadiness?.cycleId ??
+          null,
+        equipmentAttachmentMismatchCount:
+          renderer?.rendererHealth?.diagnostics?.sceneReadiness
+            ?.equipmentAttachmentMismatchCount ?? null,
+        ffmpegRunning: renderer?.stats?.ffmpegRunning ?? false,
+        audioHealthy: renderer?.stats?.audioHealthy ?? false,
+      };
+    }
 
     await expect
       .poll(
@@ -4449,7 +8068,7 @@ test.describe("market flows", () => {
       .toEqual({
         duelKey: duelKeyHex,
         marketRef: marketState.toBase58(),
-        lifecycleStatus: "OPEN",
+        lifecycleStatus: expect.stringMatching(/^(OPEN|LOCKED)$/),
       });
 
     await page.reload({ waitUntil: "domcontentloaded" });
@@ -4461,42 +8080,725 @@ test.describe("market flows", () => {
       await expandButton.click();
     }
     await ensureWalletConnected(page);
-    await page.getByTestId("refresh-market").click();
-    await page
-      .getByTestId("prediction-amount-input")
-      .fill(SOLANA_PREDICTION_AMOUNT);
-    await page.getByTestId("prediction-select-yes").click({ force: true });
+    let hlsPlaybackEvidence: Record<string, unknown> | null = null;
+    if (E2E_HYPERIA_RUNTIME === "full_3d") {
+      const video = page.locator("video[data-stream-source]").first();
+      const samplePlayback = () =>
+        video.evaluate((element: HTMLVideoElement) => ({
+          source: element.dataset.streamSource || "",
+          readyState: element.readyState,
+          paused: element.paused,
+          videoWidth: element.videoWidth,
+          videoHeight: element.videoHeight,
+          currentTime: element.currentTime,
+          totalVideoFrames:
+            typeof element.getVideoPlaybackQuality === "function"
+              ? element.getVideoPlaybackQuality().totalVideoFrames
+              : 0,
+        }));
+      await expect
+        .poll(samplePlayback, {
+          timeout: 45_000,
+          intervals: [250, 500, 1_000, 2_000],
+        })
+        .toMatchObject({
+          readyState: expect.any(Number),
+          paused: false,
+          videoWidth: 1280,
+          videoHeight: 720,
+          currentTime: expect.any(Number),
+        });
+      const beforePlayback = await samplePlayback();
+      await page.waitForTimeout(2_500);
+      const afterPlayback = await samplePlayback();
+      expect(beforePlayback.source).toMatch(/\/live\/stream\.m3u8$/);
+      expect(beforePlayback.currentTime).toBeGreaterThan(0);
+      expect(
+        afterPlayback.currentTime - beforePlayback.currentTime,
+      ).toBeGreaterThan(1);
+      expect(afterPlayback.totalVideoFrames).toBeGreaterThan(
+        beforePlayback.totalVideoFrames,
+      );
+      hlsPlaybackEvidence = { before: beforePlayback, after: afterPlayback };
+    }
+    const fundedBalanceAfterRestart =
+      (await clobProgram.account.userBalance.fetch(
+        userBalanceAddress,
+      )) as UserBalanceAccount;
+    expect({
+      aShares: bnLikeToBigInt(fundedBalanceAfterRestart.aShares),
+      bShares: bnLikeToBigInt(fundedBalanceAfterRestart.bShares),
+      aLockedLamports: bnLikeToBigInt(
+        fundedBalanceAfterRestart.aLockedLamports,
+      ),
+      bLockedLamports: bnLikeToBigInt(
+        fundedBalanceAfterRestart.bLockedLamports,
+      ),
+    }).toEqual({
+      aShares: 50_000_000n,
+      bShares: 50_000_000n,
+      aLockedLamports: 25_000_000n,
+      bLockedLamports: 25_000_000n,
+    });
+    expect(runtimeErrors).toEqual([]);
 
-    const beforeBalance = (await clobProgram.account.userBalance.fetchNullable(
-      userBalanceAddress,
-    )) as UserBalanceAccount | null;
-    const beforeYes = bnLikeToBigInt(beforeBalance?.aShares);
+    let terminal: HyperiaStreamingState | null = null;
+    const terminalDeadline = Date.now() + 360_000;
+    while (Date.now() < terminalDeadline) {
+      const current = await fetchHyperiaStreamingState(request, control);
+      const cycle = current.cycle;
+      if (
+        cycle?.duelId !== duelId ||
+        cycle.duelKeyHex !== duelKeyHex ||
+        cycle.competitiveSnapshotDigest !== sourceBefore.snapshotDigest
+      ) {
+        throw new Error(
+          `public stream identity drifted after authority restart: ${JSON.stringify(cycle)}`,
+        );
+      }
+      if (cycle.phase === "RESOLUTION") {
+        terminal = current;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (!terminal?.cycle) {
+      throw new Error("recovered Hyperia duel did not reach RESOLUTION");
+    }
+    const terminalCycle = terminal.cycle;
+    const winnerSide =
+      terminalCycle.winnerId === terminalCycle.agent1?.id
+        ? "a"
+        : terminalCycle.winnerId === terminalCycle.agent2?.id
+          ? "b"
+          : null;
+    if (winnerSide === null) {
+      throw new Error("recovered Hyperia terminal winner is not a contestant");
+    }
+    expect({
+      outcome: terminalCycle.outcome,
+      winnerSide,
+      replayHash: terminalCycle.replayHash,
+    }).toEqual({
+      outcome: "win",
+      winnerSide: expect.stringMatching(/^(a|b)$/),
+      replayHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
 
-    const resumedSubmitButton = page.getByTestId("prediction-submit");
-    await expect(resumedSubmitButton).toBeEnabled({ timeout: 30_000 });
-    await resumedSubmitButton.click({ force: true });
-    await confirmSolanaOrder(page);
+    await expect
+      .poll(
+        async () => {
+          const fixtures = await listSolanaTraderFixtures(connection, state);
+          const fixture =
+            fixtures.find((entry) => entry.marketState.equals(marketState)) ??
+            null;
+          return `${fixture?.duelStatus ?? "missing"}:${fixture?.marketStatus ?? "missing"}:${fixture?.marketWinner ?? "missing"}`;
+        },
+        { timeout: 150_000, intervals: [1_000, 2_000, 5_000] },
+      )
+      .toBe(`resolved:resolved:${winnerSide}`);
 
+    const resolvedMarket = (await clobProgram.account.marketState.fetch(
+      marketState,
+    )) as MarketStateAccount & {
+      status?: unknown;
+      winningsMarketMakerFeeBpsSnapshot?: unknown;
+    };
+    expect(enumName(resolvedMarket.status)).toBe("resolved");
+    const winningShares =
+      winnerSide === "a"
+        ? bnLikeToBigInt(fundedBalanceAfterRestart.aShares)
+        : bnLikeToBigInt(fundedBalanceAfterRestart.bShares);
+    const winningsFeeBps = bnLikeToBigInt(
+      resolvedMarket.winningsMarketMakerFeeBpsSnapshot,
+    );
+    const expectedPayoutLamports =
+      winningShares - (winningShares * winningsFeeBps) / 10_000n;
+    const userBalanceRentLamports = BigInt(
+      await connection.getBalance(userBalanceAddress, "confirmed"),
+    );
+    const beforeClaimWalletLamports = BigInt(
+      await connection.getBalance(trader, "confirmed"),
+    );
+
+    await gotoApp(page, {
+      e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
+      e2eSolanaMarketRef: marketState.toBase58(),
+      debug: false,
+    });
+    await selectChain(page, "solana");
+    await ensureWalletConnected(page);
+    await expect(
+      page.getByTestId("solana-clob-settlement-action"),
+    ).toContainText("Claim winnings", { timeout: 60_000 });
+    const claimButton = page
+      .getByRole("button", { name: /claim winnings/i })
+      .first();
+    await expect(claimButton).toBeEnabled({ timeout: 30_000 });
+    await claimButton.click();
+    const claimSignature = await expectSolanaSettlementReceipt(
+      page,
+      /claim confirmed on-chain/i,
+    );
+    const [claimWalletDelta, claimTransactionFee] = await Promise.all([
+      getWalletLamportDeltaFromSignature(connection, claimSignature, trader),
+      getTransactionFeeFromSignature(connection, claimSignature),
+    ]);
+    expect(claimWalletDelta).not.toBeNull();
+    expect(claimTransactionFee).not.toBeNull();
+    expect((claimWalletDelta ?? 0n) + (claimTransactionFee ?? 0n)).toBe(
+      expectedPayoutLamports + userBalanceRentLamports,
+    );
     await expect
       .poll(
         async () => {
           const balance = (await clobProgram.account.userBalance.fetchNullable(
             userBalanceAddress,
           )) as UserBalanceAccount | null;
-          return Number(bnLikeToBigInt(balance?.aShares) - beforeYes);
+          return `${bnLikeToBigInt(balance?.aShares)}:${bnLikeToBigInt(balance?.bShares)}`;
         },
-        {
-          timeout: 120_000,
-          intervals: [1_000, 2_000, 5_000],
-        },
+        { timeout: 60_000, intervals: [500, 1_000, 2_000, 5_000] },
       )
-      .toBeGreaterThan(0);
+      .toBe("0:0");
+    const afterClaimWalletLamports = BigInt(
+      await connection.getBalance(trader, "confirmed"),
+    );
+    expect(afterClaimWalletLamports).toBeGreaterThan(beforeClaimWalletLamports);
+
+    let postTerminalHlsPlayback: Record<string, unknown> | null = null;
+    if (E2E_HYPERIA_RUNTIME === "full_3d") {
+      const video = page.locator("video[data-stream-source]").first();
+      const samplePlayback = () =>
+        video.evaluate((element: HTMLVideoElement) => ({
+          source: element.dataset.streamSource || "",
+          readyState: element.readyState,
+          paused: element.paused,
+          videoWidth: element.videoWidth,
+          videoHeight: element.videoHeight,
+          currentTime: element.currentTime,
+          totalVideoFrames:
+            typeof element.getVideoPlaybackQuality === "function"
+              ? element.getVideoPlaybackQuality().totalVideoFrames
+              : 0,
+        }));
+      await expect
+        .poll(samplePlayback, {
+          timeout: 45_000,
+          intervals: [250, 500, 1_000, 2_000],
+        })
+        .toMatchObject({
+          paused: false,
+          videoWidth: 1280,
+          videoHeight: 720,
+        });
+      const before = await samplePlayback();
+      await page.waitForTimeout(2_500);
+      const after = await samplePlayback();
+      expect(before.source).toMatch(/\/live\/stream\.m3u8$/);
+      expect(after.currentTime - before.currentTime).toBeGreaterThan(1);
+      expect(after.totalVideoFrames).toBeGreaterThan(before.totalVideoFrames);
+      postTerminalHlsPlayback = { before, after };
+    }
+    expect(runtimeErrors).toEqual([]);
+
+    const evidence = {
+      schemaVersion: 1,
+      duelId,
+      duelKeyHex,
+      duelState: duelState.toBase58(),
+      marketState: marketState.toBase58(),
+      userBalance: userBalanceAddress.toBase58(),
+      controlSha256,
+      configuredNodePath,
+      launchPathFirstEntry: launchPathEntries[0],
+      resolvedLaunchNodePath,
+      reuseGameBuilds,
+      sourceBefore,
+      sourceAfter,
+      restartStartedAtMs,
+      restartRecoveredMs,
+      initialPid,
+      restartedPid,
+      initialProcessCommand,
+      restartedProcessCommand,
+      sameDuelRecovered: true,
+      sameMarketRecovered: true,
+      sourceEpochChanged: true,
+      rendererRestartEvidence,
+      hlsPlaybackEvidence,
+      browserOrders,
+      fundedBalance: {
+        aShares: bnLikeToBigInt(fundedBalanceAfterRestart.aShares).toString(),
+        bShares: bnLikeToBigInt(fundedBalanceAfterRestart.bShares).toString(),
+        aLockedLamports: bnLikeToBigInt(
+          fundedBalanceAfterRestart.aLockedLamports,
+        ).toString(),
+        bLockedLamports: bnLikeToBigInt(
+          fundedBalanceAfterRestart.bLockedLamports,
+        ).toString(),
+      },
+      marketStatusBeforeRestart: enumName(exactMarketBeforeRestart.status),
+      terminalSettlement: {
+        outcome: terminalCycle.outcome,
+        winnerId: terminalCycle.winnerId,
+        winnerSide,
+        winReason: terminalCycle.winReason,
+        replayHash: terminalCycle.replayHash,
+        marketStatus: enumName(resolvedMarket.status),
+        claimSignature,
+        claimWalletDelta: claimWalletDelta?.toString() ?? null,
+        claimTransactionFee: claimTransactionFee?.toString() ?? null,
+        expectedPayoutLamports: expectedPayoutLamports.toString(),
+        userBalanceRentLamports: userBalanceRentLamports.toString(),
+        beforeClaimWalletLamports: beforeClaimWalletLamports.toString(),
+        afterClaimWalletLamports: afterClaimWalletLamports.toString(),
+      },
+      postTerminalHlsPlayback,
+      runtimeErrors,
+    };
+    const evidencePath = testInfo.outputPath(
+      "solana-full3d-hyperia-restart-recovery.json",
+    );
+    const screenshotPath = testInfo.outputPath(
+      "solana-full3d-hyperia-restart-recovery.png",
+    );
+    fs.writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    fs.writeFileSync(
+      screenshotPath,
+      await page.screenshot({ animations: "disabled", fullPage: true }),
+      { flag: "wx", mode: 0o600 },
+    );
+    await testInfo.attach("solana-full3d-hyperia-restart-recovery", {
+      path: evidencePath,
+      contentType: "application/json",
+    });
+    await testInfo.attach("solana-full3d-hyperia-restart-recovery-screenshot", {
+      path: screenshotPath,
+      contentType: "image/png",
+    });
+  });
+
+  test("graceful Hyperia shutdown cancels the exact active SOL market and refunds lamports", async ({
+    page,
+    request,
+  }, testInfo) => {
+    test.skip(
+      E2E_DUEL_SOURCE !== "real_hyperia",
+      "graceful Hyperia shutdown requires the persisted real-duel source",
+    );
+    test.setTimeout(360_000);
+
+    const runtimeErrors: string[] = [];
+    page.on("pageerror", (error) => runtimeErrors.push(error.message));
+
+    const state = loadState();
+    const control = loadControl();
+    const connection = createConfirmedConnection(
+      state.solanaRpcUrl || "http://127.0.0.1:8899",
+      state.solanaWsUrl,
+    );
+    const trader = new PublicKey(state.solanaTraderPublicKey || "");
+    const clobProgram = createReadonlyClobProgram(connection, state);
+    const {
+      authority,
+      fightProgram,
+      clobProgram: writableClobProgram,
+    } = await createWritablePrograms(connection, state);
+    const { duelKeyHex, duelId, duelState, marketState } =
+      await createFreshSolanaOpenMarket(
+        request,
+        state,
+        authority,
+        fightProgram,
+        writableClobProgram,
+        "gate10-solana-graceful-shutdown",
+      );
+    const userBalanceAddress = deriveUserBalancePda(
+      clobProgram.programId,
+      marketState,
+      trader,
+    );
+
+    await gotoApp(page, {
+      e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
+      e2eSolanaMarketRef: marketState.toBase58(),
+    });
+    await selectChain(page, "solana");
+    const expandButton = page.locator('button[title="Expand panel"]').first();
+    if (await expandButton.isVisible().catch(() => false)) {
+      await expandButton.click();
+    }
+    await ensureWalletConnected(page);
+    await seedClobLiquidity(connection, state, SIDE_ASK, {
+      marketState,
+      duelState,
+    });
+    await page.getByTestId("refresh-market").click();
+    const clobPanel = page.getByTestId("solana-clob-panel").first();
+    await openSolanaBuyOrderEntry(page, clobPanel);
+    await clobPanel
+      .getByTestId("prediction-amount-input")
+      .fill(SOLANA_PREDICTION_AMOUNT);
+    await selectSolanaPredictionSide(clobPanel, "yes");
+    const buyYesButton = clobPanel
+      .getByRole("button", { name: /buy yes/i })
+      .first();
+    await expect(buyYesButton).toBeEnabled({ timeout: 30_000 });
+    await buyYesButton.click();
+    await confirmSolanaOrder(page);
+
+    await expect
+      .poll(
+        async () => {
+          const status = await readText(page, "solana-clob-status");
+          if (/Order failed:/i.test(status)) throw new Error(status);
+          const balance = (await clobProgram.account.userBalance.fetchNullable(
+            userBalanceAddress,
+          )) as UserBalanceAccount | null;
+          return `${bnLikeToBigInt(balance?.aShares)}:${bnLikeToBigInt(balance?.aLockedLamports)}`;
+        },
+        { timeout: 120_000, intervals: [1_000, 2_000, 5_000] },
+      )
+      .toBe("50000000:25000000");
+
+    const refundableBalance = (await clobProgram.account.userBalance.fetch(
+      userBalanceAddress,
+    )) as UserBalanceAccount;
+    const expectedRefundLamports =
+      bnLikeToBigInt(refundableBalance.aLockedLamports) +
+      bnLikeToBigInt(refundableBalance.bLockedLamports) +
+      bnLikeToBigInt(refundableBalance.tradeTreasuryFeeLamports) +
+      bnLikeToBigInt(refundableBalance.tradeMarketMakerFeeLamports);
+    expect(expectedRefundLamports).toBeGreaterThan(25_000_000n);
+    const userBalanceRentLamports = BigInt(
+      await connection.getBalance(userBalanceAddress, "confirmed"),
+    );
+    expect(userBalanceRentLamports).toBeGreaterThan(0n);
+
+    const sourceBefore = await fetchHyperiaAuthorityHealth(request, control);
+    expect(sourceBefore).toMatchObject({
+      ready: true,
+      duelId,
+      duelKeyHex,
+      outcome: null,
+      cancellationReason: null,
+      competitiveSnapshotPersisted: true,
+      competitiveSnapshotDiagnostic: false,
+    });
+    expect(sourceBefore.sourceEpoch).toEqual(expect.any(Number));
+    expect(sourceBefore.snapshotDigest).toEqual(expect.any(String));
+
+    const root = page.locator(".hm-root").first();
+    await expect(root).toHaveAttribute("data-market-can-place-bet", "true", {
+      timeout: 30_000,
+    });
+    await root.evaluate((element) => {
+      const history = [
+        {
+          observedAtMs: Date.now(),
+          value: element.dataset.marketCanPlaceBet ?? null,
+        },
+      ];
+      const observer = new MutationObserver(() => {
+        const value = element.dataset.marketCanPlaceBet ?? null;
+        if (history.at(-1)?.value !== value) {
+          history.push({ observedAtMs: Date.now(), value });
+        }
+      });
+      observer.observe(element, {
+        attributeFilter: ["data-market-can-place-bet"],
+        attributes: true,
+      });
+      (
+        window as typeof window & {
+          __hyperbetShutdownTradeGateAudit?: {
+            disconnect: () => void;
+            history: typeof history;
+          };
+        }
+      ).__hyperbetShutdownTradeGateAudit = {
+        disconnect: () => observer.disconnect(),
+        history,
+      };
+    });
+
+    const shutdownStartedAtMs = Date.now();
+    runProcessControl(control, "stop", "hyperia");
+    await expect
+      .poll(() => currentHyperiaAuthorityEpoch(control), {
+        timeout: 10_000,
+        intervals: [100, 250, 500],
+      })
+      .toBeNull();
+    const shutdownEvidence = readHyperiaShutdownEvidence(control);
+    expect(shutdownEvidence).toEqual({
+      event: "shutdown-complete",
+      sourceEpoch: sourceBefore.sourceEpoch,
+      terminalFrameSeq: expect.any(Number),
+      duelId,
+      duelKeyHex,
+      competitiveSnapshotDigest: sourceBefore.snapshotDigest,
+      outcome: "cancelled",
+      cancellationReason: "scheduler_shutdown",
+      downstreamAcknowledged: true,
+    });
+    expect(shutdownEvidence.terminalFrameSeq).toBeGreaterThan(0);
+
+    await expect(root).toHaveAttribute("data-market-can-place-bet", "false", {
+      timeout: 30_000,
+    });
+    const tradeGateHistory = await page.evaluate(() => {
+      const audit = (
+        window as typeof window & {
+          __hyperbetShutdownTradeGateAudit?: {
+            disconnect: () => void;
+            history: Array<{
+              observedAtMs: number;
+              value: string | null;
+            }>;
+          };
+        }
+      ).__hyperbetShutdownTradeGateAudit;
+      if (!audit) throw new Error("shutdown trade-gate audit is missing");
+      audit.disconnect();
+      return audit.history;
+    });
+    expect(tradeGateHistory[0]?.value).toBe("true");
+    const firstFailClosedObservation = tradeGateHistory.find(
+      (entry) => entry.value === "false",
+    );
+    expect(firstFailClosedObservation).toBeDefined();
+    const browserFailClosedMs =
+      (firstFailClosedObservation?.observedAtMs ?? Number.POSITIVE_INFINITY) -
+      shutdownStartedAtMs;
+    expect(browserFailClosedMs).toBeLessThanOrEqual(10_000);
+
+    await expect
+      .poll(
+        async () => {
+          const [exactDuel, exactMarket] = await Promise.all([
+            fightProgram.account.duelState.fetch(duelState),
+            clobProgram.account.marketState.fetch(marketState),
+          ]);
+          return {
+            duelStatus: enumName(
+              (exactDuel as DuelStateAccountSnapshot).status,
+            ),
+            duelWinner: enumName(
+              (exactDuel as DuelStateAccountSnapshot).winner,
+            ),
+            marketStatus: enumName(
+              (exactMarket as MarketStateAccount & { status?: unknown }).status,
+            ),
+            marketWinner: enumName(
+              (exactMarket as MarketStateAccount & { winner?: unknown }).winner,
+            ),
+          };
+        },
+        { timeout: 120_000, intervals: [500, 1_000, 2_000, 5_000] },
+      )
+      .toEqual({
+        duelStatus: "cancelled",
+        duelWinner: "none",
+        marketStatus: "cancelled",
+        marketWinner: "none",
+      });
+    const shutdownToCancellationMs = Date.now() - shutdownStartedAtMs;
+    expect(await currentHyperiaAuthorityEpoch(control)).toBeNull();
+
+    const cancelledDuel = (await fightProgram.account.duelState.fetch(
+      duelState,
+    )) as DuelStateAccountSnapshot;
+    expect(
+      parseDuelCancellationMetadata(String(cancelledDuel.metadataUri)),
+    ).toEqual({
+      duelId,
+      duelKeyHex,
+      outcome: "cancelled",
+      reason: "scheduler_shutdown",
+    });
+    await expect
+      .poll(
+        async () => {
+          const payload = await fetchBotHealth(request);
+          const market = payload.health?.markets.find(
+            (entry) => entry.marketRef === marketState.toBase58(),
+          );
+          return {
+            running: payload.running,
+            lifecycleStatus: market?.lifecycleStatus ?? null,
+            activeRecovery:
+              payload.health?.recovery
+                .filter((entry) => entry.active)
+                .map((entry) => entry.code)
+                .sort() ?? [],
+          };
+        },
+        { timeout: 120_000, intervals: [1_000, 2_000, 5_000] },
+      )
+      .toEqual({
+        running: EXPECT_KEEPER_BOT,
+        lifecycleStatus: "CANCELLED",
+        activeRecovery: [],
+      });
+
+    const settlementPath = `/api/arena/settlements/${encodeURIComponent(
+      trader.toBase58(),
+    )}?limit=100&offset=0`;
+    const readExactSettlement = async () => {
+      const settlement = await fetchJson<{
+        ledger?: { current?: boolean };
+        entries?: Array<{
+          duelId?: string;
+          marketPda?: string;
+          marketStatus?: string;
+          settlementState?: string;
+          claimSignature?: string | null;
+        }>;
+      }>(request, settlementPath);
+      const exactEntry = settlement.entries?.find(
+        (entry) =>
+          entry.duelId === duelId && entry.marketPda === marketState.toBase58(),
+      );
+      return {
+        ledgerCurrent: settlement.ledger?.current ?? false,
+        marketStatus: exactEntry?.marketStatus ?? null,
+        settlementState: exactEntry?.settlementState ?? null,
+        claimSignature: exactEntry?.claimSignature ?? null,
+      };
+    };
+    await expect
+      .poll(readExactSettlement, {
+        timeout: 60_000,
+        intervals: [500, 1_000, 2_000, 5_000],
+      })
+      .toEqual({
+        ledgerCurrent: true,
+        marketStatus: "cancelled",
+        settlementState: "REFUND_CLAIMABLE",
+        claimSignature: null,
+      });
+    const shutdownToSettlementReconciliationMs =
+      Date.now() - shutdownStartedAtMs;
+
+    await gotoApp(page);
+    await selectChain(page, "solana");
+    await ensureWalletConnected(page);
+    const postShutdownExpandButton = page
+      .locator('button[title="Expand panel"]')
+      .first();
+    if (await postShutdownExpandButton.isVisible().catch(() => false)) {
+      await postShutdownExpandButton.click();
+    }
+    const priorDuelActivity = settlementEntriesForDuel(page, duelId).first();
+    await page.getByTestId("solana-settlement-refresh").click();
+    await expect(priorDuelActivity).toContainText("Refund ready to claim", {
+      timeout: 15_000,
+    });
+    const shutdownToVisibleRefundMs = Date.now() - shutdownStartedAtMs;
+    const claimButton = priorDuelActivity.getByRole("button", {
+      name: /claim refund/i,
+    });
+    await expect(claimButton).toBeEnabled({ timeout: 30_000 });
+    const claimStartedAtMs = Date.now();
+    await claimButton.click();
+    const claimSignature = await expectSolanaSettlementReceipt(
+      page,
+      /refund confirmed on-chain/i,
+    );
+    const claimConfirmationMs = Date.now() - claimStartedAtMs;
+    const [walletDelta, transactionFee] = await Promise.all([
+      getWalletLamportDeltaFromSignature(connection, claimSignature, trader),
+      getTransactionFeeFromSignature(connection, claimSignature),
+    ]);
+    expect(walletDelta).not.toBeNull();
+    expect(transactionFee).not.toBeNull();
+    expect((walletDelta ?? 0n) + (transactionFee ?? 0n)).toBe(
+      expectedRefundLamports + userBalanceRentLamports,
+    );
+    expect(
+      await clobProgram.account.userBalance.fetchNullable(userBalanceAddress),
+    ).toBeNull();
+    await expect
+      .poll(readExactSettlement, {
+        timeout: 60_000,
+        intervals: [500, 1_000, 2_000, 5_000],
+      })
+      .toEqual({
+        ledgerCurrent: true,
+        marketStatus: "cancelled",
+        settlementState: "REFUNDED",
+        claimSignature,
+      });
+    const claimToSettlementReconciliationMs = Date.now() - claimStartedAtMs;
+    await page.getByTestId("solana-settlement-refresh").click();
+    await expect(priorDuelActivity).toContainText("Refund paid", {
+      timeout: 15_000,
+    });
+    await expect(claimButton).toBeHidden();
+    const claimToVisiblePaidMs = Date.now() - claimStartedAtMs;
+    expect(runtimeErrors).toEqual([]);
+
+    const evidence = {
+      schemaVersion: 2,
+      duelId,
+      duelKeyHex,
+      duelState: duelState.toBase58(),
+      marketState: marketState.toBase58(),
+      sourceBefore,
+      shutdownEvidence,
+      shutdownStartedAtMs,
+      browserFailClosedMs,
+      tradeGateHistory,
+      shutdownToCancellationMs,
+      shutdownToSettlementReconciliationMs,
+      shutdownToVisibleRefundMs,
+      sourceRemainedStoppedThroughCancellation: true,
+      expectedRefundLamports: expectedRefundLamports.toString(),
+      userBalanceRentLamports: userBalanceRentLamports.toString(),
+      claimSignature,
+      claimConfirmationMs,
+      claimToSettlementReconciliationMs,
+      claimToVisiblePaidMs,
+      walletDelta: walletDelta?.toString() ?? null,
+      transactionFee: transactionFee?.toString() ?? null,
+      userBalanceClosed: true,
+      runtimeErrors,
+    };
+    const evidencePath = testInfo.outputPath(
+      "solana-graceful-shutdown-refund.json",
+    );
+    const screenshotPath = testInfo.outputPath(
+      "solana-graceful-shutdown-refund.png",
+    );
+    fs.writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    fs.writeFileSync(
+      screenshotPath,
+      await page.screenshot({ animations: "disabled", fullPage: true }),
+      { flag: "wx", mode: 0o600 },
+    );
+    await testInfo.attach("solana-graceful-shutdown-refund", {
+      path: evidencePath,
+      contentType: "application/json",
+    });
+    await testInfo.attach("solana-graceful-shutdown-refund-screenshot", {
+      path: screenshotPath,
+      contentType: "image/png",
+    });
   });
 
   test("exact Hyperia recovery-window cancellation drives keeper refund and clears claim state", async ({
     page,
     request,
-  }) => {
+  }, testInfo) => {
     test.skip(
       E2E_DUEL_SOURCE === "real_hyperia",
       "cancel/refund remains a synthetic Solana browser lane for now",
@@ -4562,6 +8864,7 @@ test.describe("market flows", () => {
 
     await gotoApp(page, {
       e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
       e2eSolanaMarketRef: marketState.toBase58(),
     });
     await selectChain(page, "solana");
@@ -4577,11 +8880,11 @@ test.describe("market flows", () => {
     });
     await page.getByTestId("refresh-market").click();
     const clobPanel = page.getByTestId("solana-clob-panel").first();
-    await clobPanel.getByTestId("prediction-tab-buy").click({ force: true });
+    await openSolanaBuyOrderEntry(page, clobPanel);
     await clobPanel
       .getByTestId("prediction-amount-input")
       .fill(SOLANA_PREDICTION_AMOUNT);
-    await clobPanel.getByTestId("prediction-select-yes").click({ force: true });
+    await selectSolanaPredictionSide(clobPanel, "yes");
     const submitButton = clobPanel
       .getByRole("button", { name: /buy yes/i })
       .first();
@@ -4589,7 +8892,7 @@ test.describe("market flows", () => {
       timeout: 30_000,
     });
     await expect(submitButton).toBeEnabled({ timeout: 30_000 });
-    await submitButton.click({ force: true });
+    await submitButton.click();
     await confirmSolanaOrder(page);
 
     const yesStatus = await page
@@ -4620,8 +8923,15 @@ test.describe("market flows", () => {
       .toBeGreaterThan(0);
 
     await page.getByTestId("refresh-market").click();
-    await clobPanel.getByTestId("prediction-tab-buy").click({ force: true });
-    await clobPanel.getByTestId("prediction-select-no").click({ force: true });
+    await expect(page.locator(".hm-root")).toHaveAttribute(
+      "data-market-can-place-bet",
+      "true",
+      { timeout: 120_000 },
+    );
+    const terminalBuyTab = clobPanel.getByTestId("prediction-tab-buy");
+    await expect(terminalBuyTab).toBeVisible({ timeout: 120_000 });
+    await terminalBuyTab.click();
+    await selectSolanaPredictionSide(clobPanel, "no");
     const terminalNoPriceInput = clobPanel.getByTestId(
       "solana-clob-price-input",
     );
@@ -4644,7 +8954,7 @@ test.describe("market flows", () => {
       .getByRole("button", { name: /buy no/i })
       .first();
     await expect(terminalNoSubmitButton).toBeEnabled({ timeout: 30_000 });
-    await terminalNoSubmitButton.click({ force: true });
+    await terminalNoSubmitButton.click();
     await confirmSolanaOrder(page);
 
     await expect
@@ -4761,6 +9071,63 @@ test.describe("market flows", () => {
     expect(enumName(cancelledMarket.status)).toBe("cancelled");
     expect(enumName(cancelledMarket.winner)).toBe("none");
 
+    await gotoApp(page, {
+      e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
+      e2eSolanaMarketRef: marketState.toBase58(),
+      debug: false,
+    });
+    await selectChain(page, "solana");
+    await ensureWalletConnected(page);
+    const publicCancellationLog = page.getByTestId("duels-bottom-panel-news");
+    await expect(publicCancellationLog).toContainText(
+      "The round was cancelled. No winner was declared.",
+      { timeout: 60_000 },
+    );
+    await expect(page.getByTestId("spectator-terminal-outcome")).toContainText(
+      "No contest — no winner was declared.",
+    );
+    await expect(
+      page.getByTestId("solana-clob-settlement-action"),
+    ).toContainText("Claim refund", { timeout: 60_000 });
+    await testInfo.attach("solana-cancelled-public-desktop", {
+      body: await page.screenshot({ animations: "disabled" }),
+      contentType: "image/png",
+    });
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.getByTestId("mobile-watch-summary")).toContainText(
+      "CANCELLED",
+    );
+    expect(
+      await page.evaluate(() => ({
+        clientWidth: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+      })),
+    ).toEqual({ clientWidth: 390, scrollWidth: 390 });
+    const refundReviewButton = page.locator(".hm-bet-fab");
+    await expect(refundReviewButton).toBeVisible();
+    expect(
+      await refundReviewButton.evaluate(
+        (element) => element.getBoundingClientRect().height,
+      ),
+    ).toBeGreaterThanOrEqual(44);
+    await refundReviewButton.click();
+    const mobileCancellationSheet = page.getByRole("dialog", {
+      name: /trading controls/i,
+    });
+    await expect(mobileCancellationSheet).toBeVisible();
+    await expect(mobileCancellationSheet).toContainText("CANCELLED");
+    await expect(mobileCancellationSheet).toContainText("Claim refund");
+    await testInfo.attach("solana-cancelled-public-mobile", {
+      body: await page.screenshot({ animations: "disabled" }),
+      contentType: "image/png",
+    });
+    await page.keyboard.press("Escape");
+    await expect(mobileCancellationSheet).toHaveCount(0);
+    await expect(refundReviewButton).toBeFocused();
+    await page.setViewportSize({ width: 1280, height: 720 });
+
     await expect
       .poll(
         async () => {
@@ -4810,7 +9177,9 @@ test.describe("market flows", () => {
     );
     await gotoApp(page, {
       e2eSolanaDuelKey: rolloverMarket.duelKeyHex,
+      e2eSolanaDuelId: rolloverMarket.duelId,
       e2eSolanaMarketRef: rolloverMarket.marketState.toBase58(),
+      debug: false,
     });
     await selectChain(page, "solana");
     const rolloverExpandButton = page
@@ -4820,9 +9189,25 @@ test.describe("market flows", () => {
       await rolloverExpandButton.click();
     }
     await ensureWalletConnected(page);
-    const terminalOrderHistory = page
-      .getByTestId("solana-settlement-entry")
-      .filter({ hasText: duelId })
+    const rolloverRoot = page.locator(".hm-root").first();
+    await expect(rolloverRoot).toHaveAttribute(
+      "data-stream-duel-id",
+      rolloverMarket.duelId,
+      { timeout: 60_000 },
+    );
+    await expect(rolloverRoot).toHaveAttribute(
+      "data-market-duel-id",
+      rolloverMarket.duelId,
+    );
+    await expect(rolloverRoot).toHaveAttribute(
+      "data-market-can-place-bet",
+      "true",
+    );
+    await expect(page.getByTestId("spectator-terminal-outcome")).toHaveCount(0);
+    await expect(
+      page.getByText("Upcoming Match", { exact: true }).first(),
+    ).toBeVisible();
+    const terminalOrderHistory = settlementEntriesForDuel(page, duelId)
       .filter({ hasText: `Order #${terminalOrderId.toString()}` })
       .first();
     await expect(terminalOrderHistory).toContainText("Reclaim required", {
@@ -4837,6 +9222,7 @@ test.describe("market flows", () => {
       rentText: `${formatSolLamports(reclaimedOrderRentLamports, 9)} SOL`,
       grossCreditText: `${formatSolLamports(expectedReclaimWalletCreditLamports, 9)} SOL`,
       historyEntry: terminalOrderHistory,
+      auditDismissal: true,
     });
     await expect
       .poll(
@@ -4923,9 +9309,7 @@ test.describe("market flows", () => {
       await connection.getBalance(userBalanceAddress, "confirmed"),
     );
     expect(reclaimedUserBalanceRentLamports).toBeGreaterThan(0n);
-    const matchedRefundHistory = page
-      .getByTestId("solana-settlement-entry")
-      .filter({ hasText: duelId })
+    const matchedRefundHistory = settlementEntriesForDuel(page, duelId)
       .filter({ hasText: "Refund ready to claim" })
       .first();
     await expect(matchedRefundHistory).toBeVisible({ timeout: 30_000 });
@@ -4933,7 +9317,7 @@ test.describe("market flows", () => {
       name: /claim refund/i,
     });
     await expect(claimButton).toBeEnabled({ timeout: 30_000 });
-    await claimButton.click({ force: true });
+    await claimButton.click();
     const claimSignature = await expectSolanaSettlementReceipt(
       page,
       /refund confirmed on-chain/i,
@@ -5017,6 +9401,10 @@ test.describe("market flows", () => {
       fightProgram,
       writableClobProgram,
       "gate10-solana-draw-refund",
+      {
+        betCloseOffsetSeconds: 120,
+        duelStartOffsetSeconds: 120,
+      },
     );
     const userBalanceAddress = deriveUserBalancePda(
       clobProgram.programId,
@@ -5064,16 +9452,16 @@ test.describe("market flows", () => {
       duelState,
     });
     await page.getByTestId("refresh-market").click();
-    await clobPanel.getByTestId("prediction-tab-buy").click({ force: true });
+    await openSolanaBuyOrderEntry(page, clobPanel);
     await clobPanel
       .getByTestId("prediction-amount-input")
       .fill(SOLANA_PREDICTION_AMOUNT);
-    await clobPanel.getByTestId("prediction-select-yes").click({ force: true });
+    await selectSolanaPredictionSide(clobPanel, "yes");
     const buyYesButton = clobPanel
       .getByRole("button", { name: /buy yes/i })
       .first();
     await expect(buyYesButton).toBeEnabled({ timeout: 30_000 });
-    await buyYesButton.click({ force: true });
+    await buyYesButton.click();
     await confirmSolanaOrder(page);
 
     await expect
@@ -5095,8 +9483,8 @@ test.describe("market flows", () => {
       duelState,
     });
     await page.getByTestId("refresh-market").click();
-    await clobPanel.getByTestId("prediction-tab-buy").click({ force: true });
-    await clobPanel.getByTestId("prediction-select-no").click({ force: true });
+    await openSolanaBuyOrderEntry(page, clobPanel);
+    await selectSolanaPredictionSide(clobPanel, "no");
     const noPriceInput = clobPanel.getByTestId("solana-clob-price-input");
     if (await noPriceInput.isVisible().catch(() => false)) {
       await noPriceInput.fill(String(ORDER_PRICE));
@@ -5105,7 +9493,7 @@ test.describe("market flows", () => {
       .getByRole("button", { name: /buy no/i })
       .first();
     await expect(buyNoButton).toBeEnabled({ timeout: 30_000 });
-    await buyNoButton.click({ force: true });
+    await buyNoButton.click();
     await confirmSolanaOrder(page);
 
     await expect
@@ -5150,6 +9538,38 @@ test.describe("market flows", () => {
     );
     expect(userBalanceRentLamports).toBeGreaterThan(0n);
 
+    const drawCommitment = buildSyntheticDuelCommitment({
+      cycleId: `gate10-solana-${duelId}`,
+      duelId,
+      duelKeyHex,
+      betOpenTs,
+      betCloseTs,
+      duelStartTs,
+      agent1: E2E_SOLANA_AGENT_A,
+      agent2: E2E_SOLANA_AGENT_B,
+    });
+    const drawTiming = drawCommitment.competitiveSnapshot.timing;
+    if (!drawTiming) {
+      throw new Error("schema-v4 draw fixture is missing committed timing");
+    }
+    expect(drawTiming).toMatchObject({
+      timeoutPolicy: "hp_percentage_then_damage_then_draw_v1",
+      fightStartTime: duelStartTs * 1_000,
+      fightDeadline: duelStartTs * 1_000 + drawTiming.maxFightDurationMs,
+    });
+    await expect
+      .poll(() => Date.now(), {
+        timeout: Math.max(
+          30_000,
+          drawTiming.fightDeadline - Date.now() + 5_000,
+        ),
+        intervals: [10, 25, 50, 100],
+      })
+      .toBeGreaterThanOrEqual(drawTiming.fightDeadline);
+    const drawPublishedAfterDeadlineMs = Date.now() - drawTiming.fightDeadline;
+    expect(drawPublishedAfterDeadlineMs).toBeGreaterThanOrEqual(0);
+    expect(drawPublishedAfterDeadlineMs).toBeLessThan(5_000);
+
     await publishSolanaCycleState(request, {
       cycleId: `gate10-solana-${duelId}`,
       duelId,
@@ -5160,7 +9580,25 @@ test.describe("market flows", () => {
       phase: "RESOLUTION",
       winner: "NONE",
       outcome: "draw",
-      duelEndTs: await currentChainUnixTimestamp(connection),
+      duelEndTimeMs: drawTiming.fightDeadline,
+    });
+
+    const drawStream = await fetchJson<StreamingStateResponse>(
+      request,
+      "/api/streaming/state",
+    );
+    expect(drawStream.cycle).toMatchObject({
+      duelId,
+      duelKeyHex,
+      outcome: "draw",
+      winnerId: null,
+      duelEndTime: drawTiming.fightDeadline,
+      competitiveSnapshotVersion: 4,
+      competitiveSnapshotDigest: drawCommitment.competitiveSnapshotDigest,
+      competitiveSnapshot: {
+        snapshotVersion: 4,
+        timing: drawTiming,
+      },
     });
 
     await expect
@@ -5242,11 +9680,84 @@ test.describe("market flows", () => {
         claimEnabled: true,
       });
 
-    await claimButton.click({ force: true });
+    await gotoApp(page, {
+      e2eSolanaDuelKey: duelKeyHex,
+      e2eSolanaDuelId: duelId,
+      e2eSolanaMarketRef: marketState.toBase58(),
+      debug: false,
+    });
+    await selectChain(page, "solana");
+    await ensureWalletConnected(page);
+    const publicDrawLog = page.getByTestId("duels-bottom-panel-news");
+    await expect(publicDrawLog).toContainText(
+      "The round ended in a draw. No winner was declared.",
+      { timeout: 60_000 },
+    );
+    await expect(page.getByTestId("spectator-terminal-outcome")).toContainText(
+      "Draw — no winner was declared.",
+    );
+    await expect(
+      page.getByTestId("solana-clob-settlement-action"),
+    ).toContainText("Claim refund", { timeout: 60_000 });
+    await testInfo.attach("solana-draw-public-desktop", {
+      body: await page.screenshot({ animations: "disabled" }),
+      contentType: "image/png",
+    });
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.getByTestId("mobile-watch-summary")).toContainText(
+      "DRAW",
+    );
+    expect(
+      await page.evaluate(() => ({
+        clientWidth: document.documentElement.clientWidth,
+        scrollWidth: document.documentElement.scrollWidth,
+      })),
+    ).toEqual({ clientWidth: 390, scrollWidth: 390 });
+    const drawRefundReviewButton = page.locator(".hm-bet-fab");
+    await expect(drawRefundReviewButton).toBeVisible();
+    expect(
+      await drawRefundReviewButton.evaluate(
+        (element) => element.getBoundingClientRect().height,
+      ),
+    ).toBeGreaterThanOrEqual(44);
+    await drawRefundReviewButton.click();
+    const mobileDrawSheet = page.getByRole("dialog", {
+      name: /trading controls/i,
+    });
+    await expect(mobileDrawSheet).toBeVisible();
+    await expect(mobileDrawSheet).toContainText("DRAW");
+    const mobileClaimButton = mobileDrawSheet
+      .getByRole("button", { name: /claim refund/i })
+      .first();
+    await expect(mobileClaimButton).toBeEnabled({ timeout: 30_000 });
+    expect(
+      await mobileClaimButton.evaluate(
+        (element) => element.getBoundingClientRect().height,
+      ),
+    ).toBeGreaterThanOrEqual(44);
+    await testInfo.attach("solana-draw-public-mobile", {
+      body: await page.screenshot({ animations: "disabled" }),
+      contentType: "image/png",
+    });
+
+    const drawHistoryEntries = settlementEntriesForDuel(page, duelId);
+    const claimStartedAtMs = Date.now();
+    await mobileClaimButton.click();
     const claimSignature = await expectSolanaSettlementReceipt(
       page,
       /refund confirmed on-chain/i,
     );
+    await expect(
+      drawHistoryEntries.getByRole("button", { name: /claim refund/i }),
+    ).toHaveCount(0, { timeout: 2_000 });
+    await expect(mobileDrawSheet).toContainText(
+      "Settlement history is catching up",
+    );
+    await testInfo.attach("solana-draw-refund-indexing", {
+      body: await page.screenshot({ animations: "disabled" }),
+      contentType: "image/png",
+    });
     const [walletDelta, transactionFee] = await Promise.all([
       getWalletLamportDeltaFromSignature(connection, claimSignature, trader),
       getTransactionFeeFromSignature(connection, claimSignature),
@@ -5263,6 +9774,63 @@ test.describe("market flows", () => {
       timeout: 30_000,
     });
 
+    const readDrawSettlementHistory = async () => {
+      const response = await fetchJson<{
+        ledger?: { current?: boolean };
+        entries?: Array<{
+          duelId?: string;
+          marketPda?: string;
+          settlementState?: string;
+          claimSignature?: string | null;
+        }>;
+      }>(
+        request,
+        `/api/arena/settlements/${encodeURIComponent(
+          trader.toBase58(),
+        )}?limit=100&offset=0`,
+      );
+      const exactEntries = (response.entries ?? []).filter(
+        (entry) =>
+          entry.duelId === duelId && entry.marketPda === marketState.toBase58(),
+      );
+      return {
+        ledgerCurrent: response.ledger?.current === true,
+        count: exactEntries.length,
+        allRefunded:
+          exactEntries.length === 2 &&
+          exactEntries.every(
+            (entry) =>
+              entry.settlementState === "REFUNDED" &&
+              entry.claimSignature === claimSignature,
+          ),
+      };
+    };
+    await expect
+      .poll(readDrawSettlementHistory, {
+        timeout: 90_000,
+        intervals: [250, 500, 1_000, 2_000, 5_000],
+      })
+      .toEqual({ ledgerCurrent: true, count: 2, allRefunded: true });
+    const claimToIndexedHistoryMs = Date.now() - claimStartedAtMs;
+    await expect
+      .poll(
+        async () => {
+          const entryText = await drawHistoryEntries.allTextContents();
+          return {
+            count: entryText.length,
+            allPaid:
+              entryText.length > 0 &&
+              entryText.every((value) => value.includes("Refund paid")),
+            claimButtons: await drawHistoryEntries
+              .getByRole("button", { name: /claim refund/i })
+              .count(),
+          };
+        },
+        { timeout: 15_000, intervals: [250, 500, 1_000, 2_000, 5_000] },
+      )
+      .toEqual({ count: 2, allPaid: true, claimButtons: 0 });
+    await expect(mobileDrawSheet).toContainText("Refund paid");
+
     await testInfo.attach("solana-draw-refund-ui", {
       body: await page.screenshot({ fullPage: true }),
       contentType: "image/png",
@@ -5276,7 +9844,11 @@ test.describe("market flows", () => {
             duelState: duelState.toBase58(),
             marketState: marketState.toBase58(),
             outcome: "draw",
+            fightStartTime: drawTiming.fightStartTime,
+            fightDeadline: drawTiming.fightDeadline,
+            drawPublishedAfterDeadlineMs,
             claimSignature,
+            claimToIndexedHistoryMs,
             aSharesBeforeRefund: bnLikeToBigInt(
               refundableBalance.aShares,
             ).toString(),
@@ -5370,16 +9942,16 @@ test.describe("market flows", () => {
     });
     await page.getByTestId("refresh-market").click();
     const clobPanel = page.getByTestId("solana-clob-panel").first();
-    await clobPanel.getByTestId("prediction-tab-buy").click({ force: true });
+    await openSolanaBuyOrderEntry(page, clobPanel);
     await clobPanel
       .getByTestId("prediction-amount-input")
       .fill(SOLANA_PREDICTION_AMOUNT);
-    await clobPanel.getByTestId("prediction-select-yes").click({ force: true });
+    await selectSolanaPredictionSide(clobPanel, "yes");
     const buyYesButton = clobPanel
       .getByRole("button", { name: /buy yes/i })
       .first();
     await expect(buyYesButton).toBeEnabled({ timeout: 30_000 });
-    await buyYesButton.click({ force: true });
+    await buyYesButton.click();
     await confirmSolanaOrder(page);
 
     await expect
@@ -5629,10 +10201,7 @@ test.describe("market flows", () => {
     if (await postRolloverExpandButton.isVisible().catch(() => false)) {
       await postRolloverExpandButton.click();
     }
-    const priorDuelActivity = page
-      .getByTestId("solana-settlement-entry")
-      .filter({ hasText: duelId })
-      .first();
+    const priorDuelActivity = settlementEntriesForDuel(page, duelId).first();
     await expect(priorDuelActivity).toContainText("Refund ready to claim", {
       timeout: 30_000,
     });
@@ -5640,7 +10209,7 @@ test.describe("market flows", () => {
       name: /claim refund/i,
     });
     await expect(claimButton).toBeEnabled({ timeout: 30_000 });
-    await claimButton.click({ force: true });
+    await claimButton.click();
     const claimSignature = await expectSolanaSettlementReceipt(
       page,
       /refund confirmed on-chain/i,

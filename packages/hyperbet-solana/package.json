@@ -13,13 +13,17 @@
     "deploy:preflight:testnet": "bun run scripts/preflight-contract-deploy.ts --target testnet",
     "deploy:preflight:devnet": "bun run scripts/preflight-contract-deploy.ts --cluster devnet",
     "stage-a:sync-program-keys": "node --import tsx scripts/sync-stage-a-program-keypairs.ts",
+    "stage-a:verify-program-keys": "node --import tsx scripts/verify-stage-a-program-identity.ts",
+    "stage-a:probe-program-readiness": "bun scripts/probe-program-readiness.ts",
+    "test:program-readiness": "bun test scripts/solana-program-readiness.test.ts scripts/solana-program-readiness-instructions.test.ts scripts/probe-program-readiness.test.ts",
     "deploy:init:devnet": "node --import tsx scripts/init-pm-config.ts --cluster devnet",
     "deploy:init:testnet": "node --import tsx scripts/init-pm-config.ts --cluster testnet",
     "deploy:init:mainnet": "node --import tsx scripts/init-pm-config.ts --cluster mainnet-beta --freeze",
     "verify:deployment:devnet": "node --import tsx scripts/verify-deployment.ts --cluster devnet",
     "verify:deployment:testnet": "node --import tsx scripts/verify-deployment.ts --cluster testnet",
     "verify:deployment:mainnet": "node --import tsx scripts/verify-deployment.ts --cluster mainnet-beta",
-    "codegen:clients": "bunx coda generate -c ./coda/fight-oracle.config.mjs && bunx coda generate -c ./coda/duel-market.config.mjs",
+    "emergency:plan": "node --import tsx scripts/emergency-instruction-plan-cli.ts",
+    "codegen:clients": "bunx coda generate -c ./coda/fight-oracle.config.mjs && bunx coda generate -c ./coda/duel-market.config.mjs && node scripts/sanitize-generated-clients.mjs",
     "sync:anchor-artifacts": "node scripts/sync-anchor-artifacts.mjs",
     "dev": "bun run --cwd app dev --mode devnet",
     "dev:local": "bash app/scripts/run-local-demo.sh",
@@ -34,28 +38,25 @@
     "preview": "bun run --cwd app preview",
     "test:e2e:local": "bun run --cwd app test:e2e:local",
     "test:e2e:testnet": "bun run --cwd app test:e2e:testnet",
-    "test:e2e:mainnet": "bun run --cwd app test:e2e:mainnet",
+    "test:e2e:mainnet": "bun run scripts/verify-mainnet-program-registry.ts && bun run --cwd app test:e2e:mainnet",
     "keeper:duel": "bun run --cwd keeper duel-bot",
     "keeper:duel:devnet": "SOLANA_CLUSTER=devnet bun run --cwd keeper duel-bot",
     "keeper:duel:local": "SOLANA_CLUSTER=localnet bun run --cwd keeper duel-bot",
-    "keeper:duel:mainnet": "SOLANA_CLUSTER=mainnet-beta bun run --cwd keeper duel-bot",
+    "keeper:duel:mainnet": "bun run scripts/verify-mainnet-program-registry.ts && SOLANA_CLUSTER=mainnet-beta bun run --cwd keeper duel-bot",
     "keeper:service": "bun run --cwd keeper service",
     "keeper:resolve": "bun run --cwd keeper resolve"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.32.1",
-    "@noble/curves": "^2.0.1",
-    "@solana/wallet-adapter-phantom": "^0.9.28",
-    "@solana/wallet-adapter-react": "^0.15.39",
-    "@solana/wallet-adapter-react-ui": "^0.9.39",
-    "@solana/web3.js": "^1.98.4",
-    "@tanstack/react-query": "^5.90.21",
+    "@coral-xyz/anchor": "0.32.1",
+    "@noble/curves": "2.0.1",
+    "@solana/web3.js": "1.98.4",
+    "@tanstack/react-query": "5.90.21",
     "bn.js": "5.2.2",
-    "@vitejs/plugin-react": "^5.1.4"
+    "@vitejs/plugin-react": "5.1.4"
   },
   "devDependencies": {
-    "@macalinao/coda": "^0.4.10",
+    "@macalinao/coda": "0.4.10",
     "@types/bn.js": "5.2.0",
-    "tsx": "^4.21.0"
+    "tsx": "4.21.0"
   }
 }

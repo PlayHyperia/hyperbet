@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { readdirSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -15,6 +14,9 @@ const ignoredDirectories = new Set([
   ".anchor",
   ".ci-artifacts",
   ".git",
+  ".ruff_cache",
+  ".turbo",
+  "__pycache__",
   "build",
   "coverage",
   "dist",
@@ -24,15 +26,20 @@ const ignoredDirectories = new Set([
   "storybook-static",
   "target",
   "test-results",
+  "vendor",
+  "workspace-packages",
 ]);
-const ignoredGlobs = [...ignoredDirectories].flatMap((directory) => [
-  `!**/${directory}`,
-  `!**/${directory}/**`,
-]);
-ignoredGlobs.push("!**/node_modules [0-9]*", "!**/node_modules [0-9]*/**");
 
 function isIgnoredDirectory(name) {
-  return ignoredDirectories.has(name) || /^node_modules [0-9]+$/.test(name);
+  return ignoredDirectories.has(name) || /^node_modules [0-9]+$/u.test(name);
+}
+
+function isIgnoredPath(relativePath) {
+  return relativePath
+    .split(/[\\/]/u)
+    .some(
+      (segment) => isIgnoredDirectory(segment) || segment.startsWith(".e2e-"),
+    );
 }
 
 function containsProhibitedTerm(value) {
@@ -42,54 +49,96 @@ function containsProhibitedTerm(value) {
   );
 }
 
-function findPathViolations(directory, relativeDirectory = "") {
-  const violations = [];
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    if (
-      (entry.isDirectory() && isIgnoredDirectory(entry.name)) ||
-      entry.name.startsWith(".e2e-")
-    ) {
-      continue;
-    }
-
-    const relativePath = path.join(relativeDirectory, entry.name);
-    if (containsProhibitedTerm(relativePath)) {
-      violations.push(relativePath);
-    }
-    if (entry.isDirectory()) {
-      violations.push(
-        ...findPathViolations(path.join(directory, entry.name), relativePath),
-      );
-    }
+function runGitPathList(args) {
+  const result = spawnSync("git", ["ls-files", "-z", ...args], {
+    cwd: root,
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(
+      `branding path inventory failed: ${result.stderr.toString("utf8").trim()}`,
+    );
   }
-  return violations;
+  return result.stdout
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean)
+    .filter((entry) => !isIgnoredPath(entry));
 }
 
-const args = ["-a", "-l", "-i", "--hidden", "--no-ignore"];
-for (const glob of ignoredGlobs) {
-  args.push("--glob", glob);
+function scanWorkingTreePaths(paths) {
+  if (paths.length === 0) return [];
+  const args = ["-a", "-l", "-i"];
+  for (const term of prohibitedTerms) {
+    args.push("-e", term);
+  }
+  args.push("--", ...paths);
+  const result = spawnSync("rg", args, {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0 && result.status !== 1) {
+    throw new Error(`branding overlay scan failed: ${result.stderr.trim()}`);
+  }
+  return result.status === 0
+    ? result.stdout.split(/\r?\n/u).filter(Boolean)
+    : [];
 }
-args.push("--glob", "!**/.e2e-*");
+
+const trackedPaths = runGitPathList(["--cached"]);
+const deletedPaths = new Set(runGitPathList(["--deleted"]));
+const modifiedPaths = runGitPathList(["--modified"]).filter(
+  (entry) => !deletedPaths.has(entry),
+);
+const untrackedPaths = runGitPathList(["--others", "--exclude-standard"]);
+const overlayPaths = [...new Set([...modifiedPaths, ...untrackedPaths])];
+const overlayPathSet = new Set(overlayPaths);
+const currentPaths = [
+  ...new Set([
+    ...trackedPaths.filter((entry) => !deletedPaths.has(entry)),
+    ...untrackedPaths,
+  ]),
+];
+
+const indexArgs = ["grep", "--cached", "-a", "-l", "-i"];
 for (const term of prohibitedTerms) {
-  args.push("-e", term);
+  indexArgs.push("-e", term);
 }
-args.push("--", ".");
+indexArgs.push("--", ".");
 
-const contentScan = spawnSync("rg", args, {
+const indexContentScan = spawnSync("git", indexArgs, {
   cwd: root,
   encoding: "utf8",
   maxBuffer: 32 * 1024 * 1024,
 });
-if (contentScan.error) throw contentScan.error;
-if (contentScan.status !== 0 && contentScan.status !== 1) {
-  throw new Error(`branding content scan failed: ${contentScan.stderr.trim()}`);
+if (indexContentScan.error) throw indexContentScan.error;
+if (indexContentScan.status !== 0 && indexContentScan.status !== 1) {
+  throw new Error(
+    `branding index scan failed: ${indexContentScan.stderr.trim()}`,
+  );
 }
 
-const contentViolations =
-  contentScan.status === 0
-    ? contentScan.stdout.split(/\r?\n/).filter(Boolean).sort()
+const indexViolations =
+  indexContentScan.status === 0
+    ? indexContentScan.stdout
+        .split(/\r?\n/u)
+        .filter(Boolean)
+        .filter(
+          (entry) =>
+            !isIgnoredPath(entry) &&
+            !deletedPaths.has(entry) &&
+            !overlayPathSet.has(entry),
+        )
     : [];
-const pathViolations = findPathViolations(root).sort();
+const contentViolations = [
+  ...new Set([...indexViolations, ...scanWorkingTreePaths(overlayPaths)]),
+].sort();
+const pathViolations = currentPaths
+  .filter((entry) => containsProhibitedTerm(entry))
+  .sort();
 
 if (contentViolations.length > 0 || pathViolations.length > 0) {
   console.error(
@@ -110,7 +159,8 @@ console.log(
   JSON.stringify({
     ok: true,
     prohibitedTerms: prohibitedTerms.length,
-    sourceAndBinaryContentScan: true,
-    workingTreePathScan: true,
+    trackedIndexContentScan: true,
+    modifiedAndUntrackedBinaryContentScan: true,
+    releaseCandidatePathScan: true,
   }),
 );

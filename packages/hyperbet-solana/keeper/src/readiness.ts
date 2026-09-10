@@ -1,4 +1,20 @@
-import type { KeeperBotHealthSnapshot } from "./launchHealth";
+import {
+  isKeeperMarketCircuitBreakerIncident,
+  isKeeperMarketRecoveryIncident,
+  isKeeperRecoveryIncident,
+  type KeeperBotHealthSnapshot,
+} from "./launchHealth";
+import { isDuelCorrelationId } from "./duelCorrelation";
+import {
+  normalizeReleaseCommitSha,
+  type KeeperReleaseIdentitySource,
+} from "./releaseIdentity";
+import { parseKeeperOperatorMetrics } from "./keeperOperatorMetrics";
+import {
+  keeperRuntimeIdentityMatches,
+  parseKeeperRuntimeIdentity,
+  type KeeperRuntimeIdentity,
+} from "./runtimeIdentity";
 
 export type ReadinessParserState = {
   enabled: boolean;
@@ -8,6 +24,12 @@ export type ReadinessParserState = {
 
 export type KeeperReadinessInput = {
   nowMs: number;
+  release: {
+    required: boolean;
+    requireBakedManifest: boolean;
+    commitSha: string | null;
+    source: KeeperReleaseIdentitySource;
+  };
   requireStreamSource: boolean;
   streamMaxAgeMs: number;
   botMaxAgeMs: number;
@@ -19,6 +41,7 @@ export type KeeperReadinessInput = {
     lastSourceError: string | null;
   };
   bot: KeeperBotHealthSnapshot | null;
+  expectedBotRuntimeIdentity?: KeeperRuntimeIdentity;
   parser: ReadinessParserState;
   database: {
     ok: boolean;
@@ -34,6 +57,15 @@ export type KeeperReadinessResult = {
     bot: number | null;
     botRpc: number | null;
     parser: number | null;
+  };
+};
+
+export type KeeperBotReadinessResult = {
+  ready: boolean;
+  reasons: string[];
+  agesMs: {
+    bot: number | null;
+    botRpc: number | null;
   };
 };
 
@@ -68,6 +100,10 @@ export function parseKeeperBotHealthSnapshot(
   if (!isRecord(value)) return null;
   if (
     value.chainKey !== "solana" ||
+    !(
+      value.releaseCommitSha === null ||
+      normalizeReleaseCommitSha(value.releaseCommitSha) !== null
+    ) ||
     typeof value.updatedAtMs !== "number" ||
     !Number.isFinite(value.updatedAtMs) ||
     typeof value.bootedAtMs !== "number" ||
@@ -78,12 +114,17 @@ export function parseKeeperBotHealthSnapshot(
   ) {
     return null;
   }
+  const runtime = parseKeeperRuntimeIdentity(value.runtime);
+  if (!runtime || runtime.role !== "duel-bot") return null;
   if (
     !value.recovery.every(
       (entry) =>
         isRecord(entry) &&
         typeof entry.code === "string" &&
-        typeof entry.active === "boolean",
+        typeof entry.active === "boolean" &&
+        (entry.correlationIds === undefined ||
+          (Array.isArray(entry.correlationIds) &&
+            entry.correlationIds.every(isDuelCorrelationId))),
     )
   ) {
     return null;
@@ -95,13 +136,28 @@ export function parseKeeperBotHealthSnapshot(
         typeof entry.lifecycleStatus === "string" &&
         (entry.circuitBreakerReason === null ||
           typeof entry.circuitBreakerReason === "string") &&
+        (entry.correlationId === undefined ||
+          entry.correlationId === null ||
+          isDuelCorrelationId(entry.correlationId)) &&
         Array.isArray(entry.recovery) &&
         entry.recovery.every((reason) => typeof reason === "string"),
     )
   ) {
     return null;
   }
-  return value as unknown as KeeperBotHealthSnapshot;
+  const operatorMetrics = parseKeeperOperatorMetrics(value.operatorMetrics);
+  if (!operatorMetrics) return null;
+  if (
+    operatorMetrics.observedAtMs !== value.updatedAtMs ||
+    operatorMetrics.markets.retainedCount !== value.markets.length
+  ) {
+    return null;
+  }
+  return {
+    ...(value as unknown as KeeperBotHealthSnapshot),
+    runtime,
+    operatorMetrics,
+  };
 }
 
 function ageMs(nowMs: number, timestamp: number | null): number | null {
@@ -109,17 +165,94 @@ function ageMs(nowMs: number, timestamp: number | null): number | null {
   return Math.max(0, nowMs - timestamp);
 }
 
-export function evaluateKeeperReadiness(
-  input: KeeperReadinessInput,
-): KeeperReadinessResult {
+export function evaluateKeeperBotReadiness(input: {
+  nowMs: number;
+  botMaxAgeMs: number;
+  requireReleaseIdentity: boolean;
+  expectedReleaseCommitSha: string | null;
+  expectedRuntimeIdentity?: KeeperRuntimeIdentity;
+  bot: KeeperBotHealthSnapshot | null;
+}): KeeperBotReadinessResult {
   const reasons = new Set<string>();
-  const streamAge = ageMs(input.nowMs, input.stream.lastUpdatedAt);
   const botAge = ageMs(input.nowMs, input.bot?.updatedAtMs ?? null);
   const botRpcAge = ageMs(
     input.nowMs,
     input.bot?.lastSuccessfulRpcAtMs ?? null,
   );
+
+  if (!input.bot) {
+    reasons.add("bot-health-missing");
+  } else {
+    if (
+      input.requireReleaseIdentity &&
+      input.bot.releaseCommitSha !== input.expectedReleaseCommitSha
+    ) {
+      reasons.add("bot-release-mismatch");
+    }
+    if (
+      input.expectedRuntimeIdentity &&
+      !keeperRuntimeIdentityMatches(
+        input.bot.runtime,
+        input.expectedRuntimeIdentity,
+      )
+    ) {
+      reasons.add("bot-runtime-identity-mismatch");
+    }
+    if (!input.bot.running) reasons.add("bot-not-running");
+    if (botAge == null || botAge > input.botMaxAgeMs) {
+      reasons.add("bot-health-stale");
+    }
+    if (botRpcAge == null || botRpcAge > input.botMaxAgeMs) {
+      reasons.add("bot-rpc-stale");
+    }
+    for (const recovery of input.bot.recovery) {
+      if (isKeeperRecoveryIncident(recovery)) {
+        reasons.add(`bot-recovery:${recovery.code}`);
+      }
+    }
+    const terminalWorkActive = input.bot.recovery.some(
+      (recovery) => recovery.active && recovery.code === "terminal-queue",
+    );
+    for (const market of input.bot.markets) {
+      if (isKeeperMarketCircuitBreakerIncident(market)) {
+        reasons.add("market-circuit-breaker");
+      }
+      if (market.lifecycleStatus === "CHALLENGED") {
+        reasons.add("market-result-challenged");
+      }
+      // A resolved market with unclaimed market-maker inventory is an
+      // expected intermediate state only while the durable terminal queue
+      // owns that work. Once the queue drains, the same marker fails
+      // readiness so a stranded claim cannot be hidden.
+      if (isKeeperMarketRecoveryIncident(market, terminalWorkActive)) {
+        reasons.add("market-recovery-active");
+      }
+    }
+  }
+
+  return {
+    ready: reasons.size === 0,
+    reasons: [...reasons],
+    agesMs: { bot: botAge, botRpc: botRpcAge },
+  };
+}
+
+export function evaluateKeeperReadiness(
+  input: KeeperReadinessInput,
+): KeeperReadinessResult {
+  const reasons = new Set<string>();
+  const streamAge = ageMs(input.nowMs, input.stream.lastUpdatedAt);
   const parserAge = ageMs(input.nowMs, input.parser.lastSuccessAt);
+
+  if (input.release.required && !input.release.commitSha) {
+    reasons.add("release-identity-unavailable");
+  } else if (
+    input.release.required &&
+    input.release.requireBakedManifest &&
+    input.release.source !== "manifest"
+  ) {
+    reasons.add("release-identity-not-baked");
+  }
 
   if (input.requireStreamSource && !input.stream.sourceConfigured) {
     reasons.add("stream-source-missing");
@@ -130,31 +263,16 @@ export function evaluateKeeperReadiness(
   }
   if (input.stream.lastSourceError) reasons.add("stream-source-error");
 
-  if (!input.bot) {
-    reasons.add("bot-health-missing");
-  } else {
-    if (!input.bot.running) reasons.add("bot-not-running");
-    if (botAge == null || botAge > input.botMaxAgeMs) {
-      reasons.add("bot-health-stale");
-    }
-    if (botRpcAge == null || botRpcAge > input.botMaxAgeMs) {
-      reasons.add("bot-rpc-stale");
-    }
-    for (const recovery of input.bot.recovery) {
-      if (recovery.active) reasons.add(`bot-recovery:${recovery.code}`);
-    }
-    for (const market of input.bot.markets) {
-      const isTerminalMarket =
-        market.lifecycleStatus === "RESOLVED" ||
-        market.lifecycleStatus === "CANCELLED";
-      if (market.circuitBreakerReason && !isTerminalMarket) {
-        reasons.add("market-circuit-breaker");
-      }
-      if (market.lifecycleStatus === "CHALLENGED") {
-        reasons.add("market-result-challenged");
-      }
-      if (market.recovery.length > 0) reasons.add("market-recovery-active");
-    }
+  const botReadiness = evaluateKeeperBotReadiness({
+    nowMs: input.nowMs,
+    botMaxAgeMs: input.botMaxAgeMs,
+    requireReleaseIdentity: input.release.required,
+    expectedReleaseCommitSha: input.release.commitSha,
+    expectedRuntimeIdentity: input.expectedBotRuntimeIdentity,
+    bot: input.bot,
+  });
+  for (const reason of botReadiness.reasons) {
+    reasons.add(reason);
   }
 
   if (!input.parser.enabled) reasons.add("solana-parser-disabled");
@@ -169,8 +287,8 @@ export function evaluateKeeperReadiness(
     reasons: [...reasons],
     agesMs: {
       stream: streamAge,
-      bot: botAge,
-      botRpc: botRpcAge,
+      bot: botReadiness.agesMs.bot,
+      botRpc: botReadiness.agesMs.botRpc,
       parser: parserAge,
     },
   };

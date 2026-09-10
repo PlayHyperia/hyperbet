@@ -4,10 +4,18 @@ import { GAME_API_URL } from "./config";
 
 const READINESS_URL = `${GAME_API_URL.replace(/\/$/, "")}/ready`;
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
+const DEFAULT_MAX_AGE_MS = 15_000;
+const DEFAULT_MAX_FUTURE_SKEW_MS = 5_000;
 
 type SolanaLaunchReadinessState = {
   checked: boolean;
   ready: boolean;
+};
+
+type SolanaLaunchReadinessTiming = {
+  nowMs: number;
+  maxAgeMs: number;
+  maxFutureSkewMs: number;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -16,65 +24,115 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-export function parseSolanaLaunchReadiness(payload: unknown): boolean {
+export function parseSolanaLaunchReadiness(
+  payload: unknown,
+  timing?: SolanaLaunchReadinessTiming,
+): boolean {
   const envelope = asRecord(payload);
   const readiness = asRecord(envelope?.readiness);
-  return (
+  const emittedAtMs = envelope?.now;
+  const structurallyReady =
     envelope?.ok === true &&
     envelope.service === "hyperbet-solana-backend" &&
-    typeof envelope.now === "number" &&
-    Number.isFinite(envelope.now) &&
-    readiness?.ready === true
-  );
+    typeof emittedAtMs === "number" &&
+    Number.isFinite(emittedAtMs) &&
+    emittedAtMs > 0 &&
+    readiness?.ready === true;
+
+  if (!structurallyReady) return false;
+  if (!timing) return true;
+  if (
+    !Number.isFinite(timing.nowMs) ||
+    !Number.isFinite(timing.maxAgeMs) ||
+    !Number.isFinite(timing.maxFutureSkewMs) ||
+    timing.maxAgeMs < 0 ||
+    timing.maxFutureSkewMs < 0
+  ) {
+    return false;
+  }
+
+  const ageMs = timing.nowMs - emittedAtMs;
+  return ageMs <= timing.maxAgeMs && ageMs >= -timing.maxFutureSkewMs;
 }
 
 export function useSolanaLaunchReadiness(
-  options: { pollIntervalMs?: number; enabled?: boolean } = {},
+  options: {
+    pollIntervalMs?: number;
+    requestTimeoutMs?: number;
+    enabled?: boolean;
+  } = {},
 ): SolanaLaunchReadinessState {
   const enabled = options.enabled ?? true;
   const pollIntervalMs = Math.max(
-    1_000,
+    1,
     options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS,
+  );
+  const requestTimeoutMs = Math.max(
+    1,
+    options.requestTimeoutMs ?? DEFAULT_POLL_INTERVAL_MS,
   );
   const [state, setState] = useState<SolanaLaunchReadinessState>({
     checked: !enabled,
     ready: false,
   });
 
-  const refresh = useCallback(async (signal?: AbortSignal) => {
-    try {
-      const response = await fetch(READINESS_URL, {
-        cache: "no-store",
-        signal,
-      });
-      const payload = await response.json();
-      if (!signal?.aborted) {
-        setState({
-          checked: true,
-          ready: response.ok && parseSolanaLaunchReadiness(payload),
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      const requestController = new AbortController();
+      const abortRequest = () => requestController.abort();
+      signal?.addEventListener("abort", abortRequest, { once: true });
+      const timeoutId = window.setTimeout(abortRequest, requestTimeoutMs);
+
+      try {
+        const response = await fetch(READINESS_URL, {
+          cache: "no-store",
+          signal: requestController.signal,
         });
+        const payload = await response.json();
+        if (!signal?.aborted && !requestController.signal.aborted) {
+          setState({
+            checked: true,
+            ready:
+              response.ok &&
+              parseSolanaLaunchReadiness(payload, {
+                nowMs: Date.now(),
+                maxAgeMs: DEFAULT_MAX_AGE_MS,
+                maxFutureSkewMs: DEFAULT_MAX_FUTURE_SKEW_MS,
+              }),
+          });
+        }
+      } catch {
+        if (!signal?.aborted) {
+          setState({ checked: true, ready: false });
+        }
+      } finally {
+        window.clearTimeout(timeoutId);
+        signal?.removeEventListener("abort", abortRequest);
       }
-    } catch {
-      if (!signal?.aborted) {
-        setState({ checked: true, ready: false });
-      }
-    }
-  }, []);
+    },
+    [requestTimeoutMs],
+  );
 
   useEffect(() => {
-    if (!enabled) return;
-    const initialController = new AbortController();
-    let pollController: AbortController | null = null;
-    void refresh(initialController.signal);
+    if (!enabled) {
+      setState({ checked: true, ready: false });
+      return;
+    }
+
+    let activeController: AbortController | null = null;
+    const poll = () => {
+      activeController?.abort();
+      activeController = new AbortController();
+      void refresh(activeController.signal);
+    };
+
+    poll();
     const intervalId = window.setInterval(() => {
-      pollController?.abort();
-      pollController = new AbortController();
-      void refresh(pollController.signal);
+      poll();
     }, pollIntervalMs);
 
     return () => {
-      initialController.abort();
-      pollController?.abort();
+      activeController?.abort();
       window.clearInterval(intervalId);
     };
   }, [enabled, pollIntervalMs, refresh]);

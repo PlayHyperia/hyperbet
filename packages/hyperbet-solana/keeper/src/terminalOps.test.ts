@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { TerminalLedger, type TerminalOperationInput } from "./terminalLedger";
-
-const cliPath = path.resolve(import.meta.dir, "terminalOps.ts");
+import { runTerminalOpsCli } from "./terminalOps";
 
 function terminalInput(): TerminalOperationInput {
   return {
@@ -53,6 +53,7 @@ describe("terminal operator CLI", () => {
       competitiveSnapshotDigest: "31".repeat(32),
       phase: "FIGHTING",
       terminal: false,
+      terminalEventKey: null,
       updatedAt: 1_200,
     });
     operationId = queued.id;
@@ -64,18 +65,26 @@ describe("terminal operator CLI", () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function runCli(args: string[]): ReturnType<typeof Bun.spawnSync> {
-    return Bun.spawnSync({
-      cmd: [process.execPath, "--bun", cliPath, ...args],
-      cwd: import.meta.dir,
-      env: { ...process.env, KEEPER_DB_PATH: dbPath },
-      stdout: "pipe",
-      stderr: "pipe",
+  async function runCli(args: string[]) {
+    const output: unknown[] = [];
+    let errorOutput = "";
+    const exitCode = await runTerminalOpsCli([...args, `--db=${dbPath}`], {
+      writeJson(value) {
+        output.push(value);
+      },
+      writeError(message) {
+        errorOutput += message;
+      },
     });
+    return {
+      exitCode,
+      stdout: Buffer.from(output.length === 0 ? "" : JSON.stringify(output[0])),
+      stderr: Buffer.from(errorOutput),
+    };
   }
 
-  test("lists and inspects recovery work without exposing the event by default", () => {
-    const listed = runCli(["list"]);
+  test("lists and inspects recovery work without exposing the event by default", async () => {
+    const listed = await runCli(["list"]);
     expect(listed.exitCode).toBe(0);
     const listPayload = JSON.parse(listed.stdout?.toString() ?? "") as {
       operations: Array<Record<string, unknown>>;
@@ -88,7 +97,7 @@ describe("terminal operator CLI", () => {
     });
     expect(listPayload.operations[0]?.event).toBeUndefined();
 
-    const inspected = runCli(["inspect", String(operationId)]);
+    const inspected = await runCli(["inspect", String(operationId)]);
     expect(inspected.exitCode).toBe(0);
     const inspectPayload = JSON.parse(inspected.stdout?.toString() ?? "") as {
       operation: Record<string, unknown>;
@@ -100,7 +109,7 @@ describe("terminal operator CLI", () => {
     expect(inspectPayload.auditEvents).toEqual([]);
   });
 
-  test("preserves contradictory truth and hides feed events unless requested", () => {
+  test("preserves contradictory truth and hides feed events unless requested", async () => {
     const ledger = new TerminalLedger(dbPath);
     expect(() =>
       ledger.enqueue(
@@ -120,7 +129,7 @@ describe("terminal operator CLI", () => {
     ).toThrow("conflicting terminal operation");
     ledger.close();
 
-    const hidden = runCli(["inspect", String(operationId)]);
+    const hidden = await runCli(["inspect", String(operationId)]);
     expect(hidden.exitCode).toBe(0);
     const hiddenPayload = JSON.parse(hidden.stdout?.toString() ?? "") as {
       conflicts: Array<{
@@ -136,7 +145,7 @@ describe("terminal operator CLI", () => {
     });
     expect(hiddenPayload.conflicts[0]?.conflictingInput.event).toBeUndefined();
 
-    const included = runCli([
+    const included = await runCli([
       "inspect",
       String(operationId),
       "--include-event",
@@ -153,8 +162,8 @@ describe("terminal operator CLI", () => {
     });
   });
 
-  test("shows the durable feed continuity checkpoint without mutation", () => {
-    const result = runCli(["feed-status"]);
+  test("shows the durable feed continuity checkpoint without mutation", async () => {
+    const result = await runCli(["feed-status"]);
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout?.toString() ?? "")).toMatchObject({
       checkpoint: {
@@ -168,8 +177,29 @@ describe("terminal operator CLI", () => {
     });
   });
 
-  test("rejects a wrong confirmation and accepts one audited exact requeue", () => {
-    const rejected = runCli([
+  test("keeps inspection commands read-only while a live writer holds the ledger", async () => {
+    const writer = new Database(dbPath);
+    writer.run("BEGIN IMMEDIATE");
+    try {
+      const listed = await runCli(["list"]);
+      expect(listed.exitCode).toBe(0);
+      expect(JSON.parse(listed.stdout?.toString() ?? "")).toMatchObject({
+        operations: [{ id: operationId }],
+      });
+
+      const feedStatus = await runCli(["feed-status"]);
+      expect(feedStatus.exitCode).toBe(0);
+      expect(JSON.parse(feedStatus.stdout?.toString() ?? "")).toMatchObject({
+        checkpoint: { lastAppliedSeq: 12 },
+      });
+    } finally {
+      writer.run("ROLLBACK");
+      writer.close(false);
+    }
+  });
+
+  test("rejects a wrong confirmation and accepts one audited exact requeue", async () => {
+    const rejected = await runCli([
       "requeue",
       String(operationId),
       "--confirm-fingerprint",
@@ -184,7 +214,7 @@ describe("terminal operator CLI", () => {
       "fingerprint confirmation failed",
     );
 
-    const accepted = runCli([
+    const accepted = await runCli([
       "requeue",
       String(operationId),
       "--confirm-fingerprint",
@@ -210,7 +240,7 @@ describe("terminal operator CLI", () => {
       },
     });
 
-    const duplicate = runCli([
+    const duplicate = await runCli([
       "requeue",
       String(operationId),
       "--confirm-fingerprint",
@@ -225,7 +255,7 @@ describe("terminal operator CLI", () => {
       "cannot be requeued from PENDING",
     );
 
-    const history = runCli(["history", "--id", String(operationId)]);
+    const history = await runCli(["history", "--id", String(operationId)]);
     expect(history.exitCode).toBe(0);
     const historyPayload = JSON.parse(history.stdout?.toString() ?? "") as {
       auditEvents: unknown[];

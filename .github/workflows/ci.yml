@@ -10,15 +10,20 @@ on:
       - "packages/hyperbet-sdk-py/**"
       - "packages/simulation-dashboard/**"
       - "scripts/ci-gate-scenarios.ts"
+      - "scripts/ci-gate-e2e.ts"
       - "scripts/ci-gate-solana-build.ts"
       - "scripts/ci-gate-solana-v1-registry.ts"
       - "scripts/ci-solana-v1-scope.ts"
       - "scripts/ci-sdk-sol-only-artifacts.py"
       - "scripts/ci-artifact-policy.ts"
       - "scripts/check-legacy-branding.mjs"
+      - "scripts/check-legacy-branding.test.mjs"
+      - "scripts/check-high-severity-audit.mjs"
+      - "scripts/check-high-severity-audit.test.mjs"
       - ".github/actions/setup-hyperbet/**"
       - ".github/workflows/ci.yml"
       - "package.json"
+      - "bunfig.toml"
       - "bun.lock"
   pull_request:
     paths:
@@ -28,15 +33,20 @@ on:
       - "packages/hyperbet-sdk-py/**"
       - "packages/simulation-dashboard/**"
       - "scripts/ci-gate-scenarios.ts"
+      - "scripts/ci-gate-e2e.ts"
       - "scripts/ci-gate-solana-build.ts"
       - "scripts/ci-gate-solana-v1-registry.ts"
       - "scripts/ci-solana-v1-scope.ts"
       - "scripts/ci-sdk-sol-only-artifacts.py"
       - "scripts/ci-artifact-policy.ts"
       - "scripts/check-legacy-branding.mjs"
+      - "scripts/check-legacy-branding.test.mjs"
+      - "scripts/check-high-severity-audit.mjs"
+      - "scripts/check-high-severity-audit.test.mjs"
       - ".github/actions/setup-hyperbet/**"
       - ".github/workflows/ci.yml"
       - "package.json"
+      - "bunfig.toml"
       - "bun.lock"
   workflow_dispatch:
 
@@ -50,24 +60,72 @@ concurrency:
 jobs:
   application-and-keeper:
     name: SOL app, keeper, SDK, and release closure
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Hyperbet toolchain
         uses: ./.github/actions/setup-hyperbet
 
       - name: Setup Python SDK toolchain
-        uses: actions/setup-python@v6
+        id: setup-python-sdk
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: packages/hyperbet-sdk-py/poetry.lock
+          python-version: "3.12.14"
+          architecture: x64
+          check-latest: false
+          token: ${{ github.token }}
+
+      - name: Verify exact Python SDK toolchain
+        env:
+          EXPECTED_PYTHON_VERSION: "3.12.14"
+          SETUP_PYTHON_PATH: ${{ steps.setup-python-sdk.outputs.python-path }}
+          SETUP_PYTHON_VERSION: ${{ steps.setup-python-sdk.outputs.python-version }}
+        run: |
+          set -euo pipefail
+          installed_version="$(python -c 'import platform; print(platform.python_version())')"
+          implementation="$(python -c 'import platform; print(platform.python_implementation())')"
+          pointer_bits="$(python -c 'import struct; print(struct.calcsize("P") * 8)')"
+          output_path="$(python -c 'import os; print(os.path.realpath(os.environ["SETUP_PYTHON_PATH"]))')"
+          runtime_path="$(python -c 'import os, sys; print(os.path.realpath(sys.executable))')"
+          if [[ "$installed_version" != "$EXPECTED_PYTHON_VERSION" || "$SETUP_PYTHON_VERSION" != "$EXPECTED_PYTHON_VERSION" ]]; then
+            echo "Expected Python ${EXPECTED_PYTHON_VERSION}, received ${installed_version}" >&2
+            exit 1
+          fi
+          if [[ "$implementation" != "CPython" || "$pointer_bits" != "64" ]]; then
+            echo "The reviewed Python SDK toolchain must be 64-bit CPython" >&2
+            exit 1
+          fi
+          if [[ "$output_path" != "$runtime_path" ]]; then
+            echo "setup-python output does not identify the active Python executable" >&2
+            exit 1
+          fi
+          printf 'Python SDK runtime: %s (%s/%s)\n' \
+            "$installed_version" \
+            "$implementation" \
+            "$pointer_bits"
+          python -m pip --version
 
       - name: Install pinned Poetry
-        run: python -m pip install poetry==1.8.5
+        env:
+          EXPECTED_POETRY_VERSION: "1.8.5"
+        run: |
+          set -euo pipefail
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            "poetry==${EXPECTED_POETRY_VERSION}"
+          installed_version="$(poetry --version | awk '{print $3}' | tr -d ')')"
+          if [[ "$installed_version" != "$EXPECTED_POETRY_VERSION" ]]; then
+            echo "Expected Poetry ${EXPECTED_POETRY_VERSION}, received ${installed_version}" >&2
+            exit 1
+          fi
+          python -m pip check
+          python -m pip freeze --all | LC_ALL=C sort
 
       - name: Install pinned dependencies
         run: bash scripts/ci-install-verified.sh root hyperbet-solana-app hyperbet-solana-keeper
@@ -82,7 +140,7 @@ jobs:
 
       - name: Typecheck launch keeper and application
         run: |
-          bunx tsc --noEmit --project packages/hyperbet-solana/keeper/tsconfig.launch.json
+          ./node_modules/.bin/tsc --noEmit --project packages/hyperbet-solana/keeper/tsconfig.launch.json
           bun run --cwd packages/hyperbet-solana/app typecheck
 
       - name: Test shared UI and TypeScript SDK
@@ -94,8 +152,15 @@ jobs:
 
       - name: Test and package Python SDK
         working-directory: packages/hyperbet-sdk-py
+        env:
+          EXPECTED_PYTHON_VERSION: "3.12.14"
         run: |
-          poetry install --no-interaction
+          poetry install --no-interaction --sync
+          sdk_python_version="$(poetry run python -c 'import platform; print(platform.python_version())')"
+          if [[ "$sdk_python_version" != "$EXPECTED_PYTHON_VERSION" ]]; then
+            echo "Expected SDK Python ${EXPECTED_PYTHON_VERSION}, received ${sdk_python_version}" >&2
+            exit 1
+          fi
           poetry run ruff check hyperbet_sdk tests
           poetry run ruff format --check hyperbet_sdk tests
           poetry run pytest -q -p no:anchorpy
@@ -103,8 +168,8 @@ jobs:
           poetry build
           python ../../scripts/ci-sdk-sol-only-artifacts.py
 
-      - name: Test simulation policy
-        run: bun run --cwd packages/simulation-dashboard test
+      - name: Test isolated Solana scenario normalization
+        run: bun run ci:scenarios:solana:policy
 
       - name: Verify registry and synchronized artifacts
         run: bun run ci:gate:registry:launch
@@ -116,11 +181,13 @@ jobs:
 
   solana-program-build:
     name: Pinned two-program SBF build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Solana and Anchor toolchain
         uses: ./.github/actions/setup-hyperbet
@@ -128,6 +195,7 @@ jobs:
           install-rust: "true"
           install-solana: "true"
           install-anchor: "true"
+          install-cargo-audit: "true"
 
       - name: Install pinned dependencies
         run: bash scripts/ci-install-verified.sh root hyperbet-solana-anchor
@@ -139,10 +207,11 @@ jobs:
         run: |
           bun run --cwd packages/hyperbet-solana/anchor test:rust
           bun run --cwd packages/hyperbet-solana/anchor lint:rust
+          bun run --cwd packages/hyperbet-solana/anchor audit:strict
 
       - name: Upload build evidence
         if: always()
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: solana-duel-v1-program-build
           path: .ci-artifacts/solana-program-build-gate
@@ -150,11 +219,13 @@ jobs:
 
   validator-matrix:
     name: Fresh-validator lifecycle and security matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Solana and Anchor toolchain
         uses: ./.github/actions/setup-hyperbet
@@ -169,13 +240,56 @@ jobs:
       - name: Run canonical local-validator matrix
         run: bun run --cwd packages/hyperbet-solana/anchor test
 
-  exploit-scenarios:
-    name: Isolated Solana exploit scenarios
-    runs-on: ubuntu-latest
+  browser-keeper-e2e:
+    name: Timestamped-HLS SOL browser and keeper gate
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Solana and Anchor toolchain
+        uses: ./.github/actions/setup-hyperbet
+        with:
+          install-rust: "true"
+          install-solana: "true"
+          install-anchor: "true"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install pinned dependencies
+        run: bash scripts/ci-install-verified.sh root hyperbet-solana-app hyperbet-solana-keeper hyperbet-solana-anchor
+
+      - name: Install pinned Playwright Chromium and system dependencies
+        run: packages/hyperbet-solana/app/node_modules/.bin/playwright install --with-deps chromium
+
+      - name: Run timestamped-HLS SOL browser and keeper gate
+        run: bun run ci:gate:e2e:solana
+
+      - name: Upload browser and keeper evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: solana-duel-v1-browser-keeper-e2e
+          path: .ci-artifacts/e2e-solana
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  exploit-scenarios:
+    name: Isolated Solana exploit scenarios
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Setup Solana and Anchor toolchain
         uses: ./.github/actions/setup-hyperbet
@@ -192,7 +306,7 @@ jobs:
 
       - name: Upload scenario evidence
         if: always()
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: solana-duel-v1-exploit-scenarios
           path: .ci-artifacts

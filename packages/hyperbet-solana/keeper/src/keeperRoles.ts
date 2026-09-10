@@ -1,4 +1,4 @@
-import type { PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 
 export type KeeperRoleRefs = {
   feePayerKeypair: string;
@@ -83,16 +83,59 @@ export function resolveKeeperRoleRefs(
   };
 }
 
-function isMainnetCluster(cluster: string): boolean {
+function normalizeLaunchCluster(
+  cluster: string,
+): "localnet" | "devnet" | "testnet" | "mainnet" | "mainnet-beta" {
   const normalized = cluster.trim().toLowerCase();
-  return normalized === "mainnet" || normalized === "mainnet-beta";
+  if (
+    normalized !== "localnet" &&
+    normalized !== "devnet" &&
+    normalized !== "testnet" &&
+    normalized !== "mainnet" &&
+    normalized !== "mainnet-beta"
+  ) {
+    throw new Error(`Unsupported Solana keeper-role cluster '${cluster}'`);
+  }
+  return normalized;
+}
+
+export function resolveConfiguredLaunchWallet(input: {
+  cluster: string;
+  envName: string;
+  configuredValue: string | undefined;
+  localFallback: PublicKey;
+}): PublicKey {
+  const cluster = normalizeLaunchCluster(input.cluster);
+
+  const configuredValue = input.configuredValue?.trim();
+  if (!configuredValue) {
+    if (cluster !== "localnet") {
+      throw new Error(
+        `${input.envName} must be explicitly configured outside localnet`,
+      );
+    }
+    return input.localFallback;
+  }
+
+  try {
+    const wallet = new PublicKey(configuredValue);
+    if (
+      wallet.equals(PublicKey.default) ||
+      wallet.toBase58() !== configuredValue
+    ) {
+      throw new Error("noncanonical public key");
+    }
+    return wallet;
+  } catch {
+    throw new Error(`${input.envName} must be a canonical Solana public key`);
+  }
 }
 
 export function validateKeeperRoleSeparation(
   cluster: string,
   roles: KeeperRolePublicKeys,
 ): void {
-  if (!isMainnetCluster(cluster)) return;
+  if (normalizeLaunchCluster(cluster) === "localnet") return;
 
   const automatedRoles: Array<[string, PublicKey]> = [
     ["fee payer", roles.feePayer],
@@ -107,7 +150,7 @@ export function validateKeeperRoleSeparation(
     const previous = seen.get(address);
     if (previous) {
       throw new Error(
-        `Mainnet keeper roles must use distinct wallets: ${previous} and ${label} both resolve to ${address}`,
+        `Non-local keeper roles must use distinct wallets: ${previous} and ${label} both resolve to ${address}`,
       );
     }
     seen.set(address, label);
@@ -117,7 +160,7 @@ export function validateKeeperRoleSeparation(
   const challengerCollision = seen.get(challengerAddress);
   if (challengerCollision) {
     throw new Error(
-      `Mainnet oracle challenger must be independent from automated keeper roles: it matches ${challengerCollision}`,
+      `Non-local oracle challenger must be independent from automated keeper roles: it matches ${challengerCollision}`,
     );
   }
 
@@ -130,8 +173,36 @@ export function validateKeeperRoleSeparation(
     const runtimeCollision = seen.get(address);
     if (runtimeCollision || address === challengerAddress) {
       throw new Error(
-        `Mainnet ${label} must be independent from runtime and challenger wallets: it matches ${runtimeCollision ?? "oracle challenger"}`,
+        `Non-local ${label} must be independent from runtime and challenger wallets: it matches ${runtimeCollision ?? "oracle challenger"}`,
       );
     }
+  }
+}
+
+export function validateKeeperFeeTreasurySeparation(
+  cluster: string,
+  roles: KeeperRolePublicKeys,
+  feeTreasury: PublicKey,
+): void {
+  if (normalizeLaunchCluster(cluster) === "localnet") return;
+
+  const treasuryAddress = feeTreasury.toBase58();
+  const reservedRoles: Array<[string, PublicKey | null]> = [
+    ["fee payer", roles.feePayer],
+    ["oracle reporter", roles.oracleReporter],
+    ["oracle finalizer", roles.oracleFinalizer],
+    ["oracle challenger", roles.oracleChallenger],
+    ["CLOB market operator", roles.clobMarketOperator],
+    ["market maker", roles.marketMaker],
+    ["oracle config authority", roles.oracleConfigAuthority],
+    ["CLOB config authority", roles.clobConfigAuthority],
+  ];
+  const collision = reservedRoles.find(
+    ([, role]) => role?.toBase58() === treasuryAddress,
+  );
+  if (collision) {
+    throw new Error(
+      `Non-local fee treasury must be independent from keeper roles: it matches ${collision[0]}`,
+    );
   }
 }

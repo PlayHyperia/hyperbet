@@ -15,11 +15,17 @@ import { resolveExpectedUpgradeAuthority } from "../keeper/src/solanaProgramIden
 import { readKeypairPubkey, resolveStageAWalletPath } from "./stage-a-identity";
 import { describeRpcEndpoint } from "./solana-deployment-evidence";
 import { fetchSolanaProgramDeploymentIdentity } from "./solana-deployment-identity";
+import { FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION } from "../account-schema";
+import { evaluateFightOracleAccountSchema } from "./solana-account-schema";
 import {
   resolveSolanaDuelLaunchConfig,
   serializeSolanaDuelLaunchConfig,
   type SolanaDuelLaunchConfig,
 } from "./solana-launch-config";
+import {
+  pauseStateFailures,
+  resolveDeploymentPauseExpectation,
+} from "./deployment-pause-expectation";
 
 interface OracleConfigAccount {
   authority: PublicKey;
@@ -29,6 +35,7 @@ interface OracleConfigAccount {
   disputeWindowSecs: anchor.BN;
   paused: boolean;
   configFrozen: boolean;
+  accountSchemaVersion: number;
 }
 
 interface MarketConfigAccount {
@@ -68,7 +75,7 @@ function parseCluster(): SolanaV1Cluster {
 
 function usage(): never {
   console.log(
-    "usage: node --import tsx packages/hyperbet-solana/scripts/verify-deployment.ts [--cluster devnet|testnet|mainnet-beta|localnet] [--out <path>]",
+    "usage: node --import tsx packages/hyperbet-solana/scripts/verify-deployment.ts [--cluster devnet|testnet|mainnet-beta|localnet] [--out <path>] [--expect-oracle-paused=true|false] [--expect-order-placement-paused=true|false] [--expect-market-creation-paused=true|false]",
   );
   process.exit(0);
 }
@@ -145,6 +152,11 @@ function verifyOracleConfig(input: {
   appendCheck(input.state !== null, "oracle config exists", input.failures);
   if (!input.state) return;
   appendCheck(
+    input.state.accountSchemaVersion === FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION,
+    `oracle account schema is v${FIGHT_ORACLE_ACCOUNT_SCHEMA_VERSION}`,
+    input.failures,
+  );
+  appendCheck(
     input.state.authority.equals(input.authority),
     `oracle authority matches ${input.authority.toBase58()}`,
     input.failures,
@@ -168,11 +180,6 @@ function verifyOracleConfig(input: {
     input.state.disputeWindowSecs.toNumber() ===
       input.expected.disputeWindowSecs,
     `oracle dispute window is ${input.expected.disputeWindowSecs} seconds`,
-    input.failures,
-  );
-  appendCheck(
-    input.state.paused === false,
-    "oracle is not paused",
     input.failures,
   );
   appendCheck(
@@ -232,16 +239,6 @@ function verifyMarketConfig(input: {
     input.failures,
   );
   appendCheck(
-    input.state.orderPlacementPaused === false,
-    "market order placement is not paused",
-    input.failures,
-  );
-  appendCheck(
-    input.state.marketCreationPaused === false,
-    "market creation is not paused",
-    input.failures,
-  );
-  appendCheck(
     input.state.configFrozen === true,
     "market config is frozen",
     input.failures,
@@ -258,6 +255,9 @@ async function main(): Promise<void> {
 
   const cluster = parseCluster();
   const outPath = parseArg("--out");
+  const pauseExpectation = resolveDeploymentPauseExpectation(
+    process.argv.slice(2),
+  );
   const configAuthority = resolveConfigAuthority();
   const expectedConfig = resolveSolanaDuelLaunchConfig({
     env: process.env,
@@ -298,6 +298,18 @@ async function main(): Promise<void> {
   ]);
   if (oracleIdentity.mode !== "upgrade" || marketIdentity.mode !== "upgrade") {
     throw new Error("deployment verification requires both programs on-chain");
+  }
+  const rawOracleSchema = evaluateFightOracleAccountSchema({
+    programId: oracleProgramId,
+    oracleConfigAccount: await connection.getAccountInfo(
+      deriveOracleConfigPda(oracleProgramId),
+      "finalized",
+    ),
+  });
+  if (rawOracleSchema.status !== "current") {
+    throw new Error(
+      "deployment verification requires an initialized v2 oracle config",
+    );
   }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -352,6 +364,26 @@ async function main(): Promise<void> {
     expected: expectedConfig,
     failures,
   });
+  if (oracleState && marketState) {
+    const pauseFailures = pauseStateFailures(
+      {
+        oraclePaused: oracleState.paused,
+        orderPlacementPaused: marketState.orderPlacementPaused,
+        marketCreationPaused: marketState.marketCreationPaused,
+      },
+      pauseExpectation,
+    );
+    if (pauseFailures.length === 0) {
+      appendCheck(
+        true,
+        "all pause states match the explicit expectation",
+        failures,
+      );
+    } else {
+      for (const failure of pauseFailures)
+        appendCheck(false, failure, failures);
+    }
+  }
 
   const summary = {
     generatedAt: new Date().toISOString(),
@@ -361,6 +393,12 @@ async function main(): Promise<void> {
     status: failures.length === 0 ? "pass" : "fail",
     failures,
     configAuthority: configAuthority.toBase58(),
+    pauseExpectation,
+    observedPauseState: {
+      oraclePaused: oracleState?.paused ?? null,
+      orderPlacementPaused: marketState?.orderPlacementPaused ?? null,
+      marketCreationPaused: marketState?.marketCreationPaused ?? null,
+    },
     expectedConfig: serializeSolanaDuelLaunchConfig(expectedConfig),
     programs: {
       fightOracle: {

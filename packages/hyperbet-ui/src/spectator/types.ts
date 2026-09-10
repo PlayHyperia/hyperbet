@@ -1,9 +1,5 @@
 export type StreamingPhase =
-  | "IDLE"
-  | "ANNOUNCEMENT"
-  | "COUNTDOWN"
-  | "FIGHTING"
-  | "RESOLUTION";
+  "IDLE" | "ANNOUNCEMENT" | "COUNTDOWN" | "FIGHTING" | "RESOLUTION";
 
 export interface AgentInfo {
   id: string;
@@ -18,16 +14,69 @@ export interface AgentInfo {
   damageDealtThisFight: number;
   equipment?: Readonly<Record<string, string>>;
   inventory?: ReadonlyArray<{
-    slot: number;
+    slot?: number;
     itemId: string;
     quantity: number;
-  }>;
+  } | null>;
+  loadoutFingerprint?: unknown;
+  availableCombatStyles?: unknown;
+  combatLoadouts?: unknown;
+  loadoutFrozen?: unknown;
+  strategySummary?: unknown;
 }
+
+export type RendererHealthDerivation = {
+  schemaVersion: 1;
+  evaluatedAtMs: number | null;
+  canonicalCycleId: string | null;
+  canonicalPhase: string | null;
+  externalSnapshotPresent: boolean;
+  externalSnapshotUpdatedAt: number | null;
+  rendererPresent: boolean;
+  rendererReady: boolean | null;
+  rendererPhase: string | null;
+  rendererDegradedReason: string | null;
+  rendererUpdatedAt: number | null;
+  scenePresent: boolean;
+  sceneReady: boolean | null;
+  sceneCycleId: string | null;
+  scenePhase: string | null;
+  captureClientConnected: boolean | null;
+  captureFfmpegRunning: boolean | null;
+};
 
 export interface RendererHealthInfo {
   ready: boolean;
   degradedReason: string | null;
   updatedAt: number | null;
+  derivation?: RendererHealthDerivation | null;
+}
+
+export interface StreamingDuelActionObservation {
+  readonly schemaVersion: 1;
+  readonly sequence: number;
+  readonly tick: number;
+  readonly observedAt: number;
+  readonly cycleId: string;
+  readonly duelId: string;
+  readonly actorId: string;
+  readonly opponentId: string;
+  readonly phase: "FIGHTING";
+  readonly combatRole: "melee" | "ranged" | "mage";
+  readonly tacticalMacro:
+    "pressure" | "hold_range" | "kite" | "orbit" | "defensive_reset" | "finish";
+  readonly action:
+    | "movement"
+    | "engagement"
+    | "food"
+    | "prayer"
+    | "style"
+    | "role_switch"
+    | "damage";
+  readonly outcome:
+    "accepted" | "committed" | "deferred" | "rejected" | "error";
+  readonly value: string;
+  readonly amount: number | null;
 }
 
 export interface LeaderboardEntry {
@@ -52,6 +101,8 @@ export interface StreamingCycle {
   agent2: AgentInfo | null;
   duelId?: string | null;
   duelKeyHex?: string | null;
+  competitiveSnapshotVersion?: number | null;
+  competitiveSnapshotDigest?: string | null;
   betOpenTime?: number | null;
   betCloseTime?: number | null;
   countdown: number | null;
@@ -60,6 +111,8 @@ export interface StreamingCycle {
   winnerId: string | null;
   winnerName: string | null;
   winReason: string | null;
+  cancellationReason?: string | null;
+  actionObservations?: readonly StreamingDuelActionObservation[];
   rendererHealth?: RendererHealthInfo | null;
   seed?: string | null;
   replayHash?: string | null;
@@ -70,6 +123,8 @@ export interface StreamingStateUpdate {
   cycle: StreamingCycle;
   leaderboard: LeaderboardEntry[];
   cameraTarget: string | null;
+  /** Category-only public preparation summary; consumers must parse strictly. */
+  preparation?: unknown;
   seq?: number;
   emittedAt?: number;
 }

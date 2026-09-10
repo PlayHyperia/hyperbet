@@ -3,7 +3,10 @@ import { describe, expect, test } from "bun:test";
 import {
   deriveSolanaBettorShellState,
   getSolanaBettorShellMessage,
+  hasRequiredSolanaLegalDocuments,
+  isSolanaProgramDeploymentReady,
   normalizePublicLegalDocumentUrl,
+  retainSolanaMarketPanelSession,
   resolvePublicLegalDocumentUrls,
   type SolanaBettorShellInput,
 } from "../../src/lib/solanaBettorShell";
@@ -11,6 +14,7 @@ import { parseSolanaLaunchReadiness } from "../../src/lib/useSolanaLaunchReadine
 
 const DUEL_KEY = "ab".repeat(32);
 const OTHER_DUEL_KEY = "cd".repeat(32);
+const MARKET_REF = "canonical-market";
 const NOW_MS = 1_700_000_000_000;
 
 function makeInput(
@@ -45,17 +49,41 @@ function makeInput(
     lifecycleMarket: {
       duelId: "duel-42",
       duelKey: DUEL_KEY,
+      marketRef: MARKET_REF,
       lifecycleStatus: "OPEN",
     },
     marketSnapshot: {
       duelKeyHex: DUEL_KEY,
+      marketRef: MARKET_REF,
       marketStatus: "open",
+      tradingReady: true,
     },
     ...overrides,
   };
 }
 
 describe("Solana bettor shell authority gate", () => {
+  test("retains a mounted market panel through transient authority loss", () => {
+    expect(
+      retainSolanaMarketPanelSession({
+        retained: false,
+        canAccessMarketPanel: true,
+      }),
+    ).toBe(true);
+    expect(
+      retainSolanaMarketPanelSession({
+        retained: true,
+        canAccessMarketPanel: false,
+      }),
+    ).toBe(true);
+    expect(
+      retainSolanaMarketPanelSession({
+        retained: false,
+        canAccessMarketPanel: false,
+      }),
+    ).toBe(false);
+  });
+
   test("loads fail-closed while program deployment is being checked", () => {
     const state = deriveSolanaBettorShellState(
       makeInput({ programsChecked: false, programsReady: false }),
@@ -138,7 +166,9 @@ describe("Solana bettor shell authority gate", () => {
       makeInput({
         marketSnapshot: {
           duelKeyHex: OTHER_DUEL_KEY,
+          marketRef: MARKET_REF,
           marketStatus: "open",
+          tradingReady: true,
         },
       }),
     );
@@ -147,6 +177,34 @@ describe("Solana bettor shell authority gate", () => {
     expect(state.canOpenMarketPanel).toBe(true);
     expect(state.canPlaceBet).toBe(false);
     expect(state.showMarketData).toBe(false);
+  });
+
+  test("rejects a noncanonical market reference and a paused config", () => {
+    const wrongMarket = deriveSolanaBettorShellState(
+      makeInput({
+        marketSnapshot: {
+          duelKeyHex: DUEL_KEY,
+          marketRef: "other-market",
+          marketStatus: "open",
+          tradingReady: true,
+        },
+      }),
+    );
+    const paused = deriveSolanaBettorShellState(
+      makeInput({
+        marketSnapshot: {
+          duelKeyHex: DUEL_KEY,
+          marketRef: MARKET_REF,
+          marketStatus: "open",
+          tradingReady: false,
+        },
+      }),
+    );
+
+    expect(wrongMarket.showMarketData).toBe(false);
+    expect(wrongMarket.canPlaceBet).toBe(false);
+    expect(paused.showMarketData).toBe(true);
+    expect(paused.canPlaceBet).toBe(false);
   });
 
   test("blocks open-market controls until real legal documents are configured", () => {
@@ -197,11 +255,14 @@ describe("Solana bettor shell authority gate", () => {
         lifecycleMarket: {
           duelId: "duel-42",
           duelKey: DUEL_KEY,
+          marketRef: MARKET_REF,
           lifecycleStatus: "LOCKED",
         },
         marketSnapshot: {
           duelKeyHex: DUEL_KEY,
+          marketRef: MARKET_REF,
           marketStatus: "locked",
+          tradingReady: false,
         },
       }),
     );
@@ -210,6 +271,103 @@ describe("Solana bettor shell authority gate", () => {
     expect(state.canOpenMarketPanel).toBe(true);
     expect(state.canPlaceBet).toBe(false);
     expect(state.actionLabel).toBe("View Market");
+  });
+
+  test("distinguishes exact public duel completion from pending on-chain settlement", () => {
+    for (const [phase, reason, message] of [
+      [
+        "RESOLUTION",
+        "duel-complete-settlement-pending",
+        /duel complete.*settlement is pending/i,
+      ],
+      [
+        "CANCELLED",
+        "duel-cancelled-settlement-pending",
+        /duel cancelled.*settlement is pending/i,
+      ],
+    ] as const) {
+      const state = deriveSolanaBettorShellState(
+        makeInput({
+          streamCycle: { ...makeInput().streamCycle, phase },
+          lifecycleMarket: {
+            duelId: "duel-42",
+            duelKey: DUEL_KEY,
+            marketRef: MARKET_REF,
+            lifecycleStatus: "LOCKED",
+          },
+          marketSnapshot: {
+            duelKeyHex: DUEL_KEY,
+            marketRef: MARKET_REF,
+            marketStatus: "locked",
+            tradingReady: false,
+          },
+        }),
+      );
+
+      expect(state.mode).toBe("locked");
+      expect(state.reason).toBe(reason);
+      expect(state.canOpenMarketPanel).toBe(true);
+      expect(state.canPlaceBet).toBe(false);
+      expect(state.actionLabel).toBe("View Market");
+      expect(getSolanaBettorShellMessage(state.reason)).toMatch(message);
+    }
+
+    const mismatchedStream = deriveSolanaBettorShellState(
+      makeInput({
+        streamCycle: {
+          ...makeInput().streamCycle,
+          phase: "RESOLUTION",
+          duelKeyHex: OTHER_DUEL_KEY,
+        },
+        lifecycleMarket: {
+          duelId: "duel-42",
+          duelKey: DUEL_KEY,
+          marketRef: MARKET_REF,
+          lifecycleStatus: "LOCKED",
+        },
+        marketSnapshot: {
+          duelKeyHex: DUEL_KEY,
+          marketRef: MARKET_REF,
+          marketStatus: "locked",
+          tradingReady: false,
+        },
+      }),
+    );
+
+    expect(mismatchedStream.reason).toBe("market-locked");
+    expect(getSolanaBettorShellMessage(mismatchedStream.reason)).toBe(
+      "Betting locked.",
+    );
+  });
+
+  test("distinguishes proposed and challenged results from an ordinary betting lock", () => {
+    for (const [lifecycleStatus, reason, message] of [
+      ["PROPOSED", "result-proposed", /dispute window open/i],
+      ["CHALLENGED", "result-challenged", /resolution pending/i],
+    ] as const) {
+      const state = deriveSolanaBettorShellState(
+        makeInput({
+          lifecycleMarket: {
+            duelId: "duel-42",
+            duelKey: DUEL_KEY,
+            marketRef: MARKET_REF,
+            lifecycleStatus,
+          },
+          marketSnapshot: {
+            duelKeyHex: DUEL_KEY,
+            marketRef: MARKET_REF,
+            marketStatus: "locked",
+            tradingReady: false,
+          },
+        }),
+      );
+
+      expect(state.mode).toBe("locked");
+      expect(state.reason).toBe(reason);
+      expect(state.canOpenMarketPanel).toBe(true);
+      expect(state.canPlaceBet).toBe(false);
+      expect(getSolanaBettorShellMessage(state.reason)).toMatch(message);
+    }
   });
 
   test("keeps verified settlement accessible without claiming the stream is live", () => {
@@ -221,11 +379,14 @@ describe("Solana bettor shell authority gate", () => {
         lifecycleMarket: {
           duelId: "duel-42",
           duelKey: DUEL_KEY,
+          marketRef: MARKET_REF,
           lifecycleStatus: "RESOLVED",
         },
         marketSnapshot: {
           duelKeyHex: DUEL_KEY,
+          marketRef: MARKET_REF,
           marketStatus: "resolved",
+          tradingReady: false,
         },
       }),
     );
@@ -244,11 +405,14 @@ describe("Solana bettor shell authority gate", () => {
         lifecycleMarket: {
           duelId: "duel-42",
           duelKey: DUEL_KEY,
+          marketRef: MARKET_REF,
           lifecycleStatus: "CANCELLED",
         },
         marketSnapshot: {
           duelKeyHex: DUEL_KEY,
+          marketRef: MARKET_REF,
           marketStatus: "cancelled",
+          tradingReady: false,
         },
       }),
     );
@@ -302,6 +466,10 @@ describe("Solana bettor shell authority gate", () => {
       "verifying-market",
       "market-open",
       "market-locked",
+      "duel-complete-settlement-pending",
+      "duel-cancelled-settlement-pending",
+      "result-proposed",
+      "result-challenged",
       "settlement-available",
       "refund-review",
     ].map((reason) =>
@@ -314,6 +482,48 @@ describe("Solana bettor shell authority gate", () => {
     expect(messages.join(" ")).not.toMatch(
       /rpc|429|json|exception|program id|duel key/i,
     );
+  });
+});
+
+describe("Solana program deployment freshness", () => {
+  const healthySnapshot = {
+    checked: true,
+    cluster: true,
+    oracle: true,
+    market: true,
+    verifiedAtMs: NOW_MS - 5_000,
+  };
+
+  test("accepts an exact deployment check at the freshness boundary", () => {
+    expect(
+      isSolanaProgramDeploymentReady({
+        snapshot: { ...healthySnapshot, verifiedAtMs: NOW_MS - 15_000 },
+        nowMs: NOW_MS,
+        maxAgeMs: 15_000,
+      }),
+    ).toBe(true);
+  });
+
+  test("fails closed on stale, future, incomplete, or invalid checks", () => {
+    const snapshots = [
+      { ...healthySnapshot, verifiedAtMs: NOW_MS - 15_001 },
+      { ...healthySnapshot, verifiedAtMs: NOW_MS + 1 },
+      { ...healthySnapshot, checked: false },
+      { ...healthySnapshot, cluster: false },
+      { ...healthySnapshot, oracle: false },
+      { ...healthySnapshot, market: false },
+      { ...healthySnapshot, verifiedAtMs: null },
+    ];
+
+    for (const snapshot of snapshots) {
+      expect(
+        isSolanaProgramDeploymentReady({
+          snapshot,
+          nowMs: NOW_MS,
+          maxAgeMs: 15_000,
+        }),
+      ).toBe(false);
+    }
   });
 });
 
@@ -348,9 +558,61 @@ describe("Solana launch readiness envelope", () => {
     ).toBe(false);
     expect(parseSolanaLaunchReadiness(null)).toBe(false);
   });
+
+  test("rejects a stale or implausibly future readiness envelope", () => {
+    const payload = {
+      ok: true,
+      service: "hyperbet-solana-backend",
+      now: NOW_MS,
+      readiness: { ready: true },
+    };
+    const timing = {
+      nowMs: NOW_MS + 15_000,
+      maxAgeMs: 15_000,
+      maxFutureSkewMs: 5_000,
+    };
+
+    expect(parseSolanaLaunchReadiness(payload, timing)).toBe(true);
+    expect(
+      parseSolanaLaunchReadiness(payload, {
+        ...timing,
+        nowMs: NOW_MS + 15_001,
+      }),
+    ).toBe(false);
+    expect(
+      parseSolanaLaunchReadiness(
+        { ...payload, now: NOW_MS + 5_001 },
+        { ...timing, nowMs: NOW_MS },
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("public legal document URLs", () => {
+  test("exempts disposable localnet funds without weakening public clusters", () => {
+    expect(
+      hasRequiredSolanaLegalDocuments({
+        isLocalTestCluster: true,
+        legalDocumentUrls: null,
+      }),
+    ).toBe(true);
+    expect(
+      hasRequiredSolanaLegalDocuments({
+        isLocalTestCluster: false,
+        legalDocumentUrls: null,
+      }),
+    ).toBe(false);
+    expect(
+      hasRequiredSolanaLegalDocuments({
+        isLocalTestCluster: false,
+        legalDocumentUrls: {
+          termsUrl: "https://legal.hyperia.example/terms",
+          privacyUrl: "https://legal.hyperia.example/privacy",
+        },
+      }),
+    ).toBe(true);
+  });
+
   test("accepts HTTPS documents and same-origin local development paths", () => {
     expect(
       normalizePublicLegalDocumentUrl(

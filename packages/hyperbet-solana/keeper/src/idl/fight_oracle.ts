@@ -5,7 +5,7 @@
  * IDL can be found at `target/idl/fight_oracle.json`.
  */
 export type FightOracle = {
-  "address": "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
+  "address": "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
   "metadata": {
     "name": "fightOracle",
     "version": "0.1.0",
@@ -385,7 +385,7 @@ export type FightOracle = {
         },
         {
           "name": "program",
-          "address": "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM"
+          "address": "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu"
         },
         {
           "name": "programData"
@@ -937,6 +937,19 @@ export type FightOracle = {
           }
         },
         {
+          "name": "competitiveSnapshotVersion",
+          "type": "u32"
+        },
+        {
+          "name": "competitiveSnapshotDigest",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
           "name": "betOpenTs",
           "type": "i64"
         },
@@ -1200,27 +1213,52 @@ export type FightOracle = {
     {
       "code": 6025,
       "name": "timingImmutable",
-      "msg": "Bet timing is immutable after betting opens"
+      "msg": "Duel timing is immutable after betting opens"
     },
     {
       "code": 6026,
+      "name": "invalidCompetitiveSnapshot",
+      "msg": "Competitive snapshot version and digest must be present"
+    },
+    {
+      "code": 6027,
+      "name": "competitiveSnapshotImmutable",
+      "msg": "Competitive snapshot commitment is immutable after betting opens"
+    },
+    {
+      "code": 6028,
+      "name": "resultHashMismatch",
+      "msg": "Result hash does not match the canonical duel outcome commitment"
+    },
+    {
+      "code": 6029,
+      "name": "unsupportedAccountSchema",
+      "msg": "Account schema version is unsupported; use a fresh v2 program identity"
+    },
+    {
+      "code": 6030,
       "name": "alreadyInitialized",
       "msg": "Config is already initialized"
     },
     {
-      "code": 6027,
+      "code": 6031,
       "name": "oraclePaused",
       "msg": "Oracle operations are paused"
     },
     {
-      "code": 6028,
+      "code": 6032,
       "name": "configFrozen",
       "msg": "Config is permanently frozen"
     },
     {
-      "code": 6029,
+      "code": 6033,
       "name": "metadataUriTooLong",
       "msg": "Metadata URI exceeds 200 byte limit"
+    },
+    {
+      "code": 6034,
+      "name": "configNotFrozen",
+      "msg": "Oracle config must be permanently frozen before betting opens"
     }
   ],
   "types": [
@@ -1453,6 +1491,23 @@ export type FightOracle = {
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "competitiveSnapshotVersion",
+            "type": "u32"
+          },
+          {
+            "name": "competitiveSnapshotDigest",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "accountSchemaVersion",
+            "type": "u16"
           }
         ]
       }
@@ -1521,6 +1576,19 @@ export type FightOracle = {
             "type": "i64"
           },
           {
+            "name": "competitiveSnapshotVersion",
+            "type": "u32"
+          },
+          {
+            "name": "competitiveSnapshotDigest",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
             "name": "metadataUri",
             "type": "string"
           }
@@ -1580,6 +1648,10 @@ export type FightOracle = {
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "accountSchemaVersion",
+            "type": "u16"
           }
         ]
       }

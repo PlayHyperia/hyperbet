@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   type CSSProperties,
   useCallback,
   useEffect,
@@ -25,7 +27,14 @@ import {
 
 import { findClobConfigPda, findClobVaultPda } from "../lib/clobPdas";
 import { duelKeyHexToBytes, shortDuelKey } from "../lib/duelKey";
-import { deriveTwoSidedClobProbabilityPercent } from "../lib/solanaMarketPresentation";
+import {
+  deriveTwoSidedClobProbabilityPercent,
+  shouldRenderSolanaClobStatusRow,
+} from "../lib/solanaMarketPresentation";
+import {
+  deriveSolanaMarketAuthorityState,
+  failClosedSolanaMarketSnapshot,
+} from "../lib/solanaMarketAuthority";
 import {
   DUEL_WINNER_MARKET_KIND,
   findDuelStatePda,
@@ -74,30 +83,69 @@ import {
   type SolanaRestingOrderQuote,
 } from "../lib/solanaOrderQuote";
 import { isSolanaOrderConfirmationQuoteCurrent } from "../lib/solanaOrderConfirmation";
+import { getSolanaCancellationRefundDisclosure } from "../lib/solanaOrderDisclosure";
 import {
   assertSolanaManagedOrderBookLinks,
   buildSolanaManagedOrderPlan,
+  normalizeSolanaManagedOrderPlanForPriceLevel,
+  resolveSolanaManagedPriceLevelForClosure,
   sameSolanaManagedOrderQuote,
+  selectPresentableSolanaManagedOrders,
+  shouldCloseEmptySolanaUserBalance,
   type SolanaManagedOrderAction,
   type SolanaManagedOrderPlan,
   type SolanaManagedOrderSnapshot,
+  type SolanaManagedPriceLevelSnapshot,
 } from "../lib/solanaOrderManagement";
 import {
+  buildSolanaTransactionContextKey,
   classifySolanaTransactionError,
+  isSolanaMarketLoadedForDuel,
   SolanaTransactionFlowError,
   type SolanaTransactionStage,
 } from "../lib/solanaTransactionFeedback";
+import { shouldExposeSolanaDebugSurface } from "../lib/solanaDebugSurface";
+import { inspectSolanaSignedTransactionIntegrity } from "../lib/solanaSignedTransactionIntegrity";
+import {
+  releaseSolanaTransactionContextLock,
+  type SolanaTransactionContextToken,
+  useSolanaTransactionContextBoundary,
+} from "../lib/useSolanaTransactionContextBoundary";
+import {
+  type SolanaWagerAuthorityBoundary,
+  SolanaWagerAuthorityChangedError,
+  type SolanaWagerAuthorityEpoch,
+  restoreSolanaOrderConfirmationFocus,
+  runSolanaWagerPreBroadcastFlow,
+  useInvalidateSolanaOrderConfirmationOnTradingDisabled,
+} from "../lib/useSolanaOrderConfirmationAuthorityBoundary";
+import { ViewportModalPortal } from "../lib/viewportModalPortal";
+import { lockDocumentScroll } from "../lib/modalScrollLock";
+import { emitHyperbetProductEvent } from "../lib/productAnalytics";
+import {
+  dispatchHyperbetMarketRefresh,
+  type HyperbetConfirmedSettlementRefresh,
+} from "../lib/marketRefresh";
 import { useStreamingState } from "../spectator/useStreamingState";
 import {
   PredictionMarketPanel,
   type ChartDataPoint,
 } from "./PredictionMarketPanel";
+import { SolanaLimitPriceField } from "./SolanaLimitPriceField";
+import {
+  SolanaOrderQuoteNotice,
+  type SolanaOrderQuoteNoticeKind,
+} from "./SolanaOrderQuoteNotice";
 import { type OrderLevel } from "./OrderBook";
 import { SolanaManagedOrders } from "./SolanaManagedOrders";
 import { SolanaManagedOrderConfirmationDialog } from "./SolanaManagedOrderConfirmationDialog";
 import { SolanaPointsDisplay } from "./SolanaPointsDisplay";
 import {
-  SolanaSettlementHistory,
+  SolanaSettlementActionCard,
+  type SolanaSettlementActionKind,
+} from "./SolanaSettlementActionCard";
+import {
+  type SolanaBalanceCleanupRequest,
   type SolanaHistoricalOrderRequest,
   type SolanaSettlementRequest,
 } from "./SolanaSettlementHistory";
@@ -109,6 +157,16 @@ import {
 import { type Trade } from "./RecentTrades";
 
 type BetSide = "YES" | "NO";
+
+const DeferredSolanaSettlementHistory = lazy(async () => ({
+  default: (await import("./SolanaSettlementHistory")).SolanaSettlementHistory,
+}));
+
+type OrderConfirmationSummary = {
+  side: BetSide;
+  fighterName: string;
+  grossPayoutLamports: bigint;
+};
 
 async function getMultipleAccountInfosConfirmed(
   connection: Connection,
@@ -140,6 +198,8 @@ type UserPosition = {
 type MarketSnapshot = {
   duelId: string;
   duelKeyHex: string;
+  competitiveSnapshotVersion: number | null;
+  competitiveSnapshotDigest: string | null;
   duelState: PublicKey;
   marketState: PublicKey;
   vault: PublicKey;
@@ -154,6 +214,7 @@ type MarketSnapshot = {
   tradeTreasuryFeeBpsSnapshot: number;
   tradeMarketMakerFeeBpsSnapshot: number;
   winningsMarketMakerFeeBpsSnapshot: number;
+  tradingReady: boolean;
   restingOrders: SolanaRestingOrderQuote[];
 };
 
@@ -161,7 +222,7 @@ type SettlementExecutionTarget = Pick<
   MarketSnapshot,
   "duelState" | "marketState" | "vault" | "marketMaker"
 > & {
-  claimKind: PredictionMarketClaimKind;
+  claimKind: PredictionMarketClaimKind | "EMPTY_BALANCE_RENT";
 };
 
 type OrderTrackingIntent = {
@@ -230,6 +291,7 @@ type OrderAccount = {
     id: BN | bigint | number;
     side: number;
     price: number;
+    orderBehavior: number;
     maker: PublicKey;
     amount: BN | bigint | number;
     filled: BN | bigint | number;
@@ -260,11 +322,19 @@ function managedOrderSnapshot(entry: OrderAccount): SolanaManagedOrderSnapshot {
   if (side !== SIDE_BID && side !== SIDE_ASK) {
     throw new Error("Order contains an invalid side");
   }
+  const orderBehavior = Number(entry.account.orderBehavior);
+  if (
+    orderBehavior !== ORDER_BEHAVIOR_GTC &&
+    orderBehavior !== ORDER_BEHAVIOR_POST_ONLY
+  ) {
+    throw new Error("Order contains a non-resting behavior");
+  }
   return {
     marketState: entry.account.marketState.toBase58(),
     id: asBigInt(entry.account.id),
     side,
     price: Number(entry.account.price),
+    orderBehavior,
     maker: entry.account.maker.toBase58(),
     amount: asBigInt(entry.account.amount),
     filled: asBigInt(entry.account.filled),
@@ -278,6 +348,7 @@ function managedOrderSnapshot(entry: OrderAccount): SolanaManagedOrderSnapshot {
 const SIDE_BID = 1;
 const SIDE_ASK = 2;
 const ORDER_BEHAVIOR_GTC = 0;
+const ORDER_BEHAVIOR_POST_ONLY = 2;
 const MAX_MATCHES_PER_TX = 50;
 const USER_BALANCE_ACCOUNT_SPACE = 120;
 const ORDER_ACCOUNT_SPACE = 119;
@@ -460,6 +531,148 @@ function parsePublicKeyOrNull(
   }
 }
 
+function publicKeyAddress(value: unknown): string {
+  try {
+    if (value instanceof PublicKey) return value.toBase58();
+    if (typeof value === "string") return new PublicKey(value).toBase58();
+    if (value && typeof value === "object" && "toBase58" in value) {
+      return new PublicKey(
+        (value as { toBase58(): string }).toBase58(),
+      ).toBase58();
+    }
+  } catch {
+    // The authority validator treats an empty address as invalid.
+  }
+  return "";
+}
+
+function bytes32Hex(value: unknown): string {
+  const bytes =
+    value instanceof Uint8Array
+      ? Array.from(value)
+      : Array.isArray(value)
+        ? value.map(Number)
+        : null;
+  if (
+    !bytes ||
+    bytes.length !== 32 ||
+    bytes.some((entry) => !Number.isInteger(entry) || entry < 0 || entry > 255)
+  ) {
+    return "";
+  }
+  return Buffer.from(bytes).toString("hex");
+}
+
+export type SolanaCompetitiveSnapshotCommitment = Readonly<{
+  competitiveSnapshotVersion: number;
+  competitiveSnapshotDigest: string;
+}>;
+
+export function normalizeSolanaCompetitiveSnapshotCommitment(input: {
+  competitiveSnapshotVersion?: unknown;
+  competitiveSnapshotDigest?: unknown;
+}): SolanaCompetitiveSnapshotCommitment | null {
+  const version = input.competitiveSnapshotVersion;
+  const digest = bytes32Hex(input.competitiveSnapshotDigest);
+  if (
+    typeof version !== "number" ||
+    !Number.isSafeInteger(version) ||
+    version <= 0 ||
+    !digest ||
+    /^0+$/u.test(digest)
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    competitiveSnapshotVersion: version,
+    competitiveSnapshotDigest: digest,
+  });
+}
+
+type RetainableSolanaClobMarketSnapshot = {
+  duelKeyHex: string;
+  marketStatus: string;
+  winner: string | null;
+  tradingReady: boolean;
+  competitiveSnapshotVersion: number | null;
+  competitiveSnapshotDigest: string | null;
+};
+
+type FailedClosedSolanaClobMarketSnapshot<
+  T extends RetainableSolanaClobMarketSnapshot,
+> = Omit<T, "competitiveSnapshotVersion" | "competitiveSnapshotDigest"> & {
+  competitiveSnapshotVersion: null;
+  competitiveSnapshotDigest: null;
+};
+
+export function failClosedSolanaClobMarketSnapshot<
+  T extends RetainableSolanaClobMarketSnapshot,
+>(
+  snapshot: T | null,
+  currentDuelKeyHex: string | null,
+): FailedClosedSolanaClobMarketSnapshot<T> | null {
+  const retained = failClosedSolanaMarketSnapshot(snapshot, currentDuelKeyHex);
+  if (!retained) return null;
+  return {
+    ...retained,
+    competitiveSnapshotVersion: null,
+    competitiveSnapshotDigest: null,
+  };
+}
+
+function marketAuthorityState(input: {
+  requireCurrentConfig: boolean;
+  duelKeyHex: string;
+  duelState: PublicKey;
+  marketState: PublicKey;
+  advertisedMarketState: string | null;
+  marketAccount: Record<string, unknown>;
+  configAccount: Record<string, unknown>;
+}) {
+  return deriveSolanaMarketAuthorityState({
+    requireCurrentConfig: input.requireCurrentConfig,
+    canonicalDuelKeyHex: input.duelKeyHex,
+    canonicalDuelState: input.duelState.toBase58(),
+    canonicalMarketState: input.marketState.toBase58(),
+    advertisedMarketState: input.advertisedMarketState,
+    market: {
+      duelKeyHex: bytes32Hex(input.marketAccount.duelKey),
+      duelState: publicKeyAddress(input.marketAccount.duelState),
+      marketKind: Number(input.marketAccount.marketKind),
+      authority: publicKeyAddress(input.marketAccount.authority),
+      treasury: publicKeyAddress(input.marketAccount.treasury),
+      marketMaker: publicKeyAddress(input.marketAccount.marketMaker),
+      tradeTreasuryFeeBps: Number(
+        input.marketAccount.tradeTreasuryFeeBpsSnapshot,
+      ),
+      tradeMarketMakerFeeBps: Number(
+        input.marketAccount.tradeMarketMakerFeeBpsSnapshot,
+      ),
+      winningsMarketMakerFeeBps: Number(
+        input.marketAccount.winningsMarketMakerFeeBpsSnapshot,
+      ),
+    },
+    config: {
+      authority: publicKeyAddress(input.configAccount.authority),
+      marketOperator: publicKeyAddress(input.configAccount.marketOperator),
+      treasury: publicKeyAddress(input.configAccount.treasury),
+      marketMaker: publicKeyAddress(input.configAccount.marketMaker),
+      tradeTreasuryFeeBps: Number(input.configAccount.tradeTreasuryFeeBps),
+      tradeMarketMakerFeeBps: Number(
+        input.configAccount.tradeMarketMakerFeeBps,
+      ),
+      winningsMarketMakerFeeBps: Number(
+        input.configAccount.winningsMarketMakerFeeBps,
+      ),
+      orderPlacementPaused:
+        typeof input.configAccount.orderPlacementPaused === "boolean"
+          ? input.configAccount.orderPlacementPaused
+          : null,
+    },
+    duelWinnerMarketKind: DUEL_WINNER_MARKET_KIND,
+  });
+}
+
 function readSolanaE2eRuntimeOverride(): {
   duelKey: string | null;
   duelId: string | null;
@@ -508,11 +721,16 @@ interface SolanaClobPanelProps {
   walletOverride: SigningWalletLike;
   programAddresses: DuelProgramAddresses;
   readOnly?: boolean;
-  tradingEnabled?: boolean;
+  tradingEnabled: boolean;
+  tradingUnavailableMessage?: string;
 }
 
 export interface SolanaClobMarketSnapshot {
   duelKeyHex: string | null;
+  marketRef: string | null;
+  competitiveSnapshotVersion: number | null;
+  competitiveSnapshotDigest: string | null;
+  tradingReady: boolean;
   yesProbabilityPercent: number | null;
   matchLabel: string;
   marketStatus: string;
@@ -534,13 +752,25 @@ export function SolanaClobPanel({
   walletOverride,
   programAddresses,
   readOnly = false,
-  tradingEnabled = true,
+  tradingEnabled,
+  tradingUnavailableMessage,
 }: SolanaClobPanelProps) {
   const resolvedLocale = resolveUiLocale(locale);
   const isE2eMode =
-    !readOnly && (import.meta.env.MODE === "e2e" || import.meta.env.DEV);
+    !readOnly && Boolean(import.meta.env.MODE === "e2e" || import.meta.env.DEV);
+  const isE2eDebugMode =
+    typeof window !== "undefined" &&
+    shouldExposeSolanaDebugSurface({
+      isE2eMode,
+      search: window.location.search,
+    });
   const connection = connectionOverride;
   const wallet = walletOverride;
+  const orderEntryAvailable = !readOnly && tradingEnabled;
+  const showSecondaryStatus = shouldRenderSolanaClobStatusRow({
+    orderEntryAvailable,
+    tradingUnavailableMessage,
+  });
   const fightOracleProgramId = programAddresses.fightOracleProgramId;
   const duelMarketProgramId = programAddresses.duelMarketProgramId;
   const stableProgramAddresses = useMemo<DuelProgramAddresses>(
@@ -555,7 +785,7 @@ export function SolanaClobPanel({
   const [side, setSide] = useState<BetSide>("YES");
   const [amountInput, setAmountInput] = useState("1");
   const [priceInput, setPriceInput] = useState("500");
-  const [activeMarket, setActiveMarket] = useState<MarketSnapshot | null>(null);
+  const [loadedMarket, setActiveMarket] = useState<MarketSnapshot | null>(null);
   const [position, setPosition] = useState<UserPosition>({
     aShares: 0n,
     bShares: 0n,
@@ -586,6 +816,8 @@ export function SolanaClobPanel({
   const [orderConfirmationRows, setOrderConfirmationRows] = useState<
     Array<{ label: string; value: string }>
   >([]);
+  const [orderConfirmationSummary, setOrderConfirmationSummary] =
+    useState<OrderConfirmationSummary | null>(null);
   const [isPlacingOrder, setIsPlacingOrder] = useState(false);
   const [orderTransactionFeedback, setOrderTransactionFeedback] =
     useState<SolanaTransactionFeedbackState>(IDLE_SOLANA_TRANSACTION_FEEDBACK);
@@ -595,12 +827,17 @@ export function SolanaClobPanel({
   const [settlingHistoryBetId, setSettlingHistoryBetId] = useState<
     string | null
   >(null);
+  const [recoveringBalanceMarketPda, setRecoveringBalanceMarketPda] = useState<
+    string | null
+  >(null);
   const [preparingHistoryOrderBetId, setPreparingHistoryOrderBetId] = useState<
     string | null
   >(null);
   const [settlementFeedbackKind, setSettlementFeedbackKind] = useState<
-    "claim" | "refund" | "cleanup"
+    "claim" | "refund" | "cleanup" | "rent"
   >("claim");
+  const [canRecoverEmptyBalanceRent, setCanRecoverEmptyBalanceRent] =
+    useState(false);
   const [managedOrders, setManagedOrders] = useState<SolanaManagedOrderPlan[]>(
     [],
   );
@@ -618,28 +855,48 @@ export function SolanaClobPanel({
   >(null);
   const [lastClaimTx, setLastClaimTx] = useState("-");
   const [lastClaimError, setLastClaimError] = useState("-");
-  const [showDebug, setShowDebug] = useState(
-    () =>
-      isE2eMode &&
-      typeof window !== "undefined" &&
-      new URLSearchParams(window.location.search).has("debug"),
-  );
+  const [showDebug, setShowDebug] = useState(isE2eDebugMode);
   const [showAdminPanel, setShowAdminPanel] = useState(false);
 
   const lastQuoteRef = useRef<{
     duelKeyHex: string;
     probabilityPercent: number | null;
   } | null>(null);
-  const refreshPromiseRef = useRef<Promise<void> | null>(null);
+  const refreshPromiseRef = useRef<{
+    contextKey: string;
+    promise: Promise<void>;
+  } | null>(null);
   const orderConfirmationDialogRef = useRef<HTMLDivElement | null>(null);
   const orderConfirmationReturnFocusRef = useRef<HTMLElement | null>(null);
-  const orderSubmissionInProgressRef = useRef(false);
+  const orderSubmitButtonRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const orderSubmissionInProgressRef =
+    useRef<SolanaTransactionContextToken | null>(null);
+  const orderConfirmationAuthorityEpochRef =
+    useRef<SolanaWagerAuthorityEpoch | null>(null);
   const managedOrderDialogRef = useRef<HTMLDivElement | null>(null);
   const managedOrderReturnFocusRef = useRef<HTMLElement | null>(null);
-  const managedOrderSubmissionInProgressRef = useRef(false);
-  const settlementSubmissionInProgressRef = useRef(false);
-  const transactionContextRef = useRef<string | null>(null);
+  const managedOrderSubmissionInProgressRef =
+    useRef<SolanaTransactionContextToken | null>(null);
+  const settlementSubmissionInProgressRef =
+    useRef<SolanaTransactionContextToken | null>(null);
+  const settlementMutationContextRef = useRef<Omit<
+    HyperbetConfirmedSettlementRefresh,
+    "schemaVersion" | "mutation" | "signature"
+  > | null>(null);
   const orderTrackingIntentRef = useRef<OrderTrackingIntent | null>(null);
+
+  const wagerAuthorityBoundary =
+    useInvalidateSolanaOrderConfirmationOnTradingDisabled({
+      tradingEnabled,
+      confirmationOpen: orderConfirmationKey !== null,
+      onInvalidate: () => {
+        orderConfirmationAuthorityEpochRef.current = null;
+        setOrderConfirmationKey(null);
+        setOrderConfirmationRows([]);
+        setOrderConfirmationSummary(null);
+      },
+    });
 
   const useHeliusSender = SOLANA_CLUSTER === "mainnet-beta";
 
@@ -692,6 +949,12 @@ export function SolanaClobPanel({
     [streamedDuelKeyHex],
   );
   const duelKeyHex = pinnedE2eDuelKey ?? lifecycleDuelKey ?? streamedDuelKey;
+  const activeMarket = isSolanaMarketLoadedForDuel({
+    loadedDuelKeyHex: loadedMarket?.duelKeyHex,
+    currentDuelKeyHex: duelKeyHex,
+  })
+    ? loadedMarket
+    : null;
   const lifecycleMatchesActiveDuel =
     lifecycleDuelKey == null || lifecycleDuelKey === duelKeyHex;
   const activeLifecycleDuel = lifecycleMatchesActiveDuel ? lifecycleDuel : null;
@@ -707,6 +970,69 @@ export function SolanaClobPanel({
     (isE2eMode ? runtimeE2eOverride.duelId : null) ??
     streamedDuelId;
   const duelLabel = duelId ?? shortDuelKey(duelKeyHex);
+  const transactionContextKey = buildSolanaTransactionContextKey({
+    cluster: SOLANA_CLUSTER,
+    rpcEndpoint: connection.rpcEndpoint,
+    fightOracleProgramId,
+    duelMarketProgramId,
+    walletAddress: wallet.publicKey?.toBase58() ?? null,
+    duelKeyHex,
+    advertisedMarketAddress: lifecycleMarketRef,
+    loadedMarketAddress: activeMarket?.marketState.toBase58() ?? null,
+  });
+  const refreshContextKey = [
+    connection.rpcEndpoint,
+    fightOracleProgramId,
+    duelMarketProgramId,
+    wallet.publicKey?.toBase58() ?? "disconnected",
+    duelKeyHex ?? "no-duel",
+    lifecycleMarketRef ?? "canonical-market",
+  ].join(":");
+  const currentRefreshContextRef = useRef(refreshContextKey);
+  currentRefreshContextRef.current = refreshContextKey;
+  const {
+    currentContext: transactionContext,
+    isCurrentContext: isCurrentTransactionContext,
+  } = useSolanaTransactionContextBoundary(transactionContextKey, () => {
+    setOrderFundingEstimate(null);
+    setOrderFundingError(null);
+    orderConfirmationAuthorityEpochRef.current = null;
+    setOrderConfirmationKey(null);
+    setOrderConfirmationRows([]);
+    setOrderTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
+    setSettlementTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
+    setManagedOrderTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
+    setManagedOrderErrorMessage(null);
+    setSelectedManagedOrder(null);
+    setManagedOrders([]);
+    setPosition({
+      aShares: 0n,
+      bShares: 0n,
+      aLockedLamports: 0n,
+      bLockedLamports: 0n,
+      tradeTreasuryFeeLamports: 0n,
+      tradeMarketMakerFeeLamports: 0n,
+    });
+    setCanRecoverEmptyBalanceRent(false);
+    setLastOrderId(null);
+    setLastPlaceOrderTx("-");
+    setLastPlaceOrderError("-");
+    setLastPlaceOrderDebug("-");
+    setLastClaimTx("-");
+    setLastClaimError("-");
+    setIsPlacingOrder(false);
+    setIsSubmittingSettlement(false);
+    setSettlingHistoryBetId(null);
+    setRecoveringBalanceMarketPda(null);
+    setSubmittingManagedOrderId(null);
+    orderSubmissionInProgressRef.current = null;
+    settlementSubmissionInProgressRef.current = null;
+    managedOrderSubmissionInProgressRef.current = null;
+    orderTrackingIntentRef.current = null;
+    settlementMutationContextRef.current = null;
+    orderConfirmationReturnFocusRef.current = null;
+    managedOrderReturnFocusRef.current = null;
+  });
   const effectiveAgent1 = cycle?.agent1?.name ?? agent1Name;
   const effectiveAgent2 = cycle?.agent2?.name ?? agent2Name;
   const copy = useMemo(
@@ -715,7 +1041,7 @@ export function SolanaClobPanel({
         ? {
             unknown: "未知",
             connectWalletFirst: "请先连接钱包",
-            vaultNotReady: "市场金库尚未由运营方完成租金准备",
+            vaultNotReady: "市场正在完成链上准备，投注开放后将自动更新",
             marketConfigNotDeployed: "市场配置尚未部署",
             waitingOracleReporter: "对局已公布，等待预言机上报",
             waitingMarketOperator: "预言机已上线，等待市场运营方开启",
@@ -739,17 +1065,38 @@ export function SolanaClobPanel({
             positionCleared: "仓位已清理",
             clearPositionFailed: (message: string) =>
               `清理仓位失败：${message}`,
+            recoveringBalanceRentContext: "取回空余额账户租金",
+            balanceRentRecovered: "账户租金已取回",
+            balanceRentRecoveryFailed: (message: string) =>
+              `账户租金取回失败：${message}`,
+            balanceRentUnavailable:
+              "此余额账户目前没有可取回的租金。未发送任何交易。",
+            winningsReady: "收益可领取",
+            refundReady: "退款可领取",
+            cleanupRequired: "需要清理",
+            rentRecoveryReady: "租金可取回",
+            claimableNow: "当前可领取",
             claimWinningsTitle: "领取收益",
             claimRefundTitle: "领取退款",
             claimLocked: "暂无可领取结算",
             claimHelp: "对局结算后，可在这里领取获胜份额。",
-            claimRefundHelp: "若本局取消，可在这里领取退回资金。",
+            claimRefundHelp:
+              "若本局以平局或取消结束，可在这里领取已核实的退款。",
             claimCleanupTitle: "清理已结算仓位",
-            claimCleanupHelp: "若本局已判定负方，可在这里清理残留仓位状态。",
+            claimCleanupHelp:
+              "此仓位未获胜，没有可领取收益。请清理已结算的链上仓位状态。",
+            balanceRentTitle: "取回账户租金",
+            balanceRentHelp:
+              "此市场已无任何托管资金。可取回为已清空余额账户保留的 SOL 租金。",
             claim: "领取",
             clearPosition: "清理仓位",
+            recoverBalanceRent: "取回租金",
             payoutAmountLabel: "完全成交时的最高毛收益（SOL）",
+            amountInputHelp: "输入大于 0 的 SOL，最多 6 位小数。",
+            amountInputInvalid: "请输入大于 0 且最多 6 位小数的 SOL 数量。",
             limitPrice: "所选结果的限价概率（千分比）",
+            limitPriceHelp: "输入 1 到 999 的整数。",
+            limitPriceInvalid: "请输入 1 到 999 的整数。",
             orderReviewTitle: "签名前订单明细",
             selectedProbability: "所选结果限价概率",
             visibleFill: "当前可见成交",
@@ -767,8 +1114,7 @@ export function SolanaClobPanel({
             quoteLoading: "正在核对网络费、账户租金和钱包余额…",
             quoteUnavailable: (message: string) => `报价不可用：${message}`,
             insufficientBalance: "钱包余额不足以覆盖最坏情况资金需求",
-            refundDisclosure:
-              "取消或收回时，未成交抵押与挂单者支付的订单账户租金会返还原始挂单者；已收取的成交手续费不会退回。共享价格档账户租金不包含在内。",
+            refundDisclosure: getSolanaCancellationRefundDisclosure("zh"),
             selfTradeDisclosure:
               "检测到自己的对手盘；程序会停止撮合并退回剩余资金。",
             continuationDisclosure:
@@ -778,6 +1124,9 @@ export function SolanaClobPanel({
             confirmOrderTitle: "确认 SOL 订单",
             confirmOrderHelp:
               "请核对最高扣款和手续费/退款条款。只有在钱包批准签名后才会发送交易。",
+            confirmOrderSummary: (fighterName: string, side: BetSide) =>
+              `买入 ${fighterName}（${side}）`,
+            confirmGrossPayout: "最高毛收益",
             confirmAndSign: "确认并签名",
             confirmingOrder: "等待钱包…",
             cancelConfirmation: "返回修改",
@@ -804,6 +1153,7 @@ export function SolanaClobPanel({
               claim: "领取已在链上确认",
               refund: "退款已在链上确认",
               cleanup: "仓位清理已在链上确认",
+              rent: "账户租金取回已在链上确认",
             },
             managedOrderProgress: {
               preparing: "正在复核订单、市场与相邻挂单",
@@ -826,6 +1176,7 @@ export function SolanaClobPanel({
             reviewLatestSettlement: "核对最新结算状态",
             transactionReceipt: "查看交易",
             transactionSignature: "交易签名",
+            transactionDetails: "交易凭证详情",
             checkTransactionStatus: "核对链上交易状态",
             reviewLatestQuote: "核对最新报价",
             transactionPendingAfterCheck:
@@ -842,6 +1193,8 @@ export function SolanaClobPanel({
               QUOTE_STALE:
                 "订单簿或费用已变化，尚未发送交易。请核对刷新后的报价后再签名。",
               USER_REJECTED: "钱包拒绝了签名，未发送交易。请核对报价后重试。",
+              WALLET_INTEGRITY_FAILED:
+                "钱包更改了已核对的交易或返回了无效签名。交易未发送。请断开连接并改用受支持的钱包。",
               WALLET_DISCONNECTED: "钱包已断开。重新连接并核对最新报价后再试。",
               INSUFFICIENT_FUNDS:
                 "钱包资金不足以覆盖订单、手续费与账户租金。补充 SOL 后请重新核对报价。",
@@ -875,7 +1228,7 @@ export function SolanaClobPanel({
             unknown: "unknown",
             connectWalletFirst: "Connect wallet first",
             vaultNotReady:
-              "Market vault rent has not been provisioned by the operator",
+              "Market setup is finishing on-chain. Betting will open automatically.",
             marketConfigNotDeployed: "Market config not deployed",
             waitingOracleReporter:
               "Game announced duel; waiting for oracle reporter",
@@ -902,20 +1255,41 @@ export function SolanaClobPanel({
             positionCleared: "Position cleared",
             clearPositionFailed: (message: string) =>
               `Position cleanup failed: ${message}`,
+            recoveringBalanceRentContext: "recovering empty balance rent",
+            balanceRentRecovered: "Account rent recovered",
+            balanceRentRecoveryFailed: (message: string) =>
+              `Account-rent recovery failed: ${message}`,
+            balanceRentUnavailable:
+              "This balance account has no recoverable rent right now. No transaction was sent.",
+            winningsReady: "Winnings ready",
+            refundReady: "Refund ready",
+            cleanupRequired: "Cleanup required",
+            rentRecoveryReady: "Rent recovery",
+            claimableNow: "Claimable now",
             claimWinningsTitle: "Claim winnings",
             claimRefundTitle: "Claim refund",
             claimLocked: "Nothing claimable yet",
             claimHelp:
               "Once the duel resolves, claim your winning shares here.",
             claimRefundHelp:
-              "If the duel is cancelled, claim your refund here.",
+              "When a duel ends in a draw or is cancelled, claim the verified refund here.",
             claimCleanupTitle: "Clear resolved position",
             claimCleanupHelp:
-              "If this market resolved against you, clear the stale position state here.",
+              "This position did not win and has no payout. Clear its resolved on-chain state to finish settlement.",
+            balanceRentTitle: "Recover account rent",
+            balanceRentHelp:
+              "This market has no remaining custody. Recover the SOL reserved for the empty balance account.",
             claim: "Claim",
             clearPosition: "Clear position",
+            recoverBalanceRent: "Recover rent",
             payoutAmountLabel: "Maximum gross payout if fully filled (SOL)",
+            amountInputHelp:
+              "Enter more than 0 SOL with no more than 6 decimal places.",
+            amountInputInvalid:
+              "Enter a SOL amount greater than 0 with no more than 6 decimal places.",
             limitPrice: "Selected-outcome limit probability (per mille)",
+            limitPriceHelp: "Enter a whole number from 1 to 999.",
+            limitPriceInvalid: "Enter a whole number from 1 to 999.",
             orderReviewTitle: "Order details before signature",
             selectedProbability: "Selected-outcome limit probability",
             visibleFill: "Visible immediate fill",
@@ -937,7 +1311,7 @@ export function SolanaClobPanel({
             insufficientBalance:
               "Wallet balance cannot cover the worst-case funding requirement",
             refundDisclosure:
-              "If the duel is cancelled, matched collateral and escrowed execution fees are refundable through claim. Cancellation or reclaim separately returns unmatched collateral and the maker-funded Order account rent to the original maker; shared PriceLevel rent is excluded.",
+              getSolanaCancellationRefundDisclosure(resolvedLocale),
             selfTradeDisclosure:
               "Your own opposing order is visible; the program will stop matching and release the remainder.",
             continuationDisclosure:
@@ -947,6 +1321,9 @@ export function SolanaClobPanel({
             confirmOrderTitle: "Confirm SOL order",
             confirmOrderHelp:
               "Review the maximum debit and fee/refund terms. Nothing is sent until your wallet approves the signature.",
+            confirmOrderSummary: (fighterName: string, side: BetSide) =>
+              `Buy ${fighterName} (${side})`,
+            confirmGrossPayout: "Maximum gross payout",
             confirmAndSign: "Confirm and sign",
             confirmingOrder: "Waiting for wallet…",
             cancelConfirmation: "Back to edit",
@@ -974,6 +1351,7 @@ export function SolanaClobPanel({
               claim: "Claim confirmed on-chain",
               refund: "Refund confirmed on-chain",
               cleanup: "Position cleanup confirmed on-chain",
+              rent: "Account-rent recovery confirmed on-chain",
             },
             managedOrderProgress: {
               preparing:
@@ -998,6 +1376,7 @@ export function SolanaClobPanel({
             reviewLatestSettlement: "Review latest settlement",
             transactionReceipt: "View transaction",
             transactionSignature: "Transaction signature",
+            transactionDetails: "Transaction proof",
             checkTransactionStatus: "Check transaction status",
             reviewLatestQuote: "Review latest quote",
             transactionPendingAfterCheck:
@@ -1015,6 +1394,8 @@ export function SolanaClobPanel({
                 "The order book or fee terms changed, so no transaction was sent. Review the refreshed quote before signing.",
               USER_REJECTED:
                 "Your wallet declined the signature. No transaction was sent; review the quote before trying again.",
+              WALLET_INTEGRITY_FAILED:
+                "Your wallet changed the reviewed transaction or returned an invalid signature. Nothing was sent. Disconnect it and use a supported wallet before continuing.",
               WALLET_DISCONNECTED:
                 "Your wallet disconnected. Reconnect and review the latest quote before trying again.",
               INSUFFICIENT_FUNDS:
@@ -1135,6 +1516,22 @@ export function SolanaClobPanel({
       };
     }
   }, [activeMarket, amountInput, priceInput, side, wallet.publicKey]);
+  const amountInputIssue = useMemo(() => {
+    try {
+      parseSolAmountToLamports(amountInput);
+      return null;
+    } catch {
+      return copy.amountInputInvalid;
+    }
+  }, [amountInput, copy.amountInputInvalid]);
+  const limitPriceInputIssue = useMemo(() => {
+    try {
+      parseOutcomePriceMillis(priceInput);
+      return null;
+    } catch {
+      return copy.limitPriceInvalid;
+    }
+  }, [copy.limitPriceInvalid, priceInput]);
   const orderQuote = orderQuoteResult.quote;
   const orderQuoteKey = useMemo(() => {
     if (!activeMarket || !wallet.publicKey || !orderQuote) return null;
@@ -1364,14 +1761,28 @@ export function SolanaClobPanel({
     async (
       transaction: Transaction,
       context: string,
+      submissionContext: SolanaTransactionContextToken,
       onProgress?: (
         stage: SolanaTransactionStage,
         signature: string | null,
       ) => void,
+      wagerAuthority?: Readonly<{
+        boundary: SolanaWagerAuthorityBoundary;
+        epoch: SolanaWagerAuthorityEpoch;
+      }>,
     ): Promise<string> => {
       let stage: SolanaTransactionStage = "preparing";
       let submittedSignature: string | null = null;
-      if (!wallet.publicKey || !wallet.signTransaction) {
+      const readStage = (): SolanaTransactionStage => stage;
+      const assertCurrentContext = () => {
+        if (!isCurrentTransactionContext(submissionContext)) {
+          throw new Error("Transaction context changed before submission");
+        }
+      };
+      assertCurrentContext();
+      const walletPublicKey = wallet.publicKey;
+      const signTransaction = wallet.signTransaction;
+      if (!walletPublicKey || !signTransaction) {
         throw new SolanaTransactionFlowError({
           message: copy.connectWalletFirst,
           stage,
@@ -1380,17 +1791,18 @@ export function SolanaClobPanel({
 
       try {
         onProgress?.(stage, null);
-        transaction.feePayer = wallet.publicKey;
+        transaction.feePayer = walletPublicKey;
 
         // Fetch blockhash and dynamic priority fee in parallel.
         const [latest, priorityFeeEstimate] = await Promise.all([
           getLatestBlockhashViaRpc(connection),
           useHeliusSender
             ? fetchPriorityFeeEstimate(connection.rpcEndpoint, [
-                wallet.publicKey.toBase58(),
+                walletPublicKey.toBase58(),
               ])
             : Promise.resolve(0),
         ]);
+        assertCurrentContext();
         transaction.recentBlockhash = latest.blockhash;
 
         if (useHeliusSender) {
@@ -1403,7 +1815,7 @@ export function SolanaClobPanel({
             }),
             // Jito tip transfer — required by Helius Sender dual-routing.
             SystemProgram.transfer({
-              fromPubkey: wallet.publicKey,
+              fromPubkey: walletPublicKey,
               toPubkey: new PublicKey(randomJitoTipAccount()),
               lamports: HELIUS_SENDER_MIN_TIP_LAMPORTS,
             }),
@@ -1413,19 +1825,55 @@ export function SolanaClobPanel({
 
         stage = "signing";
         onProgress?.(stage, null);
-        const signed = await wallet.signTransaction(transaction);
-        if (!signed.signature) {
-          throw new Error("Wallet returned a transaction without a signature");
-        }
-        submittedSignature = utils.bytes.bs58.encode(signed.signature);
-
-        stage = "sending";
-        onProgress?.(stage, submittedSignature);
-        const returnedSignature = useHeliusSender
-          ? await sendViaHeliusSender(
-              Buffer.from(signed.serialize()).toString("base64"),
-            )
-          : await sendRawTransactionViaRpc(connection, signed);
+        const expectedMessage = transaction.serializeMessage();
+        const requestSignature = async () => {
+          const signed = await signTransaction(transaction);
+          assertCurrentContext();
+          const walletSignature = signed.signature;
+          if (!walletSignature) {
+            throw new Error(
+              "Wallet returned a transaction without a signature",
+            );
+          }
+          const signedIntegrity = inspectSolanaSignedTransactionIntegrity({
+            expectedMessage,
+            signedMessage: signed.serializeMessage(),
+            signature: walletSignature,
+            expectedSignerPublicKey: walletPublicKey.toBytes(),
+          });
+          if (!signedIntegrity.valid) {
+            throw new Error(
+              `Wallet transaction integrity check failed: ${signedIntegrity.reason}`,
+            );
+          }
+          return signed;
+        };
+        const startBroadcast = async (
+          signed: Awaited<ReturnType<typeof requestSignature>>,
+        ) => {
+          const walletSignature = signed.signature;
+          if (!walletSignature) {
+            throw new Error(
+              "Wallet returned a transaction without a signature",
+            );
+          }
+          submittedSignature = utils.bytes.bs58.encode(walletSignature);
+          stage = "sending";
+          onProgress?.(stage, submittedSignature);
+          return useHeliusSender
+            ? sendViaHeliusSender(
+                Buffer.from(signed.serialize()).toString("base64"),
+              )
+            : sendRawTransactionViaRpc(connection, signed);
+        };
+        const returnedSignature = wagerAuthority
+          ? await runSolanaWagerPreBroadcastFlow({
+              authority: wagerAuthority.boundary,
+              epoch: wagerAuthority.epoch,
+              requestSignature,
+              startBroadcast,
+            })
+          : await startBroadcast(await requestSignature());
         if (returnedSignature !== submittedSignature) {
           throw new Error(
             "Transaction sender returned a signature that does not match the signed payload",
@@ -1439,18 +1887,20 @@ export function SolanaClobPanel({
         });
         return submittedSignature;
       } catch (error) {
+        if (error instanceof SolanaWagerAuthorityChangedError) throw error;
         const message = error instanceof Error ? error.message : String(error);
+        const failedStage = readStage();
         const stageLabel =
-          stage === "preparing"
+          failedStage === "preparing"
             ? copy.stageBlockhash
-            : stage === "signing"
+            : failedStage === "signing"
               ? copy.stageSigning
-              : stage === "sending"
+              : failedStage === "sending"
                 ? copy.stageSending
                 : copy.stageConfirming;
         throw new SolanaTransactionFlowError({
           message: `${context}: ${stageLabel}: ${message}`,
-          stage,
+          stage: failedStage,
           signature: submittedSignature,
           cause: error,
         });
@@ -1463,6 +1913,7 @@ export function SolanaClobPanel({
       copy.stageConfirming,
       copy.stageSending,
       copy.stageSigning,
+      isCurrentTransactionContext,
       useHeliusSender,
       wallet.publicKey,
       wallet.signTransaction,
@@ -1481,35 +1932,44 @@ export function SolanaClobPanel({
     [connection, copy.vaultNotReady],
   );
 
+  const failClosedCurrentMarket = useCallback(() => {
+    setActiveMarket((current) =>
+      failClosedSolanaClobMarketSnapshot(current, duelKeyHex),
+    );
+    setManagedOrders([]);
+    setCanRecoverEmptyBalanceRent(false);
+    setBids([]);
+    setAsks([]);
+    setYesPool(0n);
+    setNoPool(0n);
+    setPosition({
+      aShares: 0n,
+      bShares: 0n,
+      aLockedLamports: 0n,
+      bLockedLamports: 0n,
+      tradeTreasuryFeeLamports: 0n,
+      tradeMarketMakerFeeLamports: 0n,
+    });
+  }, [duelKeyHex]);
+
   const runRefreshData = useCallback(async () => {
+    const requestedRefreshContext = refreshContextKey;
+    const isCurrentRefresh = () =>
+      currentRefreshContextRef.current === requestedRefreshContext;
     const clobProgram: any = readonlyPrograms.duelMarket;
     const oracleProgram: any = readonlyPrograms.fightOracle;
     const runtimeConfigPda = findClobConfigPda(clobProgram.programId);
-
     const config =
       await clobProgram.account.marketConfig.fetchNullable(runtimeConfigPda);
+    if (!isCurrentRefresh()) return;
     if (!config) {
       setStatus(copy.marketConfigNotDeployed);
-      setActiveMarket(null);
-      setManagedOrders([]);
+      failClosedCurrentMarket();
       return;
     }
 
     if (!duelKeyHex) {
-      setActiveMarket(null);
-      setManagedOrders([]);
-      setBids([]);
-      setAsks([]);
-      setYesPool(0n);
-      setNoPool(0n);
-      setPosition({
-        aShares: 0n,
-        bShares: 0n,
-        aLockedLamports: 0n,
-        bLockedLamports: 0n,
-        tradeTreasuryFeeLamports: 0n,
-        tradeMarketMakerFeeLamports: 0n,
-      });
+      failClosedCurrentMarket();
       setStatus(
         lifecycleStatusLabel ??
           getCycleDuelStatusLabel(cycle?.phase, duelKeyHex, resolvedLocale),
@@ -1519,13 +1979,11 @@ export function SolanaClobPanel({
 
     const duelKeyBytes = duelKeyHexToBytes(duelKeyHex);
     const duelState = findDuelStatePda(oracleProgram.programId, duelKeyBytes);
-    const marketState =
-      parsePublicKeyOrNull(lifecycleMarketRef) ??
-      findMarketStatePda(
-        clobProgram.programId,
-        duelState,
-        DUEL_WINNER_MARKET_KIND,
-      );
+    const marketState = findMarketStatePda(
+      clobProgram.programId,
+      duelState,
+      DUEL_WINNER_MARKET_KIND,
+    );
     const vault = findClobVaultPda(clobProgram.programId, marketState);
 
     const [duelAccount, marketAccount, allLevels, allOrders, allBalances] =
@@ -1536,26 +1994,43 @@ export function SolanaClobPanel({
         clobProgram.account.order.all(),
         clobProgram.account.userBalance.all(),
       ]);
+    if (!isCurrentRefresh()) return;
 
     if (!duelAccount) {
       setStatus(lifecycleStatusLabel ?? copy.waitingOracleReporter);
-      setActiveMarket(null);
-      setManagedOrders([]);
+      failClosedCurrentMarket();
       return;
     }
 
     if (!marketAccount) {
       setStatus(lifecycleStatusLabel ?? copy.waitingMarketOperator);
-      setActiveMarket(null);
-      setManagedOrders([]);
+      failClosedCurrentMarket();
       return;
     }
 
+    const competitiveCommitment =
+      normalizeSolanaCompetitiveSnapshotCommitment(duelAccount);
     const storedMarketStatus = enumName(marketAccount.status);
     const marketStatus = effectiveMarketStatusFromDuel(
       enumName(duelAccount.status),
       storedMarketStatus,
     );
+    const authorityState = marketAuthorityState({
+      requireCurrentConfig: marketStatus === "open",
+      duelKeyHex,
+      duelState,
+      marketState,
+      advertisedMarketState: lifecycleMarketRef,
+      marketAccount,
+      configAccount: config,
+    });
+    if (!authorityState.valid) {
+      failClosedCurrentMarket();
+      throw new Error(
+        `Canonical Solana market verification failed: ${authorityState.reason}`,
+      );
+    }
+
     const winner = enumName(marketAccount.winner);
 
     const levels = (allLevels as PriceLevelAccount[]).filter((entry) =>
@@ -1615,6 +2090,7 @@ export function SolanaClobPanel({
       tradeTreasuryFeeLamports: 0n,
       tradeMarketMakerFeeLamports: 0n,
     };
+    let walletBalanceSnapshot: UserPosition | null = null;
     for (const balance of balances) {
       const aShares = asBigInt(balance.account.aShares);
       const bShares = asBigInt(balance.account.bShares);
@@ -1640,6 +2116,7 @@ export function SolanaClobPanel({
           tradeTreasuryFeeLamports,
           tradeMarketMakerFeeLamports,
         };
+        walletBalanceSnapshot = userPosition;
       }
     }
 
@@ -1673,6 +2150,7 @@ export function SolanaClobPanel({
           userManageableOrders.map((entry) => entry.publicKey),
         )
       : [];
+    if (!isCurrentRefresh()) return;
     const userManagedOrders = wallet.publicKey
       ? userManageableOrders.flatMap((entry, index) => {
           const accountInfo = userOrderAccountInfos[index];
@@ -1706,9 +2184,14 @@ export function SolanaClobPanel({
       }),
     );
 
+    if (!isCurrentRefresh()) return;
     setActiveMarket({
       duelId: duelId ?? shortDuelKey(duelKeyHex),
       duelKeyHex,
+      competitiveSnapshotVersion:
+        competitiveCommitment?.competitiveSnapshotVersion ?? null,
+      competitiveSnapshotDigest:
+        competitiveCommitment?.competitiveSnapshotDigest ?? null,
       duelState,
       marketState,
       vault,
@@ -1731,10 +2214,19 @@ export function SolanaClobPanel({
       winningsMarketMakerFeeBpsSnapshot: Number(
         marketAccount.winningsMarketMakerFeeBpsSnapshot,
       ),
+      tradingReady:
+        authorityState.tradingReady && competitiveCommitment !== null,
       restingOrders: quoteRestingOrders,
     });
     setManagedOrders(userManagedOrders);
     setPosition(userPosition);
+    setCanRecoverEmptyBalanceRent(
+      walletBalanceSnapshot !== null &&
+        shouldCloseEmptySolanaUserBalance({
+          marketStatus: storedMarketStatus ?? "unknown",
+          balance: walletBalanceSnapshot,
+        }),
+    );
     setYesPool(nextYesPool);
     setNoPool(nextNoPool);
     setBids(normalizedBids);
@@ -1793,10 +2285,12 @@ export function SolanaClobPanel({
     duelKeyHex,
     effectiveAgent1,
     effectiveAgent2,
+    failClosedCurrentMarket,
     activeLifecycleDuel?.betCloseTime,
     activeLifecycleDuel?.phase,
     lifecycleMarketRef,
     lifecycleStatusLabel,
+    refreshContextKey,
     readonlyPrograms.fightOracle,
     readonlyPrograms.duelMarket,
     resolvedLocale,
@@ -1805,11 +2299,13 @@ export function SolanaClobPanel({
   ]);
 
   const refreshData = useCallback(async () => {
-    if (refreshPromiseRef.current) {
-      return refreshPromiseRef.current;
+    const activeRefresh = refreshPromiseRef.current;
+    if (activeRefresh?.contextKey === refreshContextKey) {
+      return activeRefresh.promise;
     }
 
-    const promise = (async () => {
+    let promise!: Promise<void>;
+    promise = (async () => {
       setIsRefreshing(true);
       try {
         for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1817,6 +2313,9 @@ export function SolanaClobPanel({
             await runRefreshData();
             return;
           } catch (error) {
+            if (currentRefreshContextRef.current === refreshContextKey) {
+              failClosedCurrentMarket();
+            }
             if (!isRetryableRefreshError(error) || attempt === 2) {
               throw error;
             }
@@ -1824,16 +2323,29 @@ export function SolanaClobPanel({
           }
         }
       } catch {
-        setStatus(copy.refreshFailed);
+        if (currentRefreshContextRef.current === refreshContextKey) {
+          failClosedCurrentMarket();
+          setStatus(copy.refreshFailed);
+        }
       } finally {
-        setIsRefreshing(false);
-        refreshPromiseRef.current = null;
+        if (refreshPromiseRef.current?.promise === promise) {
+          setIsRefreshing(false);
+          refreshPromiseRef.current = null;
+        }
       }
     })();
 
-    refreshPromiseRef.current = promise;
+    refreshPromiseRef.current = {
+      contextKey: refreshContextKey,
+      promise,
+    };
     return promise;
-  }, [copy, runRefreshData]);
+  }, [
+    copy.refreshFailed,
+    failClosedCurrentMarket,
+    refreshContextKey,
+    runRefreshData,
+  ]);
 
   useEffect(() => {
     if (readOnly) return undefined;
@@ -1993,7 +2505,12 @@ export function SolanaClobPanel({
   );
 
   const handlePlaceOrder = useCallback(
-    async (confirmedQuoteKey: string): Promise<boolean> => {
+    async (
+      confirmedQuoteKey: string,
+      submissionContext: SolanaTransactionContextToken,
+      authorityEpoch: SolanaWagerAuthorityEpoch,
+    ): Promise<boolean> => {
+      if (!isCurrentTransactionContext(submissionContext)) return false;
       if (orderTransactionFeedback.status === "error") {
         setStatus(copy.reviewRequiredBeforeRetry);
         return false;
@@ -2016,7 +2533,12 @@ export function SolanaClobPanel({
         setStatus(copy.quoteChanged);
         return false;
       }
-      if (!clobProgram || !wallet.publicKey || !activeMarket || !orderQuote) {
+      if (
+        !clobProgram ||
+        !wallet.publicKey ||
+        !activeMarket?.tradingReady ||
+        !orderQuote
+      ) {
         setLastPlaceOrderDebug(
           `blocked ${debugPrefix} reason=missing-prerequisites`,
         );
@@ -2080,19 +2602,24 @@ export function SolanaClobPanel({
         const amount = orderQuote.amountLamports;
         const price = orderQuote.marketPriceMillis;
         const sideValue = side === "YES" ? SIDE_BID : SIDE_ASK;
-        const latestMarketAccount = await clobProgram.account.marketState.fetch(
-          activeMarket.marketState,
-        );
-        if (
-          Number(latestMarketAccount.tradeTreasuryFeeBpsSnapshot) !==
-            activeMarket.tradeTreasuryFeeBpsSnapshot ||
-          Number(latestMarketAccount.tradeMarketMakerFeeBpsSnapshot) !==
-            activeMarket.tradeMarketMakerFeeBpsSnapshot ||
-          Number(latestMarketAccount.winningsMarketMakerFeeBpsSnapshot) !==
-            activeMarket.winningsMarketMakerFeeBpsSnapshot
-        ) {
+        const configPda = findClobConfigPda(clobProgram.programId);
+        const [latestMarketAccount, latestConfigAccount] = await Promise.all([
+          clobProgram.account.marketState.fetch(activeMarket.marketState),
+          clobProgram.account.marketConfig.fetch(configPda),
+        ]);
+        if (!isCurrentTransactionContext(submissionContext)) return false;
+        const latestAuthorityState = marketAuthorityState({
+          requireCurrentConfig: true,
+          duelKeyHex: activeMarket.duelKeyHex,
+          duelState: activeMarket.duelState,
+          marketState: activeMarket.marketState,
+          advertisedMarketState: lifecycleMarketRef,
+          marketAccount: latestMarketAccount,
+          configAccount: latestConfigAccount,
+        });
+        if (!latestAuthorityState.valid || !latestAuthorityState.tradingReady) {
           throw new Error(
-            "Market fee snapshots changed; review the refreshed quote",
+            "Market configuration changed; review the refreshed quote",
           );
         }
         const snapshotOrderId = activeMarket.nextOrderId;
@@ -2123,13 +2650,13 @@ export function SolanaClobPanel({
           price,
           amount,
         );
+        if (!isCurrentTransactionContext(submissionContext)) return false;
         setLastPlaceOrderDebug(
           `prepared ${debugPrefix} snapshotOrderId=${snapshotOrderId.toString()} chainOrderId=${orderId.toString()} amount=${amount.toString()} price=${price} remainingAccounts=${remainingAccounts.length}`,
         );
 
         await verifyVaultRentExempt(activeMarket.vault);
-
-        const configPda = findClobConfigPda(clobProgram.programId);
+        if (!isCurrentTransactionContext(submissionContext)) return false;
 
         const tx = await clobProgram.methods
           .placeOrder(
@@ -2173,7 +2700,9 @@ export function SolanaClobPanel({
         const signature = await submitTransaction(
           tx,
           copy.placingOrderContext,
+          submissionContext,
           (transactionStage, submittedSignature) => {
+            if (!isCurrentTransactionContext(submissionContext)) return;
             setOrderTransactionFeedback({
               status: transactionStage,
               signature: submittedSignature,
@@ -2181,18 +2710,28 @@ export function SolanaClobPanel({
               warning: null,
             });
           },
+          {
+            boundary: wagerAuthorityBoundary,
+            epoch: authorityEpoch,
+          },
         );
-        setLastPlaceOrderTx(signature);
-        setLastPlaceOrderError("-");
-        setOrderTransactionFeedback({
-          status: "confirmed",
-          signature,
-          recovery: null,
-          warning: null,
+        if (isCurrentTransactionContext(submissionContext)) {
+          setLastPlaceOrderTx(signature);
+          setLastPlaceOrderError("-");
+          setOrderTransactionFeedback({
+            status: "confirmed",
+            signature,
+            recovery: null,
+            warning: null,
+          });
+          setLastPlaceOrderDebug(
+            `submitted ${debugPrefix} snapshotOrderId=${snapshotOrderId.toString()} chainOrderId=${orderId.toString()} signature=${signature}`,
+          );
+        }
+        emitHyperbetProductEvent("bet_success", {
+          finality: "confirmed",
+          side,
         });
-        setLastPlaceOrderDebug(
-          `submitted ${debugPrefix} snapshotOrderId=${snapshotOrderId.toString()} chainOrderId=${orderId.toString()} signature=${signature}`,
-        );
         try {
           const recorded = await recordSolanaPredictionMarketTrade({
             bettorWallet: trackingIntent.bettorWallet,
@@ -2211,6 +2750,7 @@ export function SolanaClobPanel({
             trackingError instanceof Error
               ? trackingError.message
               : String(trackingError);
+          if (!isCurrentTransactionContext(submissionContext)) return false;
           setOrderTransactionFeedback({
             status: "confirmed",
             signature,
@@ -2221,6 +2761,7 @@ export function SolanaClobPanel({
             `tracking-delayed ${debugPrefix} signature=${signature} message=${trackingDetail}`,
           );
         }
+        if (!isCurrentTransactionContext(submissionContext)) return false;
         setActiveMarket((current) =>
           current
             ? {
@@ -2231,16 +2772,23 @@ export function SolanaClobPanel({
         );
         setStatus(copy.orderPlaced);
         await refreshData();
+        if (!isCurrentTransactionContext(submissionContext)) return false;
         setLastPlaceOrderDebug(
           `refreshed ${debugPrefix} snapshotOrderId=${snapshotOrderId.toString()} chainOrderId=${orderId.toString()} signature=${signature} nextOrder=${(orderId + 1n).toString()}`,
         );
         return true;
       } catch (error) {
+        if (!isCurrentTransactionContext(submissionContext)) return false;
         const recovery = classifySolanaTransactionError(error);
         if (!recovery.signature) {
           orderTrackingIntentRef.current = null;
         }
         const message = copy.recoveryCopy[recovery.kind];
+        emitHyperbetProductEvent("bet_failure", {
+          failureKind: recovery.kind,
+          stage: recovery.stage,
+          side,
+        });
         setOrderTransactionFeedback({
           status: "error",
           signature: recovery.signature,
@@ -2267,11 +2815,14 @@ export function SolanaClobPanel({
       orderQuoteResult.error,
       orderTransactionFeedback.status,
       lastPlaceOrderError,
+      isCurrentTransactionContext,
+      lifecycleMarketRef,
       priceInput,
       refreshData,
       side,
       submitTransaction,
       verifyVaultRentExempt,
+      wagerAuthorityBoundary,
       wallet.publicKey,
       writablePrograms,
     ],
@@ -2281,17 +2832,25 @@ export function SolanaClobPanel({
     async (
       resolveTarget: () => Promise<SettlementExecutionTarget>,
       historyBetId: string | null = null,
+      feedbackHint: "settlement" | "rent" = "settlement",
     ) => {
+      const submissionContext = transactionContext;
+      if (!isCurrentTransactionContext(submissionContext)) {
+        setStatus(copy.connectWalletToClaim);
+        return;
+      }
       if (settlementTransactionFeedback.status === "error") {
         setStatus(copy.reviewRequiredBeforeRetry);
         return;
       }
       if (settlementSubmissionInProgressRef.current) return;
-      settlementSubmissionInProgressRef.current = true;
+      settlementSubmissionInProgressRef.current = submissionContext;
       setSettlingHistoryBetId(historyBetId);
       setIsSubmittingSettlement(true);
 
       let isCleanup = false;
+      let isBalanceRentRecovery = feedbackHint === "rent";
+      let analyticsSettlementKind: "claim" | "refund" | null = null;
       try {
         setLastClaimTx("-");
         setLastClaimError("-");
@@ -2301,62 +2860,155 @@ export function SolanaClobPanel({
           recovery: null,
           warning: null,
         });
+        if (isBalanceRentRecovery) {
+          setSettlementFeedbackKind("rent");
+        }
 
         const target = await resolveTarget();
+        if (!isCurrentTransactionContext(submissionContext)) return;
         const clobProgram: any = writablePrograms?.duelMarket;
-        const settlementInstruction = resolveSolanaSettlementInstruction(
-          target.claimKind,
-        );
+        isBalanceRentRecovery = target.claimKind === "EMPTY_BALANCE_RENT";
+        if (isBalanceRentRecovery) {
+          setRecoveringBalanceMarketPda(target.marketState.toBase58());
+        }
+        const settlementInstruction =
+          target.claimKind === "EMPTY_BALANCE_RENT"
+            ? "closeEmptyUserBalance"
+            : resolveSolanaSettlementInstruction(target.claimKind);
         if (!clobProgram || !wallet.publicKey || !settlementInstruction) {
           throw new Error(copy.connectWalletToClaim);
         }
+        const settlementUser = wallet.publicKey;
 
         isCleanup = settlementInstruction === "closeLosingBalance";
-        setSettlementFeedbackKind(
-          isCleanup
-            ? "cleanup"
+        analyticsSettlementKind =
+          isCleanup || isBalanceRentRecovery
+            ? null
             : target.claimKind === "REFUND"
               ? "refund"
-              : "claim",
+              : "claim";
+        if (analyticsSettlementKind === "refund") {
+          emitHyperbetProductEvent("refund_attempt", {
+            source: historyBetId ? "history" : "active",
+          });
+        } else if (analyticsSettlementKind === "claim") {
+          emitHyperbetProductEvent("claim_attempt", {
+            source: historyBetId ? "history" : "active",
+          });
+        }
+        setSettlementFeedbackKind(
+          isBalanceRentRecovery
+            ? "rent"
+            : isCleanup
+              ? "cleanup"
+              : target.claimKind === "REFUND"
+                ? "refund"
+                : "claim",
         );
+        settlementMutationContextRef.current = isCleanup
+          ? {
+              wallet: settlementUser.toBase58(),
+              marketPda: target.marketState.toBase58(),
+              kind: "CLEANUP",
+            }
+          : analyticsSettlementKind
+            ? {
+                wallet: settlementUser.toBase58(),
+                marketPda: target.marketState.toBase58(),
+                kind: analyticsSettlementKind === "refund" ? "REFUND" : "CLAIM",
+              }
+            : null;
         const userBalance = findUserBalancePda(
           clobProgram.programId,
           target.marketState,
-          wallet.publicKey,
+          settlementUser,
         );
-        const tx = isCleanup
-          ? await clobProgram.methods
-              .closeLosingBalance()
-              .accountsPartial({
-                marketState: target.marketState,
-                duelState: target.duelState,
-                userBalance,
-                user: wallet.publicKey,
-              })
-              .transaction()
-          : await (async () => {
-              const configPda = findClobConfigPda(clobProgram.programId);
+        const tx = isBalanceRentRecovery
+          ? await (async () => {
+              const [marketAccount, balanceAccount] = await Promise.all([
+                clobProgram.account.marketState.fetchNullable(
+                  target.marketState,
+                ),
+                clobProgram.account.userBalance.fetchNullable(userBalance),
+              ]);
+              if (
+                !marketAccount ||
+                !balanceAccount ||
+                !(marketAccount.duelState as PublicKey).equals(
+                  target.duelState,
+                ) ||
+                !(balanceAccount.marketState as PublicKey).equals(
+                  target.marketState,
+                ) ||
+                !(balanceAccount.user as PublicKey).equals(settlementUser)
+              ) {
+                throw new Error(copy.balanceRentUnavailable);
+              }
+              if (
+                !shouldCloseEmptySolanaUserBalance({
+                  marketStatus: enumName(marketAccount.status) ?? "unknown",
+                  balance: {
+                    aShares: asBigInt(balanceAccount.aShares),
+                    bShares: asBigInt(balanceAccount.bShares),
+                    aLockedLamports: asBigInt(balanceAccount.aLockedLamports),
+                    bLockedLamports: asBigInt(balanceAccount.bLockedLamports),
+                    tradeTreasuryFeeLamports: asBigInt(
+                      balanceAccount.tradeTreasuryFeeLamports,
+                    ),
+                    tradeMarketMakerFeeLamports: asBigInt(
+                      balanceAccount.tradeMarketMakerFeeLamports,
+                    ),
+                  },
+                })
+              ) {
+                throw new Error(copy.balanceRentUnavailable);
+              }
               return clobProgram.methods
-                .claim()
+                .closeEmptyUserBalance()
+                .accountsPartial({
+                  marketState: target.marketState,
+                  userBalance,
+                  user: settlementUser,
+                })
+                .transaction();
+            })()
+          : isCleanup
+            ? await clobProgram.methods
+                .closeLosingBalance()
                 .accountsPartial({
                   marketState: target.marketState,
                   duelState: target.duelState,
                   userBalance,
-                  config: configPda,
-                  marketMaker: target.marketMaker,
-                  vault: target.vault,
-                  user: wallet.publicKey,
-                  systemProgram: SystemProgram.programId,
+                  user: settlementUser,
                 })
-                .transaction();
-            })();
+                .transaction()
+            : await (async () => {
+                const configPda = findClobConfigPda(clobProgram.programId);
+                return clobProgram.methods
+                  .claim()
+                  .accountsPartial({
+                    marketState: target.marketState,
+                    duelState: target.duelState,
+                    userBalance,
+                    config: configPda,
+                    marketMaker: target.marketMaker,
+                    vault: target.vault,
+                    user: settlementUser,
+                    systemProgram: SystemProgram.programId,
+                  })
+                  .transaction();
+              })();
 
         const signature = await submitTransaction(
           tx,
-          isCleanup
-            ? copy.clearingPositionContext
-            : copy.claimingWinningsContext,
+          isBalanceRentRecovery
+            ? copy.recoveringBalanceRentContext
+            : isCleanup
+              ? copy.clearingPositionContext
+              : copy.claimingWinningsContext,
+          submissionContext,
           (transactionStage, submittedSignature) => {
+            if (!isCurrentTransactionContext(submissionContext)) return;
             setSettlementTransactionFeedback({
               status: transactionStage,
               signature: submittedSignature,
@@ -2365,19 +3017,67 @@ export function SolanaClobPanel({
             });
           },
         );
+        if (!isCurrentTransactionContext(submissionContext)) return;
         setLastClaimTx(signature);
-        setStatus(isCleanup ? copy.positionCleared : copy.claimComplete);
+        setStatus(
+          isBalanceRentRecovery
+            ? copy.balanceRentRecovered
+            : isCleanup
+              ? copy.positionCleared
+              : copy.claimComplete,
+        );
         setSettlementTransactionFeedback({
           status: "confirmed",
           signature,
           recovery: null,
           warning: null,
         });
+        if (analyticsSettlementKind === "refund") {
+          emitHyperbetProductEvent("refund_success", {
+            finality: "confirmed",
+          });
+        } else if (analyticsSettlementKind === "claim") {
+          emitHyperbetProductEvent("claim_success", {
+            finality: "confirmed",
+          });
+        }
+        const mutationContext = settlementMutationContextRef.current;
+        dispatchHyperbetMarketRefresh(
+          mutationContext
+            ? {
+                schemaVersion: 1,
+                mutation: "SETTLEMENT_CONFIRMED",
+                ...mutationContext,
+                signature,
+              }
+            : undefined,
+        );
+        settlementMutationContextRef.current = null;
         await refreshData();
-        window.dispatchEvent(new CustomEvent("hyperbet:market-refresh"));
+        if (!isCurrentTransactionContext(submissionContext)) return;
       } catch (error) {
+        if (!isCurrentTransactionContext(submissionContext)) return;
         const recovery = classifySolanaTransactionError(error);
-        const message = copy.recoveryCopy[recovery.kind];
+        if (!recovery.signature) {
+          settlementMutationContextRef.current = null;
+        }
+        const message =
+          isBalanceRentRecovery &&
+          error instanceof Error &&
+          error.message === copy.balanceRentUnavailable
+            ? copy.balanceRentUnavailable
+            : copy.recoveryCopy[recovery.kind];
+        if (analyticsSettlementKind === "refund") {
+          emitHyperbetProductEvent("refund_failure", {
+            failureKind: recovery.kind,
+            stage: recovery.stage,
+          });
+        } else if (analyticsSettlementKind === "claim") {
+          emitHyperbetProductEvent("claim_failure", {
+            failureKind: recovery.kind,
+            stage: recovery.stage,
+          });
+        }
         setSettlementTransactionFeedback({
           status: "error",
           signature: recovery.signature,
@@ -2386,21 +3086,34 @@ export function SolanaClobPanel({
         });
         setLastClaimError(message);
         setStatus(
-          isCleanup
-            ? copy.clearPositionFailed(message)
-            : copy.claimFailed(message),
+          isBalanceRentRecovery
+            ? copy.balanceRentRecoveryFailed(message)
+            : isCleanup
+              ? copy.clearPositionFailed(message)
+              : copy.claimFailed(message),
         );
       } finally {
-        settlementSubmissionInProgressRef.current = false;
-        setSettlingHistoryBetId(null);
-        setIsSubmittingSettlement(false);
+        if (
+          releaseSolanaTransactionContextLock(
+            settlementSubmissionInProgressRef,
+            submissionContext,
+          )
+        ) {
+          if (isCurrentTransactionContext(submissionContext)) {
+            setSettlingHistoryBetId(null);
+            setRecoveringBalanceMarketPda(null);
+            setIsSubmittingSettlement(false);
+          }
+        }
       }
     },
     [
       copy,
+      isCurrentTransactionContext,
       refreshData,
       settlementTransactionFeedback.status,
       submitTransaction,
+      transactionContext,
       wallet.publicKey,
       writablePrograms,
     ],
@@ -2420,6 +3133,95 @@ export function SolanaClobPanel({
       claimKind: uiState.claimKind,
     }));
   }, [activeMarket, copy.claimLocked, executeSettlement, uiState]);
+
+  const handleActiveBalanceRentRecovery = useCallback(async () => {
+    if (!activeMarket || !canRecoverEmptyBalanceRent) {
+      setStatus(copy.balanceRentUnavailable);
+      return;
+    }
+    await executeSettlement(
+      async () => ({
+        duelState: activeMarket.duelState,
+        marketState: activeMarket.marketState,
+        vault: activeMarket.vault,
+        marketMaker: activeMarket.marketMaker,
+        claimKind: "EMPTY_BALANCE_RENT",
+      }),
+      null,
+      "rent",
+    );
+  }, [
+    activeMarket,
+    canRecoverEmptyBalanceRent,
+    copy.balanceRentUnavailable,
+    executeSettlement,
+  ]);
+
+  const handleHistoricalBalanceRentRecovery = useCallback(
+    async (request: SolanaBalanceCleanupRequest) => {
+      await executeSettlement(
+        async () => {
+          if (!wallet.publicKey) {
+            throw new Error(copy.connectWalletToClaim);
+          }
+          const normalizedDuelKey = normalizePredictionMarketDuelKeyHex(
+            request.duelKey,
+          );
+          const requestedMarketState = parsePublicKeyOrNull(request.marketPda);
+          if (!normalizedDuelKey || !requestedMarketState) {
+            throw new Error(copy.balanceRentUnavailable);
+          }
+
+          const clobProgram: any = readonlyPrograms.duelMarket;
+          const oracleProgram: any = readonlyPrograms.fightOracle;
+          const duelState = findDuelStatePda(
+            oracleProgram.programId,
+            duelKeyHexToBytes(normalizedDuelKey),
+          );
+          const canonicalMarketState = findMarketStatePda(
+            clobProgram.programId,
+            duelState,
+            DUEL_WINNER_MARKET_KIND,
+          );
+          if (!requestedMarketState.equals(canonicalMarketState)) {
+            throw new Error(copy.balanceRentUnavailable);
+          }
+          const marketAccount =
+            await clobProgram.account.marketState.fetchNullable(
+              canonicalMarketState,
+            );
+          if (
+            !marketAccount ||
+            !(marketAccount.duelState as PublicKey).equals(duelState) ||
+            Number(marketAccount.marketKind) !== DUEL_WINNER_MARKET_KIND
+          ) {
+            throw new Error(copy.balanceRentUnavailable);
+          }
+
+          return {
+            duelState,
+            marketState: canonicalMarketState,
+            vault: findClobVaultPda(
+              clobProgram.programId,
+              canonicalMarketState,
+            ),
+            marketMaker: marketAccount.marketMaker as PublicKey,
+            claimKind: "EMPTY_BALANCE_RENT" as const,
+          };
+        },
+        request.betId,
+        "rent",
+      );
+    },
+    [
+      copy.balanceRentUnavailable,
+      copy.connectWalletToClaim,
+      executeSettlement,
+      readonlyPrograms.duelMarket,
+      readonlyPrograms.fightOracle,
+      wallet.publicKey,
+    ],
+  );
 
   const handleHistoricalSettlement = useCallback(
     async (request: SolanaSettlementRequest) => {
@@ -2495,10 +3297,12 @@ export function SolanaClobPanel({
           },
         );
         const expectedClaimKind =
-          request.settlementState === "REFUND_CLAIMABLE"
-            ? historicalUiState.claimKind === "REFUND"
-            : historicalUiState.claimKind === "WINNER_A" ||
-              historicalUiState.claimKind === "WINNER_B";
+          request.settlementState === "LOST"
+            ? historicalUiState.claimKind === "LOSER_CLEANUP"
+            : request.settlementState === "REFUND_CLAIMABLE"
+              ? historicalUiState.claimKind === "REFUND"
+              : historicalUiState.claimKind === "WINNER_A" ||
+                historicalUiState.claimKind === "WINNER_B";
         if (!historicalUiState.canClaim || !expectedClaimKind) {
           throw new Error(copy.claimLocked);
         }
@@ -2530,6 +3334,11 @@ export function SolanaClobPanel({
     if (!selectedManagedOrder || managedOrderSubmissionInProgressRef.current) {
       return;
     }
+    const submissionContext = transactionContext;
+    if (!isCurrentTransactionContext(submissionContext)) {
+      setSelectedManagedOrder(null);
+      return;
+    }
     const clobProgram: any = writablePrograms?.duelMarket;
     const oracleProgram: any = readonlyPrograms.fightOracle;
     const managedMarketState = parsePublicKeyOrNull(
@@ -2541,7 +3350,7 @@ export function SolanaClobPanel({
     }
 
     const reviewedPlan = selectedManagedOrder;
-    managedOrderSubmissionInProgressRef.current = true;
+    managedOrderSubmissionInProgressRef.current = submissionContext;
     setSubmittingManagedOrderId(reviewedPlan.orderId);
     setManagedOrderFeedbackAction(reviewedPlan.action);
     setManagedOrderErrorMessage(null);
@@ -2556,6 +3365,7 @@ export function SolanaClobPanel({
     try {
       const latestMarketAccount =
         await clobProgram.account.marketState.fetch(managedMarketState);
+      if (!isCurrentTransactionContext(submissionContext)) return;
       const managedDuelState = latestMarketAccount.duelState as PublicKey;
       if (
         Number(latestMarketAccount.marketKind) !== DUEL_WINNER_MARKET_KIND ||
@@ -2580,6 +3390,7 @@ export function SolanaClobPanel({
           clobProgram.account.order.fetchNullable(orderPda),
           connection.getAccountInfo(orderPda, "confirmed"),
         ]);
+      if (!isCurrentTransactionContext(submissionContext)) return;
       if (
         !latestOrderAccount ||
         !latestOrderInfo ||
@@ -2598,13 +3409,14 @@ export function SolanaClobPanel({
         );
       }
 
+      const effectiveManagedMarketStatus = effectiveMarketStatusFromDuel(
+        enumName(latestDuelAccount.status),
+        enumName(latestMarketAccount.status),
+      );
       let freshPlan: SolanaManagedOrderPlan;
       try {
         freshPlan = buildSolanaManagedOrderPlan({
-          marketStatus: effectiveMarketStatusFromDuel(
-            enumName(latestDuelAccount.status),
-            enumName(latestMarketAccount.status),
-          ),
+          marketStatus: effectiveManagedMarketStatus,
           marketState: managedMarketState.toBase58(),
           wallet: wallet.publicKey.toBase58(),
           order: managedOrderSnapshot({
@@ -2641,53 +3453,75 @@ export function SolanaClobPanel({
           freshPlan.side,
           freshPlan.programPriceMillis,
         );
-        const [latestPriceLevel, adjacentAccounts] = await Promise.all([
-          clobProgram.account.priceLevel.fetchNullable(priceLevelPda),
-          Promise.all(
-            freshPlan.adjacentOrderIds.map(async (orderId) => {
-              const adjacentPda = findOrderPda(
-                clobProgram.programId,
-                managedMarketState,
-                orderId,
+        const latestPriceLevel =
+          await clobProgram.account.priceLevel.fetchNullable(priceLevelPda);
+        if (!isCurrentTransactionContext(submissionContext)) return;
+        let fetchedPriceLevelSnapshot: SolanaManagedPriceLevelSnapshot | null =
+          null;
+        if (latestPriceLevel) {
+          const priceLevelSide = Number(latestPriceLevel.side);
+          if (priceLevelSide !== SIDE_BID && priceLevelSide !== SIDE_ASK) {
+            throw new ManagedOrderStateChangedError(
+              "The selected price level has an invalid side",
+            );
+          }
+          const canonicalPriceLevelSide = priceLevelSide as 1 | 2;
+          fetchedPriceLevelSnapshot = {
+            marketState: (latestPriceLevel.marketState as PublicKey).toBase58(),
+            side: canonicalPriceLevelSide,
+            price: Number(latestPriceLevel.price),
+            headOrderId: asBigInt(latestPriceLevel.headOrderId),
+            tailOrderId: asBigInt(latestPriceLevel.tailOrderId),
+            totalOpen: asBigInt(latestPriceLevel.totalOpen),
+          };
+        }
+        let priceLevelSnapshot;
+        try {
+          priceLevelSnapshot = resolveSolanaManagedPriceLevelForClosure({
+            plan: freshPlan,
+            priceLevel: fetchedPriceLevelSnapshot,
+          });
+        } catch (error) {
+          throw new ManagedOrderStateChangedError(
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+        let instructionPlan: SolanaManagedOrderPlan;
+        try {
+          instructionPlan = normalizeSolanaManagedOrderPlanForPriceLevel({
+            plan: freshPlan,
+            priceLevel: priceLevelSnapshot,
+          });
+        } catch (error) {
+          throw new ManagedOrderStateChangedError(
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+        const adjacentAccounts = await Promise.all(
+          instructionPlan.adjacentOrderIds.map(async (orderId) => {
+            const adjacentPda = findOrderPda(
+              clobProgram.programId,
+              managedMarketState,
+              orderId,
+            );
+            const adjacentAccount =
+              await clobProgram.account.order.fetchNullable(adjacentPda);
+            if (!adjacentAccount) {
+              throw new ManagedOrderStateChangedError(
+                `Linked order ${orderId.toString()} no longer exists`,
               );
-              const adjacentAccount =
-                await clobProgram.account.order.fetchNullable(adjacentPda);
-              if (!adjacentAccount) {
-                throw new ManagedOrderStateChangedError(
-                  `Linked order ${orderId.toString()} no longer exists`,
-                );
-              }
-              return managedOrderSnapshot({
-                publicKey: adjacentPda,
-                account: adjacentAccount,
-              });
-            }),
-          ),
-        ]);
-        if (!latestPriceLevel) {
-          throw new ManagedOrderStateChangedError(
-            "The selected price level no longer exists",
-          );
-        }
-        const priceLevelSide = Number(latestPriceLevel.side);
-        if (priceLevelSide !== SIDE_BID && priceLevelSide !== SIDE_ASK) {
-          throw new ManagedOrderStateChangedError(
-            "The selected price level has an invalid side",
-          );
-        }
+            }
+            return managedOrderSnapshot({
+              publicKey: adjacentPda,
+              account: adjacentAccount,
+            });
+          }),
+        );
+        if (!isCurrentTransactionContext(submissionContext)) return;
         try {
           assertSolanaManagedOrderBookLinks({
-            plan: freshPlan,
-            priceLevel: {
-              marketState: (
-                latestPriceLevel.marketState as PublicKey
-              ).toBase58(),
-              side: priceLevelSide,
-              price: Number(latestPriceLevel.price),
-              headOrderId: asBigInt(latestPriceLevel.headOrderId),
-              tailOrderId: asBigInt(latestPriceLevel.tailOrderId),
-              totalOpen: asBigInt(latestPriceLevel.totalOpen),
-            },
+            plan: instructionPlan,
+            priceLevel: priceLevelSnapshot,
             adjacentOrders: adjacentAccounts,
           });
         } catch (error) {
@@ -2704,6 +3538,7 @@ export function SolanaClobPanel({
           connection.getBalance(managedVault, "confirmed"),
           connection.getMinimumBalanceForRentExemption(0, "confirmed"),
         ]);
+        if (!isCurrentTransactionContext(submissionContext)) return;
         if (
           BigInt(vaultBalance) <
           BigInt(vaultRentMinimum) + freshPlan.refundableCollateralLamports
@@ -2713,8 +3548,8 @@ export function SolanaClobPanel({
           );
         }
 
-        const remainingAccounts: AccountMeta[] = freshPlan.adjacentOrderIds.map(
-          (orderId) => ({
+        const remainingAccounts: AccountMeta[] =
+          instructionPlan.adjacentOrderIds.map((orderId) => ({
             pubkey: findOrderPda(
               clobProgram.programId,
               managedMarketState,
@@ -2722,19 +3557,18 @@ export function SolanaClobPanel({
             ),
             isSigner: false,
             isWritable: true,
-          }),
-        );
+          }));
         const instructionBuilder =
-          freshPlan.action === "CANCEL"
+          instructionPlan.action === "CANCEL"
             ? clobProgram.methods.cancelOrder(
-                new BN(freshPlan.orderId.toString()),
-                freshPlan.side,
-                freshPlan.programPriceMillis,
+                new BN(instructionPlan.orderId.toString()),
+                instructionPlan.side,
+                instructionPlan.programPriceMillis,
               )
             : clobProgram.methods.reclaimRestingOrder(
-                new BN(freshPlan.orderId.toString()),
-                freshPlan.side,
-                freshPlan.programPriceMillis,
+                new BN(instructionPlan.orderId.toString()),
+                instructionPlan.side,
+                instructionPlan.programPriceMillis,
               );
         tx = await instructionBuilder
           .accountsPartial({
@@ -2748,11 +3582,53 @@ export function SolanaClobPanel({
           })
           .remainingAccounts(remainingAccounts)
           .transaction();
+        if (instructionPlan.action === "RECLAIM") {
+          const managedUserBalance = findUserBalancePda(
+            clobProgram.programId,
+            managedMarketState,
+            wallet.publicKey,
+          );
+          const latestUserBalance =
+            await clobProgram.account.userBalance.fetchNullable(
+              managedUserBalance,
+            );
+          if (!isCurrentTransactionContext(submissionContext)) return;
+          if (
+            latestUserBalance &&
+            shouldCloseEmptySolanaUserBalance({
+              marketStatus: enumName(latestMarketAccount.status) ?? "unknown",
+              balance: {
+                aShares: asBigInt(latestUserBalance.aShares),
+                bShares: asBigInt(latestUserBalance.bShares),
+                aLockedLamports: asBigInt(latestUserBalance.aLockedLamports),
+                bLockedLamports: asBigInt(latestUserBalance.bLockedLamports),
+                tradeTreasuryFeeLamports: asBigInt(
+                  latestUserBalance.tradeTreasuryFeeLamports,
+                ),
+                tradeMarketMakerFeeLamports: asBigInt(
+                  latestUserBalance.tradeMarketMakerFeeLamports,
+                ),
+              },
+            })
+          ) {
+            const cleanupTransaction = await clobProgram.methods
+              .closeEmptyUserBalance()
+              .accountsPartial({
+                marketState: managedMarketState,
+                userBalance: managedUserBalance,
+                user: wallet.publicKey,
+              })
+              .transaction();
+            tx.add(...cleanupTransaction.instructions);
+          }
+        }
       }
       const signature = await submitTransaction(
         tx,
         copy.managingOrderContext,
+        submissionContext,
         (transactionStage, submittedSignature) => {
+          if (!isCurrentTransactionContext(submissionContext)) return;
           setManagedOrderTransactionFeedback({
             status: transactionStage,
             signature: submittedSignature,
@@ -2761,6 +3637,7 @@ export function SolanaClobPanel({
           });
         },
       );
+      if (!isCurrentTransactionContext(submissionContext)) return;
       setManagedOrderTransactionFeedback({
         status: "confirmed",
         signature,
@@ -2771,6 +3648,7 @@ export function SolanaClobPanel({
       setSelectedManagedOrder(null);
       await refreshData();
     } catch (error) {
+      if (!isCurrentTransactionContext(submissionContext)) return;
       const recovery = classifySolanaTransactionError(error);
       const message =
         error instanceof ManagedOrderStateChangedError
@@ -2790,17 +3668,27 @@ export function SolanaClobPanel({
         await refreshData();
       }
     } finally {
-      managedOrderSubmissionInProgressRef.current = false;
-      setSubmittingManagedOrderId(null);
+      if (
+        releaseSolanaTransactionContextLock(
+          managedOrderSubmissionInProgressRef,
+          submissionContext,
+        )
+      ) {
+        if (isCurrentTransactionContext(submissionContext)) {
+          setSubmittingManagedOrderId(null);
+        }
+      }
     }
   }, [
     connection,
     copy,
+    isCurrentTransactionContext,
     managedOrderTransactionFeedback.status,
     readonlyPrograms.fightOracle,
     refreshData,
     selectedManagedOrder,
     submitTransaction,
+    transactionContext,
     wallet.publicKey,
     writablePrograms,
   ]);
@@ -2810,8 +3698,20 @@ export function SolanaClobPanel({
       return;
     }
 
+    const competitiveCommitmentReady =
+      activeMarket?.tradingReady === true &&
+      activeMarket.competitiveSnapshotVersion !== null &&
+      activeMarket.competitiveSnapshotDigest !== null;
     onMarketSnapshot({
       duelKeyHex,
+      marketRef: activeMarket?.marketState.toBase58() ?? null,
+      competitiveSnapshotVersion: competitiveCommitmentReady
+        ? activeMarket.competitiveSnapshotVersion
+        : null,
+      competitiveSnapshotDigest: competitiveCommitmentReady
+        ? activeMarket.competitiveSnapshotDigest
+        : null,
+      tradingReady: activeMarket?.tradingReady === true,
       matchLabel: duelLabel,
       marketStatus: activeMarket?.marketStatus ?? "unavailable",
       yesProbabilityPercent: deriveTwoSidedClobProbabilityPercent(
@@ -2828,7 +3728,11 @@ export function SolanaClobPanel({
   }, [
     activeMarket?.bestAsk,
     activeMarket?.bestBid,
+    activeMarket?.competitiveSnapshotDigest,
+    activeMarket?.competitiveSnapshotVersion,
+    activeMarket?.marketState,
     activeMarket?.marketStatus,
+    activeMarket?.tradingReady,
     asks,
     bids,
     chartData,
@@ -2931,7 +3835,7 @@ export function SolanaClobPanel({
     currentFundingEstimate.walletBalanceLamports >= maxWalletFundingLamports;
   const orderSubmissionReady =
     tradingEnabled &&
-    Boolean(activeMarket) &&
+    activeMarket?.tradingReady === true &&
     uiState.canTrade &&
     orderQuote != null &&
     currentFundingEstimate != null &&
@@ -2946,47 +3850,112 @@ export function SolanaClobPanel({
     orderSubmissionReady,
     submissionInProgress: isPlacingOrder,
   });
-  const handleRequestOrderConfirmation = useCallback(() => {
-    if (!orderSubmissionReady || !orderQuoteKey) return;
-    orderConfirmationReturnFocusRef.current =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    setLastPlaceOrderError("-");
-    setOrderTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
-    setSelectedManagedOrder(null);
-    setOrderConfirmationRows(orderQuoteRows);
-    setOrderConfirmationKey(orderQuoteKey);
-  }, [orderQuoteKey, orderQuoteRows, orderSubmissionReady]);
+  const handleRequestOrderConfirmation = useCallback(
+    (returnFocusTarget?: HTMLElement) => {
+      if (!orderSubmissionReady || !orderQuoteKey || !orderQuote) return;
+      const authorityEpoch = wagerAuthorityBoundary.capture();
+      if (!authorityEpoch) return;
+      emitHyperbetProductEvent("bet_attempt", {
+        orderKind: "limit",
+        side,
+      });
+      orderConfirmationReturnFocusRef.current =
+        returnFocusTarget ??
+        (document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null);
+      setLastPlaceOrderError("-");
+      setOrderTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
+      setSelectedManagedOrder(null);
+      setOrderConfirmationRows(orderQuoteRows);
+      setOrderConfirmationSummary({
+        side,
+        fighterName: side === "YES" ? effectiveAgent1 : effectiveAgent2,
+        grossPayoutLamports: orderQuote.fullFillGrossPayoutLamports,
+      });
+      orderConfirmationAuthorityEpochRef.current = authorityEpoch;
+      setOrderConfirmationKey(orderQuoteKey);
+    },
+    [
+      effectiveAgent1,
+      effectiveAgent2,
+      orderQuote,
+      orderQuoteKey,
+      orderQuoteRows,
+      orderSubmissionReady,
+      side,
+      wagerAuthorityBoundary,
+    ],
+  );
   const handleConfirmPlaceOrder = useCallback(async () => {
+    const authorityEpoch = orderConfirmationAuthorityEpochRef.current;
     if (
       !orderConfirmationKey ||
       orderConfirmationKey !== orderQuoteKey ||
       !orderSubmissionReady ||
-      isPlacingOrder
+      isPlacingOrder ||
+      !authorityEpoch
     ) {
       setLastPlaceOrderError(copy.quoteChanged);
       setStatus(copy.quoteChanged);
       return;
     }
-    setIsPlacingOrder(true);
-    orderSubmissionInProgressRef.current = true;
     try {
-      await handlePlaceOrder(orderConfirmationKey);
+      wagerAuthorityBoundary.assertCurrent(authorityEpoch);
+    } catch (error) {
+      if (!(error instanceof SolanaWagerAuthorityChangedError)) throw error;
+      orderConfirmationAuthorityEpochRef.current = null;
       setOrderConfirmationKey(null);
+      setOrderConfirmationRows([]);
+      setOrderConfirmationSummary(null);
+      setLastPlaceOrderError(copy.quoteChanged);
+      setStatus(copy.quoteChanged);
+      return;
+    }
+    const submissionContext = transactionContext;
+    if (!isCurrentTransactionContext(submissionContext)) {
+      orderConfirmationAuthorityEpochRef.current = null;
+      setOrderConfirmationKey(null);
+      return;
+    }
+    setIsPlacingOrder(true);
+    orderSubmissionInProgressRef.current = submissionContext;
+    try {
+      await handlePlaceOrder(
+        orderConfirmationKey,
+        submissionContext,
+        authorityEpoch,
+      );
+      if (isCurrentTransactionContext(submissionContext)) {
+        orderConfirmationAuthorityEpochRef.current = null;
+        setOrderConfirmationKey(null);
+      }
     } finally {
-      orderSubmissionInProgressRef.current = false;
-      setIsPlacingOrder(false);
+      if (
+        releaseSolanaTransactionContextLock(
+          orderSubmissionInProgressRef,
+          submissionContext,
+        )
+      ) {
+        if (isCurrentTransactionContext(submissionContext)) {
+          setIsPlacingOrder(false);
+        }
+      }
     }
   }, [
     copy.quoteChanged,
     handlePlaceOrder,
+    isCurrentTransactionContext,
     isPlacingOrder,
     orderConfirmationKey,
     orderQuoteKey,
     orderSubmissionReady,
+    transactionContext,
+    wagerAuthorityBoundary,
   ]);
   const handleReviewLatestQuote = useCallback(async () => {
+    const reviewContext = transactionContext;
+    if (!isCurrentTransactionContext(reviewContext)) return;
     setOrderConfirmationKey(null);
     const feedback = orderTransactionFeedback;
     if (!requiresTransactionStatusCheck(feedback)) {
@@ -3004,6 +3973,7 @@ export function SolanaClobPanel({
     });
     try {
       const inspection = await inspectSignatureViaRpc(connection, signature);
+      if (!isCurrentTransactionContext(reviewContext)) return;
       if (inspection.state === "confirmed") {
         setLastPlaceOrderTx(signature);
         setLastPlaceOrderError("-");
@@ -3021,7 +3991,7 @@ export function SolanaClobPanel({
             ...trackingIntent,
             txSignature: signature,
           });
-          if (!recorded) {
+          if (!recorded && isCurrentTransactionContext(reviewContext)) {
             setOrderTransactionFeedback({
               status: "confirmed",
               signature,
@@ -3029,7 +3999,7 @@ export function SolanaClobPanel({
               warning: copy.trackingDelayed,
             });
           }
-        } else {
+        } else if (isCurrentTransactionContext(reviewContext)) {
           setOrderTransactionFeedback({
             status: "confirmed",
             signature,
@@ -3037,6 +4007,7 @@ export function SolanaClobPanel({
             warning: copy.trackingDelayed,
           });
         }
+        if (!isCurrentTransactionContext(reviewContext)) return;
         await refreshData();
         return;
       }
@@ -3065,13 +4036,23 @@ export function SolanaClobPanel({
             : copy.transactionNotFoundAfterCheck,
       });
     } catch {
+      if (!isCurrentTransactionContext(reviewContext)) return;
       setOrderTransactionFeedback({
         ...feedback,
         warning: copy.transactionStatusCheckFailed,
       });
     }
-  }, [connection, copy, orderTransactionFeedback, refreshData]);
+  }, [
+    connection,
+    copy,
+    isCurrentTransactionContext,
+    orderTransactionFeedback,
+    refreshData,
+    transactionContext,
+  ]);
   const handleReviewLatestSettlement = useCallback(async () => {
+    const reviewContext = transactionContext;
+    if (!isCurrentTransactionContext(reviewContext)) return;
     const feedback = settlementTransactionFeedback;
     if (!requiresTransactionStatusCheck(feedback)) {
       setSettlementTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
@@ -3088,6 +4069,7 @@ export function SolanaClobPanel({
     });
     try {
       const inspection = await inspectSignatureViaRpc(connection, signature);
+      if (!isCurrentTransactionContext(reviewContext)) return;
       if (inspection.state === "confirmed") {
         setLastClaimTx(signature);
         setLastClaimError("-");
@@ -3098,15 +4080,29 @@ export function SolanaClobPanel({
           warning: null,
         });
         setStatus(
-          settlementFeedbackKind === "cleanup"
-            ? copy.positionCleared
-            : copy.claimComplete,
+          settlementFeedbackKind === "rent"
+            ? copy.balanceRentRecovered
+            : settlementFeedbackKind === "cleanup"
+              ? copy.positionCleared
+              : copy.claimComplete,
         );
+        const mutationContext = settlementMutationContextRef.current;
+        dispatchHyperbetMarketRefresh(
+          mutationContext
+            ? {
+                schemaVersion: 1,
+                mutation: "SETTLEMENT_CONFIRMED",
+                ...mutationContext,
+                signature,
+              }
+            : undefined,
+        );
+        settlementMutationContextRef.current = null;
         await refreshData();
-        window.dispatchEvent(new CustomEvent("hyperbet:market-refresh"));
         return;
       }
       if (inspection.state === "failed") {
+        settlementMutationContextRef.current = null;
         const recovery = failedTransactionRecovery(
           signature,
           feedback.recovery.stage,
@@ -3120,9 +4116,11 @@ export function SolanaClobPanel({
         });
         setLastClaimError(copy.recoveryCopy.ONCHAIN_FAILED);
         setStatus(
-          settlementFeedbackKind === "cleanup"
-            ? copy.clearPositionFailed(copy.recoveryCopy.ONCHAIN_FAILED)
-            : copy.claimFailed(copy.recoveryCopy.ONCHAIN_FAILED),
+          settlementFeedbackKind === "rent"
+            ? copy.balanceRentRecoveryFailed(copy.recoveryCopy.ONCHAIN_FAILED)
+            : settlementFeedbackKind === "cleanup"
+              ? copy.clearPositionFailed(copy.recoveryCopy.ONCHAIN_FAILED)
+              : copy.claimFailed(copy.recoveryCopy.ONCHAIN_FAILED),
         );
         await refreshData();
         return;
@@ -3135,6 +4133,7 @@ export function SolanaClobPanel({
             : copy.transactionNotFoundAfterCheck,
       });
     } catch {
+      if (!isCurrentTransactionContext(reviewContext)) return;
       setSettlementTransactionFeedback({
         ...feedback,
         warning: copy.transactionStatusCheckFailed,
@@ -3143,16 +4142,19 @@ export function SolanaClobPanel({
   }, [
     connection,
     copy,
+    isCurrentTransactionContext,
     refreshData,
     settlementFeedbackKind,
     settlementTransactionFeedback,
+    transactionContext,
   ]);
   const handleRequestManagedOrder = useCallback(
-    (plan: SolanaManagedOrderPlan) => {
+    (plan: SolanaManagedOrderPlan, returnFocusTarget?: HTMLElement) => {
       managedOrderReturnFocusRef.current =
-        document.activeElement instanceof HTMLElement
+        returnFocusTarget ??
+        (document.activeElement instanceof HTMLElement
           ? document.activeElement
-          : null;
+          : null);
       setOrderConfirmationKey(null);
       setManagedOrderErrorMessage(null);
       setManagedOrderFeedbackAction(plan.action);
@@ -3162,11 +4164,16 @@ export function SolanaClobPanel({
     [],
   );
   const handleHistoricalOrderManagement = useCallback(
-    async (request: SolanaHistoricalOrderRequest) => {
+    async (
+      request: SolanaHistoricalOrderRequest,
+      returnFocusTarget?: HTMLElement,
+    ) => {
+      const requestContext = transactionContext;
       if (!wallet.publicKey || preparingHistoryOrderBetId !== null) {
         setStatus(copy.connectWalletToTrade);
         return;
       }
+      if (!isCurrentTransactionContext(requestContext)) return;
       const normalizedDuelKey = normalizePredictionMarketDuelKeyHex(
         request.duelKey,
       );
@@ -3214,6 +4221,7 @@ export function SolanaClobPanel({
             clobProgram.account.order.fetchNullable(orderPda),
             connection.getAccountInfo(orderPda, "confirmed"),
           ]);
+        if (!isCurrentTransactionContext(requestContext)) return;
         if (
           !(marketAccount.duelState as PublicKey).equals(requestedDuelState) ||
           Number(marketAccount.marketKind) !== DUEL_WINNER_MARKET_KIND ||
@@ -3253,8 +4261,9 @@ export function SolanaClobPanel({
             "The historical order state changed",
           );
         }
-        handleRequestManagedOrder(plan);
+        handleRequestManagedOrder(plan, returnFocusTarget);
       } catch {
+        if (!isCurrentTransactionContext(requestContext)) return;
         setManagedOrderErrorMessage(copy.managedOrderChanged);
         setStatus(copy.managedOrderChanged);
         await refreshData();
@@ -3267,14 +4276,18 @@ export function SolanaClobPanel({
       copy.connectWalletToTrade,
       copy.managedOrderChanged,
       handleRequestManagedOrder,
+      isCurrentTransactionContext,
       preparingHistoryOrderBetId,
       readonlyPrograms.duelMarket,
       readonlyPrograms.fightOracle,
       refreshData,
+      transactionContext,
       wallet.publicKey,
     ],
   );
   const handleReviewLatestManagedOrder = useCallback(async () => {
+    const reviewContext = transactionContext;
+    if (!isCurrentTransactionContext(reviewContext)) return;
     setSelectedManagedOrder(null);
     const feedback = managedOrderTransactionFeedback;
     if (!requiresTransactionStatusCheck(feedback)) {
@@ -3293,6 +4306,7 @@ export function SolanaClobPanel({
     });
     try {
       const inspection = await inspectSignatureViaRpc(connection, signature);
+      if (!isCurrentTransactionContext(reviewContext)) return;
       if (inspection.state === "confirmed") {
         setManagedOrderErrorMessage(null);
         setManagedOrderTransactionFeedback({
@@ -3330,6 +4344,7 @@ export function SolanaClobPanel({
             : copy.transactionNotFoundAfterCheck,
       });
     } catch {
+      if (!isCurrentTransactionContext(reviewContext)) return;
       setManagedOrderTransactionFeedback({
         ...feedback,
         warning: copy.transactionStatusCheckFailed,
@@ -3338,37 +4353,16 @@ export function SolanaClobPanel({
   }, [
     connection,
     copy,
+    isCurrentTransactionContext,
     managedOrderFeedbackAction,
     managedOrderTransactionFeedback,
     refreshData,
+    transactionContext,
   ]);
-
-  const transactionMarketAddress = activeMarket?.marketState.toBase58() ?? null;
-  const transactionWalletAddress = wallet.publicKey?.toBase58() ?? null;
-  useEffect(() => {
-    if (!transactionMarketAddress || !transactionWalletAddress) {
-      return;
-    }
-    const transactionContext = `${transactionWalletAddress}:${transactionMarketAddress}`;
-    if (transactionContextRef.current === null) {
-      transactionContextRef.current = transactionContext;
-      return;
-    }
-    if (transactionContextRef.current === transactionContext) {
-      return;
-    }
-    transactionContextRef.current = transactionContext;
-    setOrderTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
-    setSettlementTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
-    setManagedOrderTransactionFeedback(IDLE_SOLANA_TRANSACTION_FEEDBACK);
-    setManagedOrderErrorMessage(null);
-    setSelectedManagedOrder(null);
-  }, [transactionMarketAddress, transactionWalletAddress]);
 
   useEffect(() => {
     if (orderConfirmationKey == null) return undefined;
-    const previousBodyOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const restoreDocumentScroll = lockDocumentScroll(document);
     const handleDialogKeyboard = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (!orderSubmissionInProgressRef.current) {
@@ -3398,17 +4392,18 @@ export function SolanaClobPanel({
     };
     window.addEventListener("keydown", handleDialogKeyboard);
     return () => {
-      document.body.style.overflow = previousBodyOverflow;
+      restoreDocumentScroll();
       window.removeEventListener("keydown", handleDialogKeyboard);
-      orderConfirmationReturnFocusRef.current?.focus();
+      const returnFocusTarget =
+        orderConfirmationReturnFocusRef.current ?? orderSubmitButtonRef.current;
+      restoreSolanaOrderConfirmationFocus(returnFocusTarget, panelRef.current);
       orderConfirmationReturnFocusRef.current = null;
     };
   }, [orderConfirmationKey]);
 
   useEffect(() => {
     if (selectedManagedOrder == null) return undefined;
-    const previousBodyOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
+    const restoreDocumentScroll = lockDocumentScroll(document);
     const handleDialogKeyboard = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         if (!managedOrderSubmissionInProgressRef.current) {
@@ -3438,7 +4433,7 @@ export function SolanaClobPanel({
     };
     window.addEventListener("keydown", handleDialogKeyboard);
     return () => {
-      document.body.style.overflow = previousBodyOverflow;
+      restoreDocumentScroll();
       window.removeEventListener("keydown", handleDialogKeyboard);
       managedOrderReturnFocusRef.current?.focus();
       managedOrderReturnFocusRef.current = null;
@@ -3450,15 +4445,46 @@ export function SolanaClobPanel({
   );
   const noPercent = yesPercent === null ? null : 100 - yesPercent;
   const canClaim = uiState.canClaim;
+  const visibleManagedOrders = selectPresentableSolanaManagedOrders({
+    orders: managedOrders,
+    lifecycleStatus: uiState.lifecycleStatus,
+    primarySettlementRequired: canClaim,
+  });
   const claimUi = derivePredictionMarketClaimUi(
     copy,
     uiState.claimKind,
     canClaim,
   );
+  const settlementActionUi = canRecoverEmptyBalanceRent
+    ? {
+        title: copy.balanceRentTitle,
+        buttonLabel: copy.recoverBalanceRent,
+        helpText: copy.balanceRentHelp,
+      }
+    : claimUi;
   const claimValueText =
     canClaim && uiState.claimableAmount > 0n
       ? `${fmtAmount(uiState.claimableAmount).toFixed(3)} SOL`
       : null;
+  const settlementActionButtonLabel = claimValueText
+    ? `${settlementActionUi.buttonLabel} ${claimValueText}`
+    : settlementActionUi.buttonLabel;
+  const settlementActionKind: SolanaSettlementActionKind =
+    canRecoverEmptyBalanceRent
+      ? "rent"
+      : uiState.claimKind === "REFUND"
+        ? "refund"
+        : uiState.claimKind === "LOSER_CLEANUP"
+          ? "cleanup"
+          : "winnings";
+  const settlementActionEyebrow =
+    settlementActionKind === "rent"
+      ? copy.rentRecoveryReady
+      : settlementActionKind === "refund"
+        ? copy.refundReady
+        : settlementActionKind === "cleanup"
+          ? copy.cleanupRequired
+          : copy.winningsReady;
   const marketStateText = activeMarket?.marketState.toBase58() ?? "-";
   const lifecycleDebugText = [
     `duelKey=${activeLifecycleMarket?.duelKey ?? activeLifecycleDuel?.duelKey ?? duelKeyHex ?? "-"}`,
@@ -3490,19 +4516,45 @@ export function SolanaClobPanel({
     `${copy.adminPools} YES ${fmtAmount(yesPool).toFixed(6)} | NO ${fmtAmount(noPool).toFixed(6)}`,
     `${copy.adminLastOrder} ${lastOrderId?.toString() ?? "-"}`,
   ].join("\n");
-  const orderQuoteIssue = orderQuoteResult.error
-    ? copy.quoteUnavailable(orderQuoteResult.error)
-    : orderFundingError
-      ? copy.quoteUnavailable(orderFundingError)
-      : orderQuote && walletAddress && orderQuoteKey && !currentFundingEstimate
-        ? copy.quoteLoading
-        : currentFundingEstimate?.orderAccountCollision
-          ? copy.quoteUnavailable("next order account already exists")
-          : currentFundingEstimate && !currentFundingEstimate.vaultReady
-            ? copy.vaultNotReady
-            : currentFundingEstimate && !hasSufficientOrderFunding
-              ? copy.insufficientBalance
-              : null;
+  const orderQuoteNotice: {
+    kind: SolanaOrderQuoteNoticeKind;
+    message: string;
+  } | null = amountInputIssue
+    ? { kind: "input", message: copy.quoteUnavailable(amountInputIssue) }
+    : limitPriceInputIssue
+      ? {
+          kind: "input",
+          message: copy.quoteUnavailable(limitPriceInputIssue),
+        }
+      : orderQuoteResult.error
+        ? {
+            kind: "error",
+            message: copy.quoteUnavailable(orderQuoteResult.error),
+          }
+        : orderFundingError
+          ? {
+              kind: "error",
+              message: copy.quoteUnavailable(orderFundingError),
+            }
+          : orderQuote &&
+              walletAddress &&
+              orderQuoteKey &&
+              !currentFundingEstimate
+            ? { kind: "loading", message: copy.quoteLoading }
+            : currentFundingEstimate?.orderAccountCollision
+              ? {
+                  kind: "error",
+                  message: copy.quoteUnavailable(
+                    "next order account already exists",
+                  ),
+                }
+              : currentFundingEstimate && !currentFundingEstimate.vaultReady
+                ? { kind: "status", message: copy.vaultNotReady }
+                : currentFundingEstimate && !hasSufficientOrderFunding
+                  ? { kind: "error", message: copy.insufficientBalance }
+                  : null;
+  const orderQuoteHasErrorTone =
+    orderQuoteNotice?.kind === "input" || orderQuoteNotice?.kind === "error";
   const orderTransactionMessage =
     orderTransactionFeedback.status === "idle"
       ? null
@@ -3513,7 +4565,9 @@ export function SolanaClobPanel({
     settlementTransactionFeedback.status === "idle"
       ? null
       : settlementTransactionFeedback.status === "error"
-        ? copy.recoveryCopy[settlementTransactionFeedback.recovery.kind]
+        ? settlementFeedbackKind === "rent" && lastClaimError !== "-"
+          ? lastClaimError
+          : copy.recoveryCopy[settlementTransactionFeedback.recovery.kind]
         : settlementTransactionFeedback.status === "confirmed"
           ? copy.settlementConfirmed[settlementFeedbackKind]
           : copy.settlementProgress[settlementTransactionFeedback.status];
@@ -3527,7 +4581,11 @@ export function SolanaClobPanel({
           ? copy.managedOrderConfirmed[managedOrderFeedbackAction]
           : copy.managedOrderProgress[managedOrderTransactionFeedback.status];
   return (
-    <div data-testid={isE2eMode ? "solana-clob-panel" : undefined}>
+    <div
+      ref={panelRef}
+      tabIndex={-1}
+      data-testid={isE2eMode ? "solana-clob-panel" : undefined}
+    >
       <PredictionMarketPanel
         yesPercent={yesPercent}
         noPercent={noPercent}
@@ -3538,6 +4596,7 @@ export function SolanaClobPanel({
         amountInput={amountInput}
         setAmountInput={setAmountInput}
         onPlaceBet={handleRequestOrderConfirmation}
+        submitButtonRef={orderSubmitButtonRef}
         isWalletReady={walletReady(wallet)}
         programsReady={orderSubmissionReady && !isPlacingOrder}
         agent1Name={effectiveAgent1}
@@ -3549,6 +4608,8 @@ export function SolanaClobPanel({
         recentTrades={recentTrades}
         currencySymbol="SOL"
         amountLabel={copy.payoutAmountLabel}
+        amountHelpText={copy.amountInputHelp}
+        amountError={amountInputIssue}
         compact={compact}
         pointsDisplay={
           readOnly ? undefined : (
@@ -3560,7 +4621,8 @@ export function SolanaClobPanel({
           )
         }
         locale={resolvedLocale}
-        readOnly={readOnly}
+        readOnly={!orderEntryAvailable}
+        readOnlyMessage={tradingUnavailableMessage}
       >
         {!readOnly ? (
           <div
@@ -3573,7 +4635,7 @@ export function SolanaClobPanel({
               fontSize: 12,
             }}
           >
-            {activeMarket ? (
+            {activeMarket && orderEntryAvailable ? (
               <div
                 data-testid={isE2eMode ? "solana-order-quote" : undefined}
                 style={{
@@ -3581,8 +4643,8 @@ export function SolanaClobPanel({
                   gap: 8,
                   padding: "12px",
                   borderRadius: "var(--hm-radius)",
-                  border: `1px solid ${orderQuoteIssue ? "rgba(248,113,113,0.28)" : "rgba(96,165,250,0.24)"}`,
-                  background: orderQuoteIssue
+                  border: `1px solid ${orderQuoteHasErrorTone ? "rgba(248,113,113,0.28)" : "rgba(96,165,250,0.24)"}`,
+                  background: orderQuoteHasErrorTone
                     ? "rgba(127,29,29,0.09)"
                     : "rgba(30,64,175,0.08)",
                 }}
@@ -3622,10 +4684,8 @@ export function SolanaClobPanel({
                     </span>
                   </div>
                 ))}
-                {orderQuoteIssue ? (
-                  <span style={{ color: "#fca5a5", lineHeight: 1.45 }}>
-                    {orderQuoteIssue}
-                  </span>
+                {orderQuoteNotice ? (
+                  <SolanaOrderQuoteNotice {...orderQuoteNotice} />
                 ) : null}
                 {orderQuote?.selfTradePrevented ? (
                   <span style={{ color: "#fbbf24", lineHeight: 1.45 }}>
@@ -3656,24 +4716,27 @@ export function SolanaClobPanel({
               testId="solana-order-transaction-feedback"
               signatureTestId="solana-order-transaction-signature"
               signatureLabel={copy.transactionSignature}
+              detailsLabel={copy.transactionDetails}
               receiptLabel={copy.transactionReceipt}
               reviewLabel={copy.reviewLatestQuote}
               checkStatusLabel={copy.checkTransactionStatus}
               onReview={() => void handleReviewLatestQuote()}
             />
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                gap: 12,
-                flexWrap: "wrap",
-              }}
-            >
-              <span>{status}</span>
-            </div>
+            {showSecondaryStatus ? (
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 12,
+                  flexWrap: "wrap",
+                }}
+              >
+                <span>{status}</span>
+              </div>
+            ) : null}
 
             <SolanaManagedOrders
-              orders={managedOrders}
+              orders={visibleManagedOrders}
               submittingOrderId={submittingManagedOrderId}
               disabled={
                 !walletReady(wallet) ||
@@ -3692,103 +4755,39 @@ export function SolanaClobPanel({
               testId="solana-managed-order-transaction-feedback"
               signatureTestId="solana-managed-order-transaction-signature"
               signatureLabel={copy.transactionSignature}
+              detailsLabel={copy.transactionDetails}
               receiptLabel={copy.transactionReceipt}
               reviewLabel={copy.reviewLatestManagedOrder}
               checkStatusLabel={copy.checkTransactionStatus}
               onReview={() => void handleReviewLatestManagedOrder()}
             />
 
-            {canClaim ? (
-              <div
-                style={{
-                  display: "grid",
-                  gap: 8,
-                  padding: "12px",
-                  borderRadius: "var(--hm-radius)",
-                  border: "1px solid rgba(52,211,153,0.26)",
-                  background:
-                    "linear-gradient(180deg, rgba(16,92,53,0.14) 0%, rgba(12,67,39,0.08) 100%)",
-                  boxShadow:
-                    "inset 0 1px 0 rgba(255,255,255,0.05), 0 10px 22px rgba(0,0,0,0.14)",
-                }}
-              >
-                <div
-                  style={{
-                    display: "grid",
-                    gap: 4,
-                    minWidth: 0,
-                  }}
-                >
-                  <span
-                    style={{
-                      fontSize: 9,
-                      fontWeight: 800,
-                      letterSpacing: 1,
-                      textTransform: "uppercase",
-                      color: "rgba(167,243,208,0.82)",
-                      fontFamily: "var(--hm-font-display)",
-                    }}
-                  >
-                    {copy.adminStatus}
-                  </span>
-                  <span
-                    style={{
-                      fontSize: compact ? 12 : 13,
-                      fontWeight: 700,
-                      color: "var(--hm-text, #f8fafc)",
-                      lineHeight: 1.4,
-                      minWidth: 0,
-                      overflowWrap: "anywhere",
-                    }}
-                  >
-                    {claimUi.title}
-                  </span>
-                  {claimValueText ? (
-                    <span
-                      style={{
-                        fontSize: 11,
-                        fontWeight: 700,
-                        color: "rgba(167,243,208,0.88)",
-                        fontFamily: "var(--hm-font-mono)",
-                      }}
-                    >
-                      {claimValueText}
-                    </span>
-                  ) : null}
-                  <span
-                    style={{
-                      fontSize: 11,
-                      color:
-                        "var(--hm-panel-subtle-text, rgba(255,255,255,0.48))",
-                      lineHeight: 1.45,
-                      minWidth: 0,
-                      overflowWrap: "anywhere",
-                    }}
-                  >
-                    {claimUi.helpText}
-                  </span>
-                </div>
-
-                <button
-                  data-testid={
-                    isE2eMode ? "solana-clob-claim-payout" : undefined
-                  }
-                  type="button"
-                  disabled={
-                    isSubmittingSettlement || transactionSubmissionBlocked
-                  }
-                  onClick={() => void handleClaim()}
-                  style={buttonStyle(
-                    "#0f3f2b",
-                    "rgba(34,197,94,0.35)",
-                    isSubmittingSettlement,
-                  )}
-                >
-                  {isSubmittingSettlement
-                    ? copy.processingSettlement
-                    : claimUi.buttonLabel}
-                </button>
-              </div>
+            {canClaim || canRecoverEmptyBalanceRent ? (
+              <SolanaSettlementActionCard
+                kind={settlementActionKind}
+                eyebrow={settlementActionEyebrow}
+                title={settlementActionUi.title}
+                helpText={settlementActionUi.helpText}
+                amountLabel={copy.claimableNow}
+                amountText={claimValueText}
+                buttonLabel={settlementActionButtonLabel}
+                processingLabel={copy.processingSettlement}
+                isProcessing={isSubmittingSettlement}
+                disabled={transactionSubmissionBlocked}
+                onAction={() =>
+                  void (canRecoverEmptyBalanceRent
+                    ? handleActiveBalanceRentRecovery()
+                    : handleClaim())
+                }
+                testId="solana-clob-settlement-action"
+                actionTestId={
+                  isE2eMode
+                    ? canRecoverEmptyBalanceRent
+                      ? "solana-clob-recover-balance-rent"
+                      : "solana-clob-claim-payout"
+                    : undefined
+                }
+              />
             ) : null}
 
             <SolanaTransactionFeedbackCard
@@ -3798,235 +4797,302 @@ export function SolanaClobPanel({
               testId="solana-settlement-transaction-feedback"
               signatureTestId="solana-settlement-transaction-signature"
               signatureLabel={copy.transactionSignature}
+              detailsLabel={copy.transactionDetails}
               receiptLabel={copy.transactionReceipt}
               reviewLabel={copy.reviewLatestSettlement}
               checkStatusLabel={copy.checkTransactionStatus}
               onReview={() => void handleReviewLatestSettlement()}
             />
 
-            <SolanaSettlementHistory
-              walletAddress={walletAddress}
-              agent1Name={effectiveAgent1}
-              agent2Name={effectiveAgent2}
-              onRequestSettlement={handleHistoricalSettlement}
-              onRequestOrderManagement={handleHistoricalOrderManagement}
-              settlingBetId={settlingHistoryBetId}
-              preparingOrderBetId={preparingHistoryOrderBetId}
-              transactionsBlocked={transactionSubmissionBlocked}
-              compact={compact}
-              locale={resolvedLocale}
-            />
+            <Suspense fallback={null}>
+              <DeferredSolanaSettlementHistory
+                programId={duelMarketProgramId}
+                walletAddress={walletAddress}
+                agent1Name={effectiveAgent1}
+                agent2Name={effectiveAgent2}
+                onRequestSettlement={handleHistoricalSettlement}
+                onRequestBalanceCleanup={handleHistoricalBalanceRentRecovery}
+                onRequestOrderManagement={handleHistoricalOrderManagement}
+                settlingBetId={settlingHistoryBetId}
+                recoveringBalanceMarketPda={recoveringBalanceMarketPda}
+                preparingOrderBetId={preparingHistoryOrderBetId}
+                transactionsBlocked={transactionSubmissionBlocked}
+                compact={compact}
+                locale={resolvedLocale}
+              />
+            </Suspense>
           </div>
         ) : null}
       </PredictionMarketPanel>
-      {!readOnly ? (
-        <div
-          style={{
-            marginTop: 12,
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            color: "#d4d4d8",
-            fontFamily: "var(--hm-font-body)",
-            fontSize: 12,
-          }}
-        >
-          <span>{copy.limitPrice}</span>
-          <input
-            data-testid="solana-clob-price-input"
-            value={priceInput}
-            onChange={(event) => setPriceInput(event.target.value)}
-            inputMode="numeric"
-            style={{
-              width: 88,
-              padding: "6px 8px",
-              borderRadius: 8,
-              border: "1px solid rgba(255,255,255,0.14)",
-              background: "rgba(17,24,39,0.65)",
-              color: "#f4f4f5",
-            }}
-          />
-        </div>
+      {orderEntryAvailable ? (
+        <SolanaLimitPriceField
+          value={priceInput}
+          label={copy.limitPrice}
+          helpText={copy.limitPriceHelp}
+          errorMessage={limitPriceInputIssue}
+          onChange={setPriceInput}
+        />
       ) : null}
       {orderConfirmationKey != null ? (
-        <div
-          role="presentation"
-          style={{
-            position: "fixed",
-            inset: 0,
-            zIndex: 1000,
-            display: "grid",
-            placeItems: "center",
-            padding: 16,
-            background: "rgba(2,6,23,0.78)",
-            backdropFilter: "blur(8px)",
-          }}
-        >
+        <ViewportModalPortal>
           <div
-            ref={orderConfirmationDialogRef}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="solana-order-confirmation-title"
-            aria-describedby="solana-order-confirmation-help"
-            data-testid={isE2eMode ? "solana-order-confirmation" : undefined}
+            role="presentation"
             style={{
-              width: "min(100%, 460px)",
-              maxHeight: "min(90vh, 760px)",
-              overflowY: "auto",
+              position: "fixed",
+              inset: 0,
+              zIndex: 1000,
               display: "grid",
-              gap: 14,
-              padding: compact ? 16 : 20,
-              borderRadius: 14,
-              border: "1px solid rgba(96,165,250,0.34)",
-              background:
-                "linear-gradient(180deg, rgba(15,23,42,0.99), rgba(3,7,18,0.99))",
-              boxShadow: "0 28px 80px rgba(0,0,0,0.58)",
-              color: "var(--hm-text, #f8fafc)",
-              fontFamily: "var(--hm-font-body)",
+              placeItems: "center",
+              padding: 16,
+              overflowY: "auto",
+              overscrollBehavior: "contain",
+              background: "rgba(2,6,23,0.78)",
+              backdropFilter: "blur(8px)",
             }}
           >
-            <div style={{ display: "grid", gap: 6 }}>
-              <h2
-                id="solana-order-confirmation-title"
-                style={{ margin: 0, fontSize: 18, lineHeight: 1.25 }}
-              >
-                {copy.confirmOrderTitle}
-              </h2>
-              <p
-                id="solana-order-confirmation-help"
-                style={{
-                  margin: 0,
-                  color: "rgba(255,255,255,0.62)",
-                  fontSize: 12,
-                  lineHeight: 1.5,
-                }}
-              >
-                {copy.confirmOrderHelp}
-              </p>
-            </div>
-
             <div
+              ref={orderConfirmationDialogRef}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="solana-order-confirmation-title"
+              aria-describedby="solana-order-confirmation-help"
+              data-testid={isE2eMode ? "solana-order-confirmation" : undefined}
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Escape" &&
+                  !orderSubmissionInProgressRef.current
+                ) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setOrderConfirmationKey(null);
+                }
+              }}
               style={{
+                width: "min(100%, 460px)",
+                maxHeight: "min(calc(100dvh - 32px), 760px)",
+                overflowY: "auto",
+                overscrollBehavior: "contain",
+                boxSizing: "border-box",
                 display: "grid",
-                gap: 8,
-                padding: 12,
-                borderRadius: 10,
-                border: `1px solid ${confirmationQuoteIsCurrent ? "rgba(96,165,250,0.22)" : "rgba(248,113,113,0.32)"}`,
-                background: confirmationQuoteIsCurrent
-                  ? "rgba(30,64,175,0.08)"
-                  : "rgba(127,29,29,0.12)",
+                gap: 14,
+                padding: compact ? 16 : 20,
+                borderRadius: 14,
+                border: "1px solid rgba(96,165,250,0.34)",
+                background:
+                  "linear-gradient(180deg, rgba(15,23,42,0.99), rgba(3,7,18,0.99))",
+                boxShadow: "0 28px 80px rgba(0,0,0,0.58)",
+                color: "var(--hm-text, #f8fafc)",
+                fontFamily: "var(--hm-font-body)",
               }}
             >
-              {orderConfirmationRows.map((row) => (
-                <div
-                  key={row.label}
+              <div style={{ display: "grid", gap: 6 }}>
+                <h2
+                  id="solana-order-confirmation-title"
+                  style={{ margin: 0, fontSize: 18, lineHeight: 1.25 }}
+                >
+                  {copy.confirmOrderTitle}
+                </h2>
+                <p
+                  id="solana-order-confirmation-help"
                   style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "baseline",
-                    gap: 14,
+                    margin: 0,
+                    color: "rgba(255,255,255,0.62)",
                     fontSize: 12,
+                    lineHeight: 1.5,
                   }}
                 >
-                  <span style={{ color: "rgba(255,255,255,0.54)" }}>
-                    {row.label}
-                  </span>
-                  <span
+                  {copy.confirmOrderHelp}
+                </p>
+              </div>
+
+              {orderConfirmationSummary ? (
+                <div
+                  data-testid={
+                    isE2eMode ? "solana-order-confirmation-summary" : undefined
+                  }
+                  style={{
+                    display: "grid",
+                    gap: 5,
+                    padding: 12,
+                    borderRadius: 10,
+                    border: "1px solid rgba(96,165,250,0.34)",
+                    background:
+                      "linear-gradient(135deg, rgba(30,64,175,0.2), rgba(14,116,144,0.1))",
+                  }}
+                >
+                  <strong
                     style={{
-                      textAlign: "right",
-                      fontFamily: "var(--hm-font-mono)",
+                      fontSize: 16,
+                      lineHeight: 1.3,
                       overflowWrap: "anywhere",
                     }}
                   >
-                    {row.value}
+                    {copy.confirmOrderSummary(
+                      orderConfirmationSummary.fighterName,
+                      orderConfirmationSummary.side,
+                    )}
+                  </strong>
+                  <span
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "baseline",
+                      gap: 12,
+                      color: "rgba(255,255,255,0.62)",
+                      fontSize: 12,
+                    }}
+                  >
+                    <span>{copy.confirmGrossPayout}</span>
+                    <span
+                      style={{
+                        color: "var(--hm-text, #f8fafc)",
+                        fontFamily: "var(--hm-font-mono)",
+                        fontWeight: 800,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {formatSolLamports(
+                        orderConfirmationSummary.grossPayoutLamports,
+                      )}{" "}
+                      SOL
+                    </span>
                   </span>
                 </div>
-              ))}
-              {!confirmationQuoteIsCurrent ? (
-                <span
-                  role="alert"
-                  style={{ color: "#fca5a5", fontSize: 12, lineHeight: 1.45 }}
-                >
-                  {copy.quoteChanged}
-                </span>
               ) : null}
-            </div>
 
-            <div
-              style={{
-                display: "grid",
-                gap: 8,
-                color: "rgba(255,255,255,0.58)",
-                fontSize: 11,
-                lineHeight: 1.5,
-              }}
-            >
-              <span>{copy.refundDisclosure}</span>
-              <span>{copy.expirationDisclosure}</span>
-            </div>
+              <div
+                style={{
+                  display: "grid",
+                  gap: 8,
+                  padding: 12,
+                  borderRadius: 10,
+                  border: `1px solid ${confirmationQuoteIsCurrent ? "rgba(96,165,250,0.22)" : "rgba(248,113,113,0.32)"}`,
+                  background: confirmationQuoteIsCurrent
+                    ? "rgba(30,64,175,0.08)"
+                    : "rgba(127,29,29,0.12)",
+                }}
+              >
+                {orderConfirmationRows.map((row) => (
+                  <div
+                    key={row.label}
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "baseline",
+                      gap: 14,
+                      fontSize: 12,
+                    }}
+                  >
+                    <span style={{ color: "rgba(255,255,255,0.54)" }}>
+                      {row.label}
+                    </span>
+                    <span
+                      style={{
+                        textAlign: "right",
+                        fontFamily: "var(--hm-font-mono)",
+                        overflowWrap: "anywhere",
+                      }}
+                    >
+                      {row.value}
+                    </span>
+                  </div>
+                ))}
+                {!confirmationQuoteIsCurrent ? (
+                  <span
+                    role="alert"
+                    style={{ color: "#fca5a5", fontSize: 12, lineHeight: 1.45 }}
+                  >
+                    {copy.quoteChanged}
+                  </span>
+                ) : null}
+              </div>
 
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.35fr)",
-                gap: 10,
-              }}
-            >
-              <button
-                type="button"
-                disabled={isPlacingOrder}
-                onClick={() => setOrderConfirmationKey(null)}
-                style={buttonStyle(
-                  "rgba(30,41,59,0.78)",
-                  "rgba(148,163,184,0.26)",
-                  isPlacingOrder,
-                )}
+              <div
+                style={{
+                  display: "grid",
+                  gap: 8,
+                  color: "rgba(255,255,255,0.58)",
+                  fontSize: 11,
+                  lineHeight: 1.5,
+                }}
               >
-                {copy.cancelConfirmation}
-              </button>
-              <button
-                type="button"
-                autoFocus
-                disabled={!confirmationQuoteIsCurrent || isPlacingOrder}
-                onClick={() => void handleConfirmPlaceOrder()}
-                style={buttonStyle(
-                  "rgba(30,64,175,0.82)",
-                  "rgba(96,165,250,0.48)",
-                  !confirmationQuoteIsCurrent || isPlacingOrder,
-                )}
+                <span>{copy.refundDisclosure}</span>
+                <span>{copy.expirationDisclosure}</span>
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.35fr)",
+                  gap: 10,
+                }}
               >
-                {isPlacingOrder ? copy.confirmingOrder : copy.confirmAndSign}
-              </button>
+                <button
+                  type="button"
+                  autoFocus
+                  disabled={isPlacingOrder}
+                  onClick={() => setOrderConfirmationKey(null)}
+                  style={{
+                    ...buttonStyle(
+                      "rgba(30,41,59,0.78)",
+                      "rgba(148,163,184,0.26)",
+                      isPlacingOrder,
+                    ),
+                    minHeight: 44,
+                  }}
+                >
+                  {copy.cancelConfirmation}
+                </button>
+                <button
+                  type="button"
+                  disabled={!confirmationQuoteIsCurrent || isPlacingOrder}
+                  onClick={() => void handleConfirmPlaceOrder()}
+                  style={{
+                    ...buttonStyle(
+                      "rgba(30,64,175,0.82)",
+                      "rgba(96,165,250,0.48)",
+                      !confirmationQuoteIsCurrent || isPlacingOrder,
+                    ),
+                    minHeight: 44,
+                  }}
+                >
+                  {isPlacingOrder ? copy.confirmingOrder : copy.confirmAndSign}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
+        </ViewportModalPortal>
       ) : null}
       {selectedManagedOrder != null ? (
-        <div
-          role="presentation"
-          style={{
-            position: "fixed",
-            inset: 0,
-            zIndex: 1000,
-            display: "grid",
-            placeItems: "center",
-            padding: 16,
-            background: "rgba(2,6,23,0.78)",
-            backdropFilter: "blur(8px)",
-          }}
-        >
-          <SolanaManagedOrderConfirmationDialog
-            ref={managedOrderDialogRef}
-            order={selectedManagedOrder}
-            submitting={submittingManagedOrderId !== null}
-            compact={compact}
-            locale={resolvedLocale}
-            onBack={() => setSelectedManagedOrder(null)}
-            onConfirm={() => void handleConfirmManagedOrder()}
-          />
-        </div>
+        <ViewportModalPortal>
+          <div
+            role="presentation"
+            style={{
+              position: "fixed",
+              inset: 0,
+              zIndex: 1000,
+              display: "grid",
+              placeItems: "center",
+              padding: 16,
+              overflowY: "auto",
+              overscrollBehavior: "contain",
+              background: "rgba(2,6,23,0.78)",
+              backdropFilter: "blur(8px)",
+            }}
+          >
+            <SolanaManagedOrderConfirmationDialog
+              ref={managedOrderDialogRef}
+              order={selectedManagedOrder}
+              submitting={submittingManagedOrderId !== null}
+              compact={compact}
+              locale={resolvedLocale}
+              onBack={() => setSelectedManagedOrder(null)}
+              onConfirm={() => void handleConfirmManagedOrder()}
+            />
+          </div>
+        </ViewportModalPortal>
       ) : null}
-      {isE2eMode && (
+      {isE2eDebugMode && (
         <div
           style={{
             marginTop: 16,

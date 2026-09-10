@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "randomWordCount": 256,
+  "cases": [
+    {
+      "id": "hype",
+      "kind": "seed",
+      "seed": "0x48595045",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    },
+    {
+      "id": "sol1",
+      "kind": "seed",
+      "seed": "0x534f4c31",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    },
+    {
+      "id": "golden-ratio",
+      "kind": "seed",
+      "seed": "0x3c6ef373",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    },
+    {
+      "id": "orbit",
+      "kind": "seed",
+      "seed": "0x4f524249",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    },
+    {
+      "id": "order-book",
+      "kind": "seed",
+      "seed": "0x424f4f4b",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    },
+    {
+      "id": "matching-tick",
+      "kind": "seed",
+      "seed": "0x5449434b",
+      "openActionCount": 32,
+      "enforceCoverage": true
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-import { type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import {
   getLocaleTag,
   resolveUiLocale,
@@ -6,6 +6,11 @@ import {
 } from "@hyperbet/ui/i18n";
 
 import { SOLANA_CLUSTER } from "../lib/solanaConfig";
+import {
+  HYPERBET_MARKET_REFRESH_EVENT,
+  parseHyperbetConfirmedSettlementRefresh,
+  type HyperbetConfirmedSettlementRefresh,
+} from "../lib/marketRefresh";
 import { buildSolanaExplorerTransactionUrl } from "../lib/solanaTransactionFeedback";
 import {
   type SolanaBetOrderState,
@@ -15,13 +20,19 @@ import {
 } from "../lib/solanaSettlementHistory";
 
 export interface SolanaSettlementHistoryProps {
+  programId: string;
   walletAddress: string | null;
   marketPda?: string | null;
   agent1Name: string;
   agent2Name: string;
   onRequestSettlement?: (request: SolanaSettlementRequest) => void;
-  onRequestOrderManagement?: (request: SolanaHistoricalOrderRequest) => void;
+  onRequestBalanceCleanup?: (request: SolanaBalanceCleanupRequest) => void;
+  onRequestOrderManagement?: (
+    request: SolanaHistoricalOrderRequest,
+    trigger: HTMLButtonElement,
+  ) => void;
   settlingBetId?: string | null;
+  recoveringBalanceMarketPda?: string | null;
   preparingOrderBetId?: string | null;
   transactionsBlocked?: boolean;
   compact?: boolean;
@@ -36,6 +47,11 @@ export type SolanaSettlementRequest = Pick<
 export type SolanaHistoricalOrderRequest = Pick<
   SolanaSettlementHistoryEntry,
   "betId" | "marketPda" | "duelKey" | "duelId" | "orderId" | "orderState"
+>;
+
+export type SolanaBalanceCleanupRequest = Pick<
+  SolanaSettlementHistoryEntry,
+  "betId" | "marketPda" | "duelKey" | "duelId"
 >;
 
 function getCopy(locale: UiLocale) {
@@ -61,15 +77,22 @@ function getCopy(locale: UiLocale) {
     reclaim: "Still resting",
     placedTx: "Order tx",
     claimTx: "Claim tx",
+    cleanupTx: "Cleanup tx",
+    supportRef: "Support ref",
     claimWinnings: "Claim winnings",
     claimRefund: "Claim refund",
+    clearPosition: "Clear position",
     settlementSubmitting: "Preparing claim…",
+    cleanupSubmitting: "Preparing cleanup…",
     manageOrder: "Manage open order",
     reclaimOrder: "Reclaim resting order",
     recoverOrderRent: "Recover order rent",
+    recoverBalanceRent: "Recover account rent",
+    recoveringBalanceRent: "Checking account rent…",
     preparingOrder: "Checking order…",
     yes: "YES",
     no: "NO",
+    duel: "Duel",
     checking: "Checking settlement",
     orderStates: {
       PENDING_INDEX: "Confirming order",
@@ -82,7 +105,7 @@ function getCopy(locale: UiLocale) {
     } satisfies Record<SolanaBetOrderState, string>,
     settlementStates: {
       NOT_READY: "Not settled",
-      AWAITING_RESULT: "Awaiting result",
+      AWAITING_RESULT: "Settlement pending",
       PAYOUT_CLAIMABLE: "Winnings ready to claim",
       REFUND_CLAIMABLE: "Refund ready to claim",
       PAID: "Winnings paid",
@@ -114,15 +137,22 @@ function getCopy(locale: UiLocale) {
       reclaim: "仍在挂单",
       placedTx: "订单交易",
       claimTx: "领取交易",
+      cleanupTx: "清理交易",
+      supportRef: "支持编号",
       claimWinnings: "领取奖金",
       claimRefund: "领取退款",
+      clearPosition: "清理仓位",
       settlementSubmitting: "正在准备领取…",
+      cleanupSubmitting: "正在准备清理…",
       manageOrder: "管理挂单",
       reclaimOrder: "收回挂单",
       recoverOrderRent: "取回订单租金",
+      recoverBalanceRent: "取回账户租金",
+      recoveringBalanceRent: "正在核对账户租金…",
       preparingOrder: "正在核对订单…",
       yes: "是",
       no: "否",
+      duel: "对局",
       checking: "正在核对结算",
       orderStates: {
         PENDING_INDEX: "正在确认订单",
@@ -135,7 +165,7 @@ function getCopy(locale: UiLocale) {
       },
       settlementStates: {
         NOT_READY: "尚未结算",
-        AWAITING_RESULT: "等待结果",
+        AWAITING_RESULT: "结算处理中",
         PAYOUT_CLAIMABLE: "奖金可领取",
         REFUND_CLAIMABLE: "退款可领取",
         PAID: "奖金已领取",
@@ -169,12 +199,30 @@ function restingCollateral(entry: SolanaSettlementHistoryEntry): string {
   return ((BigInt(entry.restingAmountUnits) * component) / 1_000n).toString();
 }
 
+function compactDuelIdentity(
+  duelId: string | null,
+  label: string,
+): string | null {
+  const normalized = duelId?.trim();
+  if (!normalized) return null;
+  if (normalized.length <= 18) return `${label} ${normalized}`;
+  const visibleId = normalized.startsWith("streaming-")
+    ? normalized.slice("streaming-".length)
+    : normalized;
+  const visibleLabel = normalized.startsWith("streaming-") ? "" : `${label} `;
+  return `${visibleLabel}${visibleId.slice(0, 6)}…${visibleId.slice(-4)}`;
+}
+
 function statusTone(entry: SolanaSettlementHistoryEntry): CSSProperties {
-  if (["PAID", "REFUNDED"].includes(entry.settlementState)) {
+  if (
+    ["PAID", "REFUNDED"].includes(entry.settlementState) ||
+    entry.terminalKind === "LOSER_CLEANUP"
+  ) {
     return { color: "#a7f3d0", borderColor: "rgba(52,211,153,0.3)" };
   }
   if (
-    ["PAYOUT_CLAIMABLE", "REFUND_CLAIMABLE"].includes(entry.settlementState)
+    ["PAYOUT_CLAIMABLE", "REFUND_CLAIMABLE"].includes(entry.settlementState) ||
+    (entry.settlementState === "LOST" && entry.terminalKind === null)
   ) {
     return { color: "#fde68a", borderColor: "rgba(251,191,36,0.34)" };
   }
@@ -219,7 +267,7 @@ function metricRows(
   } else if (entry.settlementState === "REFUND_CLAIMABLE") {
     rows.push({
       label: copy.claimable,
-      value: `${formatAtomic(entry.executedCostLamports)} SOL`,
+      value: `${formatAtomic(entry.rewardEligibleLamports)} SOL`,
     });
   }
   if (entry.orderState === "RECLAIM_REQUIRED") {
@@ -232,13 +280,16 @@ function metricRows(
 }
 
 export function SolanaSettlementHistory({
+  programId,
   walletAddress,
   marketPda,
   agent1Name,
   agent2Name,
   onRequestSettlement,
+  onRequestBalanceCleanup,
   onRequestOrderManagement,
   settlingBetId = null,
+  recoveringBalanceMarketPda = null,
   preparingOrderBetId = null,
   transactionsBlocked = false,
   compact = false,
@@ -248,11 +299,116 @@ export function SolanaSettlementHistory({
   const copy = getCopy(resolvedLocale);
   const { history, loading, loadingMore, hasMore, error, refresh, loadMore } =
     useSolanaSettlementHistory({
+      cluster: SOLANA_CLUSTER,
+      programId,
       wallet: walletAddress,
       marketPda,
       limit: compact ? 2 : 4,
     });
-  const ledgerCurrent = history?.ledger.current === true;
+  const [pendingSettlement, setPendingSettlement] =
+    useState<HyperbetConfirmedSettlementRefresh | null>(null);
+
+  useEffect(() => {
+    setPendingSettlement(null);
+  }, [programId, walletAddress]);
+
+  useEffect(() => {
+    if (!walletAddress) return undefined;
+    const handleMarketRefresh = (event: Event) => {
+      const confirmedSettlement =
+        parseHyperbetConfirmedSettlementRefresh(event);
+      if (confirmedSettlement?.wallet === walletAddress) {
+        setPendingSettlement(confirmedSettlement);
+      }
+      refresh();
+    };
+    window.addEventListener(HYPERBET_MARKET_REFRESH_EVENT, handleMarketRefresh);
+    return () =>
+      window.removeEventListener(
+        HYPERBET_MARKET_REFRESH_EVENT,
+        handleMarketRefresh,
+      );
+  }, [refresh, walletAddress]);
+
+  useEffect(() => {
+    if (!history || !pendingSettlement) return;
+    const matchingEntries = history.entries.filter(
+      (entry) => entry.marketPda === pendingSettlement.marketPda,
+    );
+    const hasConfirmedEntry = matchingEntries.some((entry) => {
+      if (entry.claimSignature !== pendingSettlement.signature) return false;
+      return pendingSettlement.kind === "CLEANUP"
+        ? entry.terminalKind === "LOSER_CLEANUP"
+        : entry.settlementState === "PAID" ||
+            entry.settlementState === "REFUNDED";
+    });
+    const hasClaimableEntry = matchingEntries.some(
+      (entry) =>
+        entry.settlementState === "PAYOUT_CLAIMABLE" ||
+        entry.settlementState === "REFUND_CLAIMABLE" ||
+        (pendingSettlement.kind === "CLEANUP" &&
+          entry.settlementState === "LOST" &&
+          entry.terminalKind === null),
+    );
+    if (hasConfirmedEntry && !hasClaimableEntry) {
+      setPendingSettlement(null);
+    }
+  }, [history, pendingSettlement]);
+
+  const hasPendingVisibleSettlement = Boolean(
+    pendingSettlement &&
+    pendingSettlement.wallet === walletAddress &&
+    history?.entries.some(
+      (entry) =>
+        entry.marketPda === pendingSettlement.marketPda &&
+        (entry.settlementState === "PAYOUT_CLAIMABLE" ||
+          entry.settlementState === "REFUND_CLAIMABLE" ||
+          (pendingSettlement.kind === "CLEANUP" &&
+            entry.settlementState === "LOST" &&
+            entry.terminalKind === null)),
+    ),
+  );
+  const ledgerCurrent =
+    history?.ledger.current === true && !hasPendingVisibleSettlement;
+  const balanceCleanupEntryByMarket = new Map<string, string>();
+  const settlementEntryByMarket = new Map<string, string>();
+  if (history && ledgerCurrent) {
+    for (const entry of history.entries) {
+      if (
+        entry.duelKey !== null &&
+        (entry.settlementState === "PAYOUT_CLAIMABLE" ||
+          entry.settlementState === "REFUND_CLAIMABLE") &&
+        !settlementEntryByMarket.has(entry.marketPda)
+      ) {
+        settlementEntryByMarket.set(entry.marketPda, entry.betId);
+      }
+    }
+    for (const entry of history.entries) {
+      if (
+        entry.duelKey !== null &&
+        entry.settlementState === "LOST" &&
+        entry.terminalKind === null &&
+        entry.claimSignature === null &&
+        !settlementEntryByMarket.has(entry.marketPda)
+      ) {
+        settlementEntryByMarket.set(entry.marketPda, entry.betId);
+      }
+    }
+    for (const entry of history.entries) {
+      if (
+        entry.duelKey !== null &&
+        entry.orderState === "RELEASED" &&
+        entry.settlementState === "NO_ENTITLEMENT" &&
+        typeof entry.marketStatus === "string" &&
+        ["locked", "resolved", "cancelled"].includes(
+          entry.marketStatus.trim().toLowerCase(),
+        ) &&
+        !balanceCleanupEntryByMarket.has(entry.marketPda)
+      ) {
+        balanceCleanupEntryByMarket.set(entry.marketPda, entry.betId);
+      }
+    }
+  }
 
   return (
     <section
@@ -309,15 +465,18 @@ export function SolanaSettlementHistory({
         {walletAddress ? (
           <button
             type="button"
+            data-testid="solana-settlement-refresh"
             onClick={refresh}
             aria-label={copy.refresh}
             style={{
+              minWidth: 44,
+              minHeight: 44,
               border: 0,
               background: "transparent",
               color: "rgba(226,232,240,0.62)",
               cursor: "pointer",
               fontSize: 10,
-              padding: 2,
+              padding: "7px 8px",
             }}
           >
             {copy.refresh}
@@ -371,12 +530,16 @@ export function SolanaSettlementHistory({
               SOLANA_CLUSTER,
             )
           : null;
-        const settlementLabel = copy.settlementStates[entry.settlementState];
+        const settlementLabel =
+          entry.terminalKind === "LOSER_CLEANUP"
+            ? resolvedLocale === "zh"
+              ? "仓位已清理 · 无奖金"
+              : "Position closed · no payout"
+            : copy.settlementStates[entry.settlementState];
         const requestableSettlement =
           ledgerCurrent &&
           entry.duelKey !== null &&
-          (entry.settlementState === "PAYOUT_CLAIMABLE" ||
-            entry.settlementState === "REFUND_CLAIMABLE")
+          settlementEntryByMarket.get(entry.marketPda) === entry.betId
             ? ({
                 betId: entry.betId,
                 marketPda: entry.marketPda,
@@ -390,7 +553,8 @@ export function SolanaSettlementHistory({
           entry.duelKey !== null &&
           ["OPEN", "PARTIALLY_FILLED", "FILLED", "RECLAIM_REQUIRED"].includes(
             entry.orderState,
-          )
+          ) &&
+          (entry.orderState !== "FILLED" || entry.terminalKind !== null)
             ? ({
                 betId: entry.betId,
                 marketPda: entry.marketPda,
@@ -400,10 +564,21 @@ export function SolanaSettlementHistory({
                 orderState: entry.orderState,
               } satisfies SolanaHistoricalOrderRequest)
             : null;
+        const requestableBalanceCleanup =
+          balanceCleanupEntryByMarket.get(entry.marketPda) === entry.betId
+            ? ({
+                betId: entry.betId,
+                marketPda: entry.marketPda,
+                duelKey: entry.duelKey!,
+                duelId: entry.duelId,
+              } satisfies SolanaBalanceCleanupRequest)
+            : null;
         const settlementButtonLabel =
-          entry.settlementState === "REFUND_CLAIMABLE"
-            ? copy.claimRefund
-            : copy.claimWinnings;
+          entry.settlementState === "LOST"
+            ? copy.clearPosition
+            : entry.settlementState === "REFUND_CLAIMABLE"
+              ? copy.claimRefund
+              : copy.claimWinnings;
         const orderButtonLabel =
           entry.orderState === "RECLAIM_REQUIRED"
             ? copy.reclaimOrder
@@ -422,7 +597,8 @@ export function SolanaSettlementHistory({
             ? agent1Name
             : agent2Name
           : null;
-        const entryIdentity = selectedAgent ?? entry.duelId;
+        const entryIdentity =
+          selectedAgent ?? compactDuelIdentity(entry.duelId, copy.duel);
         return (
           <article
             key={entry.betId}
@@ -446,7 +622,16 @@ export function SolanaSettlementHistory({
             >
               <div style={{ display: "grid", gap: 2, minWidth: 0 }}>
                 <span
-                  style={{ color: "#f8fafc", fontSize: 11, fontWeight: 750 }}
+                  title={entry.duelId ?? undefined}
+                  data-testid={`solana-settlement-identity-${entry.betId}`}
+                  style={{
+                    color: "#f8fafc",
+                    fontSize: 11,
+                    fontWeight: 750,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
                 >
                   {entry.side === 1 ? copy.yes : copy.no}
                   {entryIdentity ? ` · ${entryIdentity}` : null}
@@ -460,6 +645,19 @@ export function SolanaSettlementHistory({
                     minute: "2-digit",
                   }).format(entry.recordedAt)}
                 </span>
+                {entry.correlationId ? (
+                  <span
+                    title={entry.correlationId}
+                    data-testid={`solana-settlement-correlation-${entry.betId}`}
+                    style={{
+                      color: "rgba(148,163,184,0.62)",
+                      fontSize: 8,
+                      fontFamily: "var(--hm-font-mono)",
+                    }}
+                  >
+                    {copy.supportRef} · {entry.correlationId.slice(0, 12)}
+                  </span>
+                ) : null}
               </div>
               <span
                 style={{
@@ -513,7 +711,7 @@ export function SolanaSettlementHistory({
                 disabled={settlingBetId !== null || transactionsBlocked}
                 onClick={() => onRequestSettlement(requestableSettlement)}
                 style={{
-                  minHeight: 34,
+                  minHeight: 44,
                   padding: "7px 10px",
                   borderRadius: 8,
                   border: "1px solid rgba(52,211,153,0.34)",
@@ -528,8 +726,45 @@ export function SolanaSettlementHistory({
                 }}
               >
                 {settlingBetId === entry.betId
-                  ? copy.settlementSubmitting
+                  ? entry.settlementState === "LOST"
+                    ? copy.cleanupSubmitting
+                    : copy.settlementSubmitting
                   : settlementButtonLabel}
+              </button>
+            ) : null}
+
+            {requestableBalanceCleanup && onRequestBalanceCleanup ? (
+              <button
+                type="button"
+                data-testid={`solana-balance-rent-action-${entry.betId}`}
+                disabled={
+                  recoveringBalanceMarketPda !== null ||
+                  settlingBetId !== null ||
+                  transactionsBlocked
+                }
+                onClick={() =>
+                  onRequestBalanceCleanup(requestableBalanceCleanup)
+                }
+                style={{
+                  minHeight: 44,
+                  padding: "7px 10px",
+                  borderRadius: 8,
+                  border: "1px solid rgba(52,211,153,0.34)",
+                  background: "rgba(16,92,53,0.18)",
+                  color: "#d1fae5",
+                  cursor:
+                    recoveringBalanceMarketPda === null &&
+                    settlingBetId === null &&
+                    !transactionsBlocked
+                      ? "pointer"
+                      : "wait",
+                  fontSize: 10,
+                  fontWeight: 800,
+                }}
+              >
+                {recoveringBalanceMarketPda === entry.marketPda
+                  ? copy.recoveringBalanceRent
+                  : copy.recoverBalanceRent}
               </button>
             ) : null}
 
@@ -542,9 +777,14 @@ export function SolanaSettlementHistory({
                   settlingBetId !== null ||
                   transactionsBlocked
                 }
-                onClick={() => onRequestOrderManagement(requestableOrder)}
+                onClick={(event) =>
+                  onRequestOrderManagement(
+                    requestableOrder,
+                    event.currentTarget,
+                  )
+                }
                 style={{
-                  minHeight: 34,
+                  minHeight: 44,
                   padding: "7px 10px",
                   borderRadius: 8,
                   border: "1px solid rgba(96,165,250,0.34)",
@@ -585,7 +825,10 @@ export function SolanaSettlementHistory({
                     rel="noreferrer"
                     style={linkStyle}
                   >
-                    {copy.claimTx} ↗
+                    {entry.terminalKind === "LOSER_CLEANUP"
+                      ? copy.cleanupTx
+                      : copy.claimTx}{" "}
+                    ↗
                   </a>
                 ) : null}
               </div>
@@ -601,7 +844,7 @@ export function SolanaSettlementHistory({
           disabled={loadingMore}
           onClick={loadMore}
           style={{
-            minHeight: 34,
+            minHeight: 44,
             padding: "7px 10px",
             borderRadius: 8,
             border: "1px solid rgba(148,163,184,0.24)",

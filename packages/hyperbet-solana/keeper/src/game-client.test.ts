@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { afterEach, describe, expect, test } from "bun:test";
 
 import {
@@ -5,6 +7,9 @@ import {
   normalizeBettingFeedCycle,
   type BettingFeedCheckpoint,
   type BettingFeedCheckpointStore,
+  type BettingFeedStateUpdate,
+  type RendererHealthDerivation,
+  type StreamingAgent,
 } from "./game-client";
 import { buildTestCompetitiveSnapshot } from "./testCompetitiveSnapshot";
 
@@ -14,7 +19,7 @@ type FetchCycle = {
   emittedAt?: number;
   phaseVersion?: number;
   cycleId?: string;
-  phase?: string;
+  phase?: string | null;
   duelId?: string | null;
   duelKeyHex?: string | null;
   competitiveSnapshotVersion?: number | null;
@@ -28,14 +33,14 @@ type FetchCycle = {
   outcome?: "win" | "draw" | "cancelled" | null;
   cancellationReason?: string | null;
   winReason?:
-    | "kill"
-    | "forfeit"
-    | "hp_advantage"
-    | "damage_advantage"
-    | "draw"
-    | null;
+    "kill" | "forfeit" | "hp_advantage" | "damage_advantage" | "draw" | null;
   seed?: string | null;
   replayHash?: string | null;
+  rendererHealth?: {
+    ready: boolean;
+    degradedReason: string | null;
+    updatedAt: number;
+  };
 };
 
 const originalFetch = globalThis.fetch;
@@ -110,7 +115,7 @@ function feedPresentationFields(cycle: FetchCycle) {
   return {
     arenaPositions: active ? { agent1: [-1, 0, 0], agent2: [1, 0, 0] } : null,
     winnerName,
-    rendererHealth: {
+    rendererHealth: cycle.rendererHealth ?? {
       ready: true,
       degradedReason: null,
       updatedAt: cycle.emittedAt ?? 1_700_000_000_000,
@@ -118,7 +123,7 @@ function feedPresentationFields(cycle: FetchCycle) {
   };
 }
 
-function feedAgent(side: "agent-a" | "agent-b") {
+function feedAgent(side: "agent-a" | "agent-b"): StreamingAgent {
   const isAlpha = side === "agent-a";
   return {
     id: side,
@@ -134,6 +139,18 @@ function feedAgent(side: "agent-a" | "agent-b") {
     rank: isAlpha ? 1 : 2,
     headToHeadWins: isAlpha ? 3 : 2,
     headToHeadLosses: isAlpha ? 2 : 3,
+    strategySummary: {
+      schemaVersion: 1 as const,
+      approach: "balanced" as const,
+      tacticalMacro: "pressure" as const,
+      attackStyle: "aggressive" as const,
+      prayer: "superhuman_strength" as const,
+      preferredCombatRole: null,
+      foodThreshold: 40,
+      switchDefensiveAt: 30,
+      source: "deterministic" as const,
+      policyVersion: "keeper-test-policy-v1",
+    },
   };
 }
 
@@ -169,8 +186,8 @@ function mockBetSyncSequence(cycles: FetchCycle[], schemaVersion = 3) {
         winReason: cycle.winReason,
         seed: cycle.seed,
         replayHash: cycle.replayHash,
-        agent1: feedAgent("agent-a"),
-        agent2: feedAgent("agent-b"),
+        agent1: typeof cycle.duelId === "string" ? feedAgent("agent-a") : null,
+        agent2: typeof cycle.duelId === "string" ? feedAgent("agent-b") : null,
         ...feedPresentationFields(cycle),
       }),
     } as Response;
@@ -211,8 +228,13 @@ class MemoryCheckpointStore implements BettingFeedCheckpointStore {
       duelId: this.checkpoint?.duelId ?? null,
       competitiveSnapshotDigest:
         this.checkpoint?.competitiveSnapshotDigest ?? null,
+      betOpenTime: this.checkpoint?.betOpenTime ?? null,
+      betCloseTime: this.checkpoint?.betCloseTime ?? null,
+      fightStartTime: this.checkpoint?.fightStartTime ?? null,
+      duelEndTime: this.checkpoint?.duelEndTime ?? null,
       phase: this.checkpoint?.phase ?? null,
       terminal: this.checkpoint?.terminal ?? true,
+      terminalEventKey: this.checkpoint?.terminalEventKey ?? null,
       degradedReason: message,
       updatedAt: now,
     };
@@ -227,6 +249,12 @@ function jsonResponse(payload: unknown): Response {
 }
 
 function bettingPayload(cycle: FetchCycle): Record<string, unknown> {
+  const agent1 = feedAgent("agent-a");
+  const agent2 = feedAgent("agent-b");
+  if (cycle.competitiveSnapshotVersion === 1) {
+    agent1.strategySummary = null;
+    agent2.strategySummary = null;
+  }
   return {
     schemaVersion: 3,
     sourceEpoch: cycle.sourceEpoch ?? 10,
@@ -249,10 +277,36 @@ function bettingPayload(cycle: FetchCycle): Record<string, unknown> {
     winReason: cycle.winReason,
     seed: cycle.seed,
     replayHash: cycle.replayHash,
-    agent1: feedAgent("agent-a"),
-    agent2: feedAgent("agent-b"),
+    agent1,
+    agent2,
     ...feedPresentationFields(cycle),
   };
+}
+
+function canonicalJson(value: unknown): string {
+  const normalize = (candidate: unknown): unknown => {
+    if (Array.isArray(candidate)) return candidate.map(normalize);
+    if (!candidate || typeof candidate !== "object") return candidate;
+    return Object.fromEntries(
+      Object.entries(candidate as Record<string, unknown>)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, nested]) => [key, normalize(nested)]),
+    );
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function mutateCompetitiveSnapshot(
+  cycle: FetchCycle,
+  mutate: (snapshot: Record<string, unknown>) => void,
+): FetchCycle {
+  const changed = structuredClone(cycle);
+  const snapshot = changed.competitiveSnapshot as Record<string, unknown>;
+  mutate(snapshot);
+  changed.competitiveSnapshotDigest = createHash("sha256")
+    .update(canonicalJson(snapshot))
+    .digest("hex");
+  return changed;
 }
 
 describe("GameClient lifecycle reconciliation", () => {
@@ -265,7 +319,7 @@ describe("GameClient lifecycle reconciliation", () => {
     }
   });
 
-  test.each([1, 2] as const)(
+  test.each([1, 2, 3] as const)(
     "accepts a schema-v%i snapshot only for an explicit terminal cancellation",
     (snapshotVersion) => {
       const identity = {
@@ -310,6 +364,390 @@ describe("GameClient lifecycle reconciliation", () => {
     },
   );
 
+  test("binds the schema-v4 sporting clock and timeout policy even when an attacker recomputes the digest", () => {
+    const cycle = makeCycle({ phase: "ANNOUNCEMENT" });
+    const accepted = normalizeBettingFeedCycle(bettingPayload(cycle));
+    expect(accepted?.competitiveSnapshot).toMatchObject({
+      snapshotVersion: 4,
+      timing: {
+        contractVersion: 2,
+        timeoutPolicy: "hp_percentage_then_damage_then_draw_v1",
+        countdownDurationMs: 10,
+        fightingDurationMs: 30,
+        endWarningDurationMs: 5,
+        maxFightDurationMs: 35,
+        fightStartTime: 1_070,
+        fightDeadline: 1_105,
+      },
+    });
+
+    const changedPolicy = mutateCompetitiveSnapshot(cycle, (snapshot) => {
+      (snapshot.timing as Record<string, unknown>).timeoutPolicy =
+        "untrusted-policy";
+    });
+    expect(normalizeBettingFeedCycle(bettingPayload(changedPolicy))).toBeNull();
+
+    const changedDeadline = mutateCompetitiveSnapshot(cycle, (snapshot) => {
+      (snapshot.timing as Record<string, unknown>).fightDeadline = 1_106;
+    });
+    expect(
+      normalizeBettingFeedCycle(bettingPayload(changedDeadline)),
+    ).toBeNull();
+  });
+
+  test("requires a published fight start to match the schema-v4 committed clock", () => {
+    const exact = makeCycle({
+      phase: "COUNTDOWN",
+      emittedAt: 1_065,
+      fightStartTime: 1_070,
+    });
+    expect(normalizeBettingFeedCycle(bettingPayload(exact))).not.toBeNull();
+    expect(
+      normalizeBettingFeedCycle(
+        bettingPayload({ ...exact, fightStartTime: 1_071 }),
+      ),
+    ).toBeNull();
+  });
+
+  test("retains bounded renderer authority and rejects future or ready-contradictory health", () => {
+    const cycle = makeCycle({
+      phase: "ANNOUNCEMENT",
+      emittedAt: 1_010,
+      rendererHealth: {
+        ready: false,
+        degradedReason: "scene_assets_not_ready",
+        updatedAt: 1_009,
+      },
+    });
+    expect(normalizeBettingFeedCycle(bettingPayload(cycle))).toMatchObject({
+      rendererHealth: {
+        ready: false,
+        degradedReason: "scene_assets_not_ready",
+        updatedAt: 1_009,
+      },
+    });
+    expect(
+      normalizeBettingFeedCycle({
+        ...bettingPayload(cycle),
+        rendererHealth: {
+          ready: false,
+          degradedReason: null,
+          updatedAt: 1_009,
+        },
+      }),
+    ).toMatchObject({ rendererHealth: { ready: false } });
+    expect(
+      normalizeBettingFeedCycle({
+        ...bettingPayload(cycle),
+        rendererHealth: {
+          ready: true,
+          degradedReason: "scene_assets_not_ready",
+          updatedAt: 1_009,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      normalizeBettingFeedCycle({
+        ...bettingPayload(cycle),
+        rendererHealth: {
+          ready: false,
+          degradedReason: "scene_assets_not_ready",
+          updatedAt: 1_011,
+        },
+      }),
+    ).toBeNull();
+  });
+
+  test("retains optional phase derivation without letting observations alter health authority", () => {
+    const cycle = makeCycle({ phase: "ANNOUNCEMENT", emittedAt: 1_010 });
+    const base = bettingPayload(cycle);
+    const derivation: RendererHealthDerivation = {
+      schemaVersion: 1,
+      evaluatedAtMs: 1_010,
+      canonicalCycleId: "cycle-a",
+      canonicalPhase: "COUNTDOWN",
+      externalSnapshotPresent: true,
+      externalSnapshotUpdatedAt: 1_009,
+      rendererPresent: true,
+      rendererReady: true,
+      rendererPhase: "ANNOUNCEMENT",
+      rendererDegradedReason: null,
+      rendererUpdatedAt: 1_008,
+      scenePresent: true,
+      sceneReady: true,
+      sceneCycleId: "cycle-a",
+      scenePhase: "ANNOUNCEMENT",
+      captureClientConnected: true,
+      captureFfmpegRunning: true,
+    };
+    const negative = {
+      ready: false,
+      degradedReason: "renderer_phase_mismatch",
+      updatedAt: 1_010,
+      derivation,
+    };
+    expect(
+      normalizeBettingFeedCycle({ ...base, rendererHealth: negative })
+        ?.rendererHealth,
+    ).toEqual(negative);
+    const rawFuture = {
+      ...derivation,
+      rendererUpdatedAt: 5_000,
+      secret: "NOT_PUBLIC",
+    };
+    const parsed = normalizeBettingFeedCycle({
+      ...base,
+      rendererHealth: { ...negative, derivation: rawFuture },
+    });
+    expect(parsed?.rendererHealth.ready).toBe(false);
+    expect(parsed?.rendererHealth.derivation?.rendererUpdatedAt).toBe(5_000);
+    expect(parsed?.rendererHealth.derivation).not.toHaveProperty("secret");
+    // Raw probe observations cannot legalize future or contradictory authority.
+    expect(
+      normalizeBettingFeedCycle({
+        ...base,
+        rendererHealth: { ...negative, updatedAt: 1_011 },
+      }),
+    ).toBeNull();
+    expect(
+      normalizeBettingFeedCycle({
+        ...base,
+        rendererHealth: { ...negative, ready: true },
+      }),
+    ).toBeNull();
+    for (const invalid of [null, [], { schemaVersion: 2 }, "NOT_PUBLIC"]) {
+      const result = normalizeBettingFeedCycle({
+        ...base,
+        rendererHealth: { ...negative, derivation: invalid },
+      });
+      expect(result?.rendererHealth).toEqual({
+        ready: false,
+        degradedReason: "renderer_phase_mismatch",
+        updatedAt: 1_010,
+      });
+    }
+    // Existing exact-key protection is not widened for unrelated health fields.
+    expect(
+      normalizeBettingFeedCycle({
+        ...base,
+        rendererHealth: { ...negative, privateAuthority: true },
+      }),
+    ).toBeNull();
+  });
+
+  test("accepts diagnostic snapshots only when the caller explicitly enables the local-only boundary", () => {
+    const cycle = makeCycle({ phase: "ANNOUNCEMENT" });
+    const diagnosticSnapshot = buildTestCompetitiveSnapshot({
+      cycleId: String(cycle.cycleId),
+      duelId: String(cycle.duelId),
+      duelKey: String(cycle.duelKeyHex),
+      betOpenTime: Number(cycle.betOpenTime),
+      betCloseTime: Number(cycle.betCloseTime),
+      diagnostic: true,
+    });
+    const payload = {
+      ...bettingPayload({ ...cycle, ...diagnosticSnapshot }),
+      agent1: {
+        ...feedAgent("agent-a"),
+        provider: "diagnostic",
+        model: "diagnostic",
+        strategySummary: {
+          ...feedAgent("agent-a").strategySummary,
+          source: "diagnostic" as const,
+          policyVersion: "diagnostic-v1",
+        },
+      },
+      agent2: {
+        ...feedAgent("agent-b"),
+        provider: "diagnostic",
+        model: "diagnostic",
+        strategySummary: {
+          ...feedAgent("agent-b").strategySummary,
+          source: "diagnostic" as const,
+          policyVersion: "diagnostic-v1",
+        },
+      },
+    };
+
+    expect(normalizeBettingFeedCycle(payload)).toBeNull();
+    const accepted = normalizeBettingFeedCycle(payload, {
+      allowDiagnosticSnapshot: true,
+    });
+    expect(accepted).toMatchObject({
+      competitiveSnapshot: { diagnostic: true },
+      phase: "ANNOUNCEMENT",
+    });
+    expect(
+      accepted?.competitiveSnapshot?.contestants.every(
+        (contestant) =>
+          typeof contestant.loadoutFingerprint === "string" &&
+          /^[a-f0-9]{64}$/.test(contestant.loadoutFingerprint),
+      ),
+    ).toBe(true);
+
+    const legacyNullSnapshot = buildTestCompetitiveSnapshot({
+      cycleId: String(cycle.cycleId),
+      duelId: String(cycle.duelId),
+      duelKey: String(cycle.duelKeyHex),
+      betOpenTime: Number(cycle.betOpenTime),
+      betCloseTime: Number(cycle.betCloseTime),
+      diagnostic: true,
+      loadoutFingerprint: null,
+    });
+    expect(
+      normalizeBettingFeedCycle(
+        {
+          ...payload,
+          competitiveSnapshotVersion:
+            legacyNullSnapshot.competitiveSnapshotVersion,
+          competitiveSnapshotDigest:
+            legacyNullSnapshot.competitiveSnapshotDigest,
+          competitiveSnapshot: legacyNullSnapshot.competitiveSnapshot,
+        },
+        { allowDiagnosticSnapshot: true },
+      ),
+    ).toBeNull();
+  });
+
+  test("validates optional producer replay-retention metadata without weakening exact frame keys", () => {
+    const cycle = makeCycle({ seq: 7, phase: "ANNOUNCEMENT" });
+    const payload = bettingPayload(cycle);
+    const replay = {
+      sourceEpoch: payload.sourceEpoch,
+      latestSeq: 7,
+      oldestSeq: 3,
+      bufferedFrames: 5,
+      bufferedBytes: 12_345,
+      lastBroadcastSeq: 6,
+    };
+    expect(normalizeBettingFeedCycle({ ...payload, replay })).not.toBeNull();
+    expect(
+      normalizeBettingFeedCycle({
+        ...payload,
+        replay: { ...replay, sourceEpoch: Number(payload.sourceEpoch) + 1 },
+      }),
+    ).toBeNull();
+    expect(
+      normalizeBettingFeedCycle({
+        ...payload,
+        unexpected: true,
+      } as unknown as BettingFeedStateUpdate),
+    ).toBeNull();
+  });
+
+  test("accepts the immutable fight start published during announcement", () => {
+    const announcement = makeCycle({
+      phase: "ANNOUNCEMENT",
+      emittedAt: 1_010,
+      fightStartTime: 1_070,
+    });
+
+    expect(
+      normalizeBettingFeedCycle(bettingPayload(announcement)),
+    ).toMatchObject({
+      phase: "ANNOUNCEMENT",
+      betCloseTime: 1_060,
+      fightStartTime: 1_070,
+    });
+  });
+
+  test("accepts a pre-fight cancellation before the immutable future fight start", () => {
+    const cancellation = makeCycle({
+      phase: "ANNOUNCEMENT",
+      emittedAt: 1_050,
+      fightStartTime: 1_070,
+      duelEndTime: 1_050,
+      outcome: "cancelled",
+      cancellationReason: "scheduler_shutdown",
+    });
+
+    expect(
+      normalizeBettingFeedCycle(bettingPayload(cancellation)),
+    ).toMatchObject({
+      phase: "ANNOUNCEMENT",
+      fightStartTime: 1_070,
+      duelEndTime: 1_050,
+      outcome: "cancelled",
+      cancellationReason: "scheduler_shutdown",
+    });
+  });
+
+  test("accepts the scheduled future fight start during countdown but not after fighting begins", () => {
+    const countdown = makeCycle({
+      phase: "COUNTDOWN",
+      emittedAt: 1_065,
+      fightStartTime: 1_070,
+    });
+    expect(normalizeBettingFeedCycle(bettingPayload(countdown))).toMatchObject({
+      phase: "COUNTDOWN",
+      fightStartTime: 1_070,
+    });
+    expect(
+      normalizeBettingFeedCycle(
+        bettingPayload({
+          ...countdown,
+          phase: "FIGHTING",
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  test("persists the one-way fight-start transition and rejects a moved start after keeper restart", async () => {
+    const checkpointStore = new MemoryCheckpointStore();
+    mockBetSyncSequence([
+      makeCycle({ seq: 1, phase: "ANNOUNCEMENT", emittedAt: 1_050 }),
+      makeCycle({
+        seq: 2,
+        phase: "COUNTDOWN",
+        emittedAt: 1_065,
+        fightStartTime: 1_070,
+      }),
+    ]);
+    const initialClient = new GameClient(
+      "https://example.test",
+      checkpointStore,
+    );
+
+    await (initialClient as any).poll();
+    expect(checkpointStore.checkpoint).toMatchObject({
+      betOpenTime: 1_000,
+      betCloseTime: 1_060,
+      fightStartTime: null,
+      duelEndTime: null,
+    });
+    await (initialClient as any).poll();
+    expect(checkpointStore.checkpoint).toMatchObject({
+      lastAppliedSeq: 2,
+      fightStartTime: 1_070,
+      degradedReason: null,
+    });
+
+    mockBetSyncSequence([
+      makeCycle({
+        seq: 3,
+        phase: "FIGHTING",
+        emittedAt: 1_071,
+        fightStartTime: 1_071,
+      }),
+    ]);
+    const restartedClient = new GameClient(
+      "https://example.test",
+      checkpointStore,
+    );
+    let callbacks = 0;
+    restartedClient.onStateFrame(() => {
+      callbacks += 1;
+    });
+    await (restartedClient as any).poll();
+
+    expect(callbacks).toBe(0);
+    expect(checkpointStore.checkpoint).toMatchObject({
+      lastAppliedSeq: 2,
+      fightStartTime: 1_070,
+      degradedReason: "betting feed state was not a valid schema-v3 frame",
+    });
+  });
+
   test("accepts released arena positions only for a terminal cancellation", () => {
     const cancelled = makeCycle({
       phase: "ANNOUNCEMENT",
@@ -322,7 +760,7 @@ describe("GameClient lifecycle reconciliation", () => {
     const win = makeCycle({
       phase: "RESOLUTION",
       emittedAt: 1_180,
-      fightStartTime: 1_060,
+      fightStartTime: 1_070,
       duelEndTime: 1_180,
       winnerId: "agent-a",
       outcome: "win",
@@ -333,7 +771,7 @@ describe("GameClient lifecycle reconciliation", () => {
     const draw = makeCycle({
       phase: "RESOLUTION",
       emittedAt: 1_180,
-      fightStartTime: 1_060,
+      fightStartTime: 1_070,
       duelEndTime: 1_180,
       outcome: "draw",
       cancellationReason: "draw",
@@ -421,6 +859,47 @@ describe("GameClient lifecycle reconciliation", () => {
     expect(attempts).toBe(2);
   });
 
+  test("defers first market publication until the same open cycle reports a ready renderer", async () => {
+    mockBetSyncSequence([
+      makeCycle({
+        seq: 1,
+        emittedAt: 1_010,
+        rendererHealth: {
+          ready: false,
+          degradedReason: "scene_assets_not_ready",
+          updatedAt: 1_010,
+        },
+      }),
+      makeCycle({
+        seq: 2,
+        emittedAt: 1_020,
+        rendererHealth: {
+          ready: true,
+          degradedReason: null,
+          updatedAt: 1_020,
+        },
+      }),
+    ]);
+
+    const frames: boolean[] = [];
+    let starts = 0;
+    const client = new GameClient("https://example.test");
+    client.onStateFrame((cycle) => {
+      frames.push(cycle.rendererHealth.ready);
+    });
+    client.onDuelStart(() => {
+      starts += 1;
+    });
+
+    await (client as any).poll();
+    expect({ frames, starts }).toEqual({ frames: [false], starts: 0 });
+    await (client as any).poll();
+    expect({ frames, starts }).toEqual({
+      frames: [false, true],
+      starts: 1,
+    });
+  });
+
   test("reports each new validated state frame without treating duplicate polls as freshness", async () => {
     mockBetSyncSequence([
       makeCycle({ seq: 1, emittedAt: 1_000 }),
@@ -440,6 +919,30 @@ describe("GameClient lifecycle reconciliation", () => {
 
     expect(frames).toEqual([
       { seq: 1, emittedAt: 1_000 },
+      { seq: 2, emittedAt: 2_000 },
+    ]);
+  });
+
+  test("reports every successful continuity-checked poll as a source observation", async () => {
+    mockBetSyncSequence([
+      makeCycle({ seq: 1, emittedAt: 1_000 }),
+      makeCycle({ seq: 2, emittedAt: 2_000 }),
+      makeCycle({ seq: 2, emittedAt: 2_000 }),
+    ]);
+
+    const observations: Array<{ seq: number; emittedAt: number }> = [];
+    const client = new GameClient("https://example.test");
+    client.onSourceObservation((cycle) => {
+      observations.push({ seq: cycle.seq, emittedAt: cycle.emittedAt });
+    });
+
+    await (client as any).poll();
+    await (client as any).poll();
+    await (client as any).poll();
+
+    expect(observations).toEqual([
+      { seq: 1, emittedAt: 1_000 },
+      { seq: 2, emittedAt: 2_000 },
       { seq: 2, emittedAt: 2_000 },
     ]);
   });
@@ -548,6 +1051,43 @@ describe("GameClient lifecycle reconciliation", () => {
     ).toBe("Bearer feed-secret");
   });
 
+  test("loads the replacement feed credential only when a rolling keeper instance starts", async () => {
+    process.env.BET_SYNC_SOURCE_BEARER_TOKEN = "old-secret";
+    const requests = mockBetSyncSequence([
+      makeCycle({ seq: 1 }),
+      makeCycle({ seq: 2 }),
+      makeCycle({ seq: 2 }),
+    ]);
+    const existingClient = new GameClient("https://example.test");
+
+    await (existingClient as any).poll();
+    process.env.BET_SYNC_SOURCE_BEARER_TOKEN = "new-secret";
+    await (existingClient as any).poll();
+    const replacementClient = new GameClient("https://example.test");
+    await (replacementClient as any).poll();
+
+    expect(
+      requests.map(
+        (request) =>
+          (request.init?.headers as Record<string, string>).authorization,
+      ),
+    ).toEqual(["Bearer old-secret", "Bearer old-secret", "Bearer new-secret"]);
+  });
+
+  test("uses the validated constructor credential instead of rereading process state", async () => {
+    process.env.BET_SYNC_SOURCE_BEARER_TOKEN = "unvalidated-secret";
+    const requests = mockBetSyncSequence([makeCycle({ seq: 1 })]);
+    const client = new GameClient("https://example.test", undefined, {
+      bearerToken: " validated-secret ",
+    });
+
+    await (client as any).poll();
+
+    expect(
+      (requests[0]?.init?.headers as Record<string, string>).authorization,
+    ).toBe("Bearer validated-secret");
+  });
+
   test("replays locked and resolved callbacks when the first poll lands mid-resolution", async () => {
     mockBetSyncSequence([
       makeCycle({
@@ -576,6 +1116,282 @@ describe("GameClient lifecycle reconciliation", () => {
     await (client as any).poll();
 
     expect(events).toEqual(["start", "lock", "end"]);
+  });
+
+  test("does not replay an identical completed terminal lifecycle after a keeper restart", async () => {
+    const terminal = makeCycle({
+      seq: 4,
+      phase: "RESOLUTION",
+      duelEndTime: 1_180,
+      winnerId: "agent-a",
+      outcome: "win",
+      winReason: "kill",
+      seed: "777",
+      replayHash: "ab".repeat(32),
+    });
+    const checkpointStore = new MemoryCheckpointStore();
+    mockBetSyncSequence([terminal]);
+
+    const initialEvents: string[] = [];
+    const initialClient = new GameClient(
+      "https://example.test",
+      checkpointStore,
+    );
+    initialClient.onDuelStart(() => {
+      initialEvents.push("start");
+    });
+    initialClient.onBettingLocked(() => {
+      initialEvents.push("lock");
+    });
+    initialClient.onDuelEnd(() => {
+      initialEvents.push("end");
+    });
+    await (initialClient as any).poll();
+
+    expect(initialEvents).toEqual(["start", "lock", "end"]);
+    expect(checkpointStore.checkpoint).toMatchObject({
+      duelId: "duel-1",
+      terminal: true,
+    });
+    expect(checkpointStore.checkpoint?.terminalEventKey).toMatch(
+      /^[0-9a-f]{64}$/,
+    );
+    mockBetSyncSequence([{ ...terminal, seq: 5, emittedAt: 1_181 }]);
+    const replayedEvents: string[] = [];
+    const restartedClient = new GameClient(
+      "https://example.test",
+      checkpointStore,
+    );
+    restartedClient.onDuelStart(() => {
+      replayedEvents.push("start");
+    });
+    restartedClient.onBettingLocked(() => {
+      replayedEvents.push("lock");
+    });
+    restartedClient.onDuelEnd(() => {
+      replayedEvents.push("end");
+    });
+    await (restartedClient as any).poll();
+
+    expect(replayedEvents).toEqual([]);
+    expect(checkpointStore.checkpoint).toMatchObject({
+      lastAppliedSeq: 5,
+      terminal: true,
+      degradedReason: null,
+    });
+  });
+
+  test("does not reopen a completed duel when its terminal frame reappears after idle and restart", async () => {
+    const terminal = makeCycle({
+      seq: 4,
+      phase: "RESOLUTION",
+      duelEndTime: 1_180,
+      winnerId: "agent-a",
+      outcome: "win",
+      winReason: "kill",
+      seed: "777",
+      replayHash: "ab".repeat(32),
+    });
+    const idle = makeCycle({
+      sourceEpoch: 10,
+      seq: 5,
+      emittedAt: 1_181,
+      phaseVersion: 5,
+      cycleId: "idle-cycle",
+      phase: null,
+      duelId: null,
+      duelKeyHex: null,
+      betOpenTime: null,
+      betCloseTime: null,
+      fightStartTime: null,
+      duelEndTime: null,
+      winnerId: null,
+      outcome: null,
+      cancellationReason: null,
+      winReason: null,
+      seed: null,
+      replayHash: null,
+    });
+    const checkpointStore = new MemoryCheckpointStore();
+    mockBetSyncSequence([terminal, idle]);
+
+    const initialEvents: string[] = [];
+    const initialClient = new GameClient(
+      "https://example.test",
+      checkpointStore,
+    );
+    initialClient.onDuelStart(() => {
+      initialEvents.push("start");
+    });
+    initialClient.onBettingLocked(() => {
+      initialEvents.push("lock");
+    });
+    initialClient.onDuelEnd(() => {
+      initialEvents.push("end");
+    });
+    await (initialClient as any).poll();
+    await (initialClient as any).poll();
+
+    expect(initialEvents).toEqual(["start", "lock", "end"]);
+    expect(checkpointStore.checkpoint).toMatchObject({
+      lastAppliedSeq: 5,
+      duelId: "duel-1",
+      phase: "IDLE",
+      terminal: true,
+    });
+    expect(checkpointStore.checkpoint?.terminalEventKey).toMatch(
+      /^[0-9a-f]{64}$/,
+    );
+    const initialTerminalEventKey =
+      checkpointStore.checkpoint?.terminalEventKey;
+
+    const reappearedTerminal = {
+      ...terminal,
+      seq: 6,
+      emittedAt: 1_183,
+      duelEndTime: 1_182,
+    };
+    mockBetSyncSequence([reappearedTerminal]);
+    const replayedEvents: string[] = [];
+    const restartedClient = new GameClient(
+      "https://example.test",
+      checkpointStore,
+    );
+    restartedClient.onDuelStart(() => {
+      replayedEvents.push("start");
+    });
+    restartedClient.onBettingLocked(() => {
+      replayedEvents.push("lock");
+    });
+    restartedClient.onDuelEnd(() => {
+      replayedEvents.push("end");
+    });
+    await (restartedClient as any).poll();
+
+    expect(replayedEvents).toEqual([]);
+    expect(checkpointStore.checkpoint).toMatchObject({
+      lastAppliedSeq: 6,
+      duelId: "duel-1",
+      duelEndTime: 1_180,
+      terminal: true,
+      degradedReason: null,
+    });
+    expect(checkpointStore.checkpoint?.terminalEventKey).toBe(
+      initialTerminalEventKey,
+    );
+
+    mockBetSyncSequence([
+      {
+        ...terminal,
+        seq: 7,
+        emittedAt: 1_184,
+        duelEndTime: 1_183,
+      },
+    ]);
+    await (restartedClient as any).poll();
+
+    expect(replayedEvents).toEqual([]);
+    expect(checkpointStore.checkpoint).toMatchObject({
+      lastAppliedSeq: 7,
+      duelEndTime: 1_180,
+      terminal: true,
+      terminalEventKey: initialTerminalEventKey,
+      degradedReason: null,
+    });
+  });
+
+  test("fails closed when a completed terminal event changes", async () => {
+    const initialTerminal = makeCycle({
+      seq: 4,
+      phase: "RESOLUTION",
+      duelEndTime: 1_180,
+      winnerId: "agent-a",
+      outcome: "win",
+      winReason: "kill",
+      seed: "777",
+      replayHash: "ab".repeat(32),
+    });
+    const checkpointStore = new MemoryCheckpointStore();
+    mockBetSyncSequence([initialTerminal]);
+    await (
+      new GameClient("https://example.test", checkpointStore) as any
+    ).poll();
+
+    mockBetSyncSequence([
+      {
+        ...initialTerminal,
+        seq: 5,
+        emittedAt: 1_181,
+        winnerId: "agent-b",
+      },
+    ]);
+    let callbacks = 0;
+    const restartedClient = new GameClient(
+      "https://example.test",
+      checkpointStore,
+    );
+    restartedClient.onDuelStart(() => {
+      callbacks += 1;
+    });
+    restartedClient.onBettingLocked(() => {
+      callbacks += 1;
+    });
+    restartedClient.onDuelEnd(() => {
+      callbacks += 1;
+    });
+    await (restartedClient as any).poll();
+
+    expect(callbacks).toBe(0);
+    expect(checkpointStore.checkpoint).toMatchObject({
+      lastAppliedSeq: 4,
+      degradedReason: expect.stringContaining(
+        "terminal event changed after completion",
+      ),
+    });
+  });
+
+  test("fails closed when a legacy terminal checkpoint has no event fingerprint", async () => {
+    const terminal = makeCycle({
+      seq: 4,
+      phase: "RESOLUTION",
+      duelEndTime: 1_180,
+      winnerId: "agent-a",
+      outcome: "win",
+      winReason: "kill",
+      seed: "777",
+      replayHash: "ab".repeat(32),
+    });
+    const checkpointStore = new MemoryCheckpointStore({
+      sourceEpoch: 10,
+      lastAppliedSeq: 4,
+      lastEmittedAt: 1_180,
+      duelId: "duel-1",
+      competitiveSnapshotDigest: DEFAULT_COMPETITIVE_SNAPSHOT_DIGEST,
+      phase: "RESOLUTION",
+      terminal: true,
+      terminalEventKey: null,
+      degradedReason: null,
+      updatedAt: 1_180,
+    });
+    mockBetSyncSequence([terminal]);
+
+    let callbacks = 0;
+    const client = new GameClient("https://example.test", checkpointStore);
+    client.onDuelStart(() => {
+      callbacks += 1;
+    });
+    client.onBettingLocked(() => {
+      callbacks += 1;
+    });
+    client.onDuelEnd(() => {
+      callbacks += 1;
+    });
+    await (client as any).poll();
+
+    expect(callbacks).toBe(0);
+    expect(checkpointStore.checkpoint).toMatchObject({
+      degradedReason: expect.stringContaining("missing its event fingerprint"),
+    });
   });
 
   test("waits for an authoritative outcome when resolution precedes its result fields", async () => {
@@ -632,6 +1448,7 @@ describe("GameClient lifecycle reconciliation", () => {
       competitiveSnapshotDigest: DEFAULT_COMPETITIVE_SNAPSHOT_DIGEST,
       phase: "ANNOUNCEMENT",
       terminal: false,
+      terminalEventKey: null,
       degradedReason: null,
       updatedAt: 1_700_000_000_000,
     });
@@ -706,6 +1523,7 @@ describe("GameClient lifecycle reconciliation", () => {
       competitiveSnapshotDigest: DEFAULT_COMPETITIVE_SNAPSHOT_DIGEST,
       phase: "ANNOUNCEMENT",
       terminal: false,
+      terminalEventKey: null,
       degradedReason: null,
       updatedAt: 1_700_000_000_000,
     });
@@ -754,6 +1572,7 @@ describe("GameClient lifecycle reconciliation", () => {
       competitiveSnapshotDigest: "33".repeat(32),
       phase: "FIGHTING",
       terminal: false,
+      terminalEventKey: null,
       degradedReason: null,
       updatedAt: 1_700_000_008_000,
     });
@@ -809,6 +1628,7 @@ describe("GameClient lifecycle reconciliation", () => {
         competitiveSnapshotDigest: DEFAULT_COMPETITIVE_SNAPSHOT_DIGEST,
         phase: "FIGHTING",
         terminal: false,
+        terminalEventKey: null,
         degradedReason: null,
         updatedAt: 1_700_000_005_000,
       });
@@ -862,6 +1682,7 @@ describe("GameClient lifecycle reconciliation", () => {
         competitiveSnapshotDigest: DEFAULT_COMPETITIVE_SNAPSHOT_DIGEST,
         phase: "FIGHTING",
         terminal: false,
+        terminalEventKey: null,
         degradedReason: null,
         updatedAt: 1_700_000_005_000,
       });

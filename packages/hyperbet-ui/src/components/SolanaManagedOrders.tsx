@@ -8,7 +8,10 @@ export interface SolanaManagedOrdersProps {
   submittingOrderId?: bigint | null;
   disabled?: boolean;
   locale?: UiLocale;
-  onRequestAction: (order: SolanaManagedOrderPlan) => void;
+  onRequestAction: (
+    order: SolanaManagedOrderPlan,
+    trigger: HTMLButtonElement,
+  ) => void;
 }
 
 function getCopy(locale: UiLocale) {
@@ -225,10 +228,10 @@ export function SolanaManagedOrders({
                 type="button"
                 data-testid={`solana-managed-order-action-${order.orderId.toString()}`}
                 disabled={disabled || submittingOrderId !== null}
-                onClick={() => onRequestAction(order)}
+                onClick={(event) => onRequestAction(order, event.currentTarget)}
                 aria-label={`${actionLabel} #${order.orderId.toString()}`}
                 style={{
-                  minHeight: 36,
+                  minHeight: 44,
                   padding: "8px 11px",
                   borderRadius: "var(--hm-radius)",
                   border: "1px solid rgba(96,165,250,0.38)",

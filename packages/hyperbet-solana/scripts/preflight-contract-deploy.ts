@@ -16,6 +16,10 @@ import {
 } from "./stage-a-identity";
 import { describeRpcEndpoint } from "./solana-deployment-evidence";
 import { fetchSolanaProgramDeploymentIdentity } from "./solana-deployment-identity";
+import {
+  deriveFightOracleConfigPda,
+  evaluateFightOracleAccountSchema,
+} from "./solana-account-schema";
 
 type Target = "testnet" | "mainnet";
 
@@ -223,6 +227,35 @@ async function main(): Promise<void> {
         failures,
         warnings,
       );
+    }
+
+    if (program.binaryName === "fight_oracle" && deploymentMode === "upgrade") {
+      try {
+        const oracleConfigAddress = deriveFightOracleConfigPda(programId);
+        const oracleConfigAccount = await connection.getAccountInfo(
+          oracleConfigAddress,
+          "finalized",
+        );
+        const schema = evaluateFightOracleAccountSchema({
+          programId,
+          oracleConfigAccount,
+        });
+        appendStatus(
+          true,
+          schema.status === "current"
+            ? `fight_oracle initialized account schema v${schema.schemaVersion} is upgrade-compatible`
+            : "fight_oracle is deployed but uninitialized; no legacy duel state can exist",
+          failures,
+          warnings,
+        );
+      } catch (error) {
+        appendStatus(
+          false,
+          `fight_oracle account schema rejected: ${error instanceof Error ? error.message : String(error)}`,
+          failures,
+          warnings,
+        );
+      }
     }
 
     const keypairPubkey = fs.existsSync(keypairPath)

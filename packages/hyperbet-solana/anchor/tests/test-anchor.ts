@@ -451,7 +451,7 @@ async function sendVersionedTransactionWithPolling(
 
 export function createPollingProvider(
   connection: anchor.web3.Connection,
-  wallet: anchor.Wallet,
+  wallet: ConstructorParameters<typeof anchor.AnchorProvider>[1],
   options?: Partial<anchor.AnchorProvider["opts"]>,
 ): anchor.AnchorProvider {
   const provider = new anchor.AnchorProvider(connection, wallet, {

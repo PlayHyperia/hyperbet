@@ -15,9 +15,12 @@ WS_PORT="${ANCHOR_TEST_WS_PORT:-8900}"
 FAUCET_PORT="${ANCHOR_TEST_FAUCET_PORT:-9900}"
 MAX_ORACLE_STALENESS_SECONDS="${HYPERIA_MAX_ORACLE_STALENESS_SECONDS:-5}"
 VALIDATOR_PID=""
-TEST_TARGETS=("$@")
+TEST_DESCRIPTORS=("$@")
 MOCHA_TIMEOUT_MS="${ANCHOR_TEST_MOCHA_TIMEOUT_MS:-1000000}"
 MOCHA_GREP="${ANCHOR_TEST_MOCHA_GREP:-}"
+MOCHA_BAIL="${ANCHOR_TEST_MOCHA_BAIL:-1}"
+NODE_BIN="${ANCHOR_TEST_NODE_BIN:-node}"
+MATRIX_TMP_DIR=""
 
 resolve_wallet_path() {
   local candidates=()
@@ -155,6 +158,9 @@ stop_validator() {
 
 cleanup() {
   stop_validator
+  if [[ -n "$MATRIX_TMP_DIR" && -d "$MATRIX_TMP_DIR" ]]; then
+    rm -rf "$MATRIX_TMP_DIR"
+  fi
 }
 
 trap cleanup EXIT
@@ -182,12 +188,14 @@ for required in solana-test-validator curl jq lsof rg; do
   fi
 done
 
-TS_MOCHA_BIN="$ROOT_DIR/node_modules/.bin/ts-mocha"
-if [[ ! -x "$TS_MOCHA_BIN" ]]; then
-  TS_MOCHA_BIN="$ROOT_DIR/../../../node_modules/.bin/ts-mocha"
+TS_MOCHA_ENTRY="$ROOT_DIR/node_modules/ts-mocha/bin/ts-mocha"
+MOCHA_PACKAGE="$ROOT_DIR/node_modules/mocha/package.json"
+if [[ ! -f "$TS_MOCHA_ENTRY" || ! -f "$MOCHA_PACKAGE" ]]; then
+  TS_MOCHA_ENTRY="$ROOT_DIR/../../../node_modules/ts-mocha/bin/ts-mocha"
+  MOCHA_PACKAGE="$ROOT_DIR/../../../node_modules/mocha/package.json"
 fi
-if [[ -x "$TS_MOCHA_BIN" ]]; then
-  TS_MOCHA_COMMAND=("$TS_MOCHA_BIN")
+if [[ -f "$TS_MOCHA_ENTRY" && -f "$MOCHA_PACKAGE" ]]; then
+  TS_MOCHA_COMMAND=("$NODE_BIN" "$TS_MOCHA_ENTRY")
 elif command -v bunx >/dev/null 2>&1; then
   WORKSPACE_NODE_MODULES="$ROOT_DIR/../../../node_modules"
   if [[ -d "$WORKSPACE_NODE_MODULES" ]]; then
@@ -204,11 +212,20 @@ if [[ ! -f "$ROOT_DIR/target/deploy/fight_oracle.so" || ! -f "$ROOT_DIR/target/d
   exit 1
 fi
 
-if [[ ${#TEST_TARGETS[@]} -eq 0 ]]; then
-  TEST_TARGETS=(
+if [[ "$MOCHA_BAIL" != "0" && "$MOCHA_BAIL" != "1" ]]; then
+  printf 'ANCHOR_TEST_MOCHA_BAIL must be 0 or 1, received: %s\n' "$MOCHA_BAIL" >&2
+  exit 1
+fi
+
+if [[ ${#TEST_DESCRIPTORS[@]} -eq 0 ]]; then
+  TEST_DESCRIPTORS=(
     tests/hyperbet.ts
-    tests/duel_market.anchor.ts
+    tests/duel_market.anchor.ts::each
+    tests/duel_market_generalized.anchor.ts
+    tests/duel_market_continuation.anchor.ts
+    tests/duel_market_generated_continuation.anchor.ts
     tests/duel_market_security.ts
+    tests/signed-bet-verification.anchor.ts
     tests/oracle-finality.anchor.ts
     tests/oracle_invariants.ts
   )
@@ -216,13 +233,82 @@ fi
 
 WALLET_PATH="$(resolve_wallet_path)"
 MINT_AUTHORITY="$(resolve_mint_authority "$WALLET_PATH")"
-PROGRAM_ORACLE_ID="$(resolve_program_id fight_oracle B5mRCRDJk9BrnH7regMWW5mpTQ8QG1CcCGSnDxMt8hmo)"
-PROGRAM_CLOB_ID="$(resolve_program_id duel_market DYtd7AoyTX2tbmZ8vpC3mxZgqTpyaDei4TFXZukWBJEf)"
+PROGRAM_ORACLE_ID="$(resolve_program_id fight_oracle FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu)"
+PROGRAM_CLOB_ID="$(resolve_program_id duel_market 7fFo9jtxpCZKTuGGrxFekGE7EGGkD3LvcsrPzxBjnApG)"
 
 : >"$TEST_LOG"
 
+TEST_TARGETS=()
+TEST_GREPS=()
+TEST_LABELS=()
+
+escape_mocha_title() {
+  "$NODE_BIN" -e 'const value = process.argv[1]; process.stdout.write(`^${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`);' "$1"
+}
+
+for test_descriptor in "${TEST_DESCRIPTORS[@]}"; do
+  if [[ "$test_descriptor" != *"::each" ]]; then
+    TEST_TARGETS+=("$test_descriptor")
+    TEST_GREPS+=("$MOCHA_GREP")
+    TEST_LABELS+=("$test_descriptor")
+    continue
+  fi
+
+  if [[ -n "$MOCHA_GREP" ]]; then
+    printf 'ANCHOR_TEST_MOCHA_GREP cannot be combined with an ::each target: %s\n' "$test_descriptor" >&2
+    exit 1
+  fi
+
+  test_target="${test_descriptor%::each}"
+  if [[ -z "$test_target" || "$test_target" == "$test_descriptor" ]]; then
+    printf 'Invalid isolated test descriptor: %s\n' "$test_descriptor" >&2
+    exit 1
+  fi
+
+  if [[ -z "$MATRIX_TMP_DIR" ]]; then
+    MATRIX_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hyperbet-anchor-matrix.XXXXXX")"
+  fi
+  test_manifest="$MATRIX_TMP_DIR/$(printf '%s' "$test_target" | shasum -a 256 | cut -d ' ' -f 1).json"
+
+  echo "[anchor-test] enumerating isolated tests for $test_target"
+  if ! ANCHOR_PROVIDER_URL="http://127.0.0.1:1" \
+    ANCHOR_WS_URL="ws://127.0.0.1:2" \
+    ANCHOR_WALLET="$WALLET_PATH" \
+    HYPERIA_MAX_ORACLE_STALENESS_SECONDS="$MAX_ORACLE_STALENESS_SECONDS" \
+      "${TS_MOCHA_COMMAND[@]}" \
+        -p ./tsconfig.json \
+        -t "$MOCHA_TIMEOUT_MS" \
+        --dry-run \
+        --reporter json \
+        "$test_target" >"$test_manifest"; then
+    printf 'Failed to enumerate isolated tests for %s\n' "$test_target" >&2
+    exit 1
+  fi
+
+  if ! jq -e '
+    (.tests | length) > 0 and
+    ([.tests[].fullTitle] | all(type == "string" and length > 0 and (contains("\n") | not))) and
+    ([.tests[].fullTitle] | length) == ([.tests[].fullTitle] | unique | length)
+  ' "$test_manifest" >/dev/null; then
+    printf 'Isolated test manifest is empty, malformed, or contains duplicate titles: %s\n' "$test_target" >&2
+    exit 1
+  fi
+
+  isolated_count="$(jq -r '.tests | length' "$test_manifest")"
+  isolated_index=0
+  while IFS= read -r full_title; do
+    isolated_index=$((isolated_index + 1))
+    TEST_TARGETS+=("$test_target")
+    TEST_GREPS+=("$(escape_mocha_title "$full_title")")
+    TEST_LABELS+=("$test_target [$isolated_index/$isolated_count] $full_title")
+  done < <(jq -r '.tests[].fullTitle' "$test_manifest")
+  echo "[anchor-test] expanded $test_target into $isolated_count fresh-validator tests"
+done
+
 test_index=0
 for test_target in "${TEST_TARGETS[@]}"; do
+  test_grep="${TEST_GREPS[$test_index]}"
+  test_label="${TEST_LABELS[$test_index]}"
   current_rpc_port=$((RPC_PORT + test_index))
   current_ws_port=$((WS_PORT + test_index))
   current_faucet_port=$((FAUCET_PORT + test_index))
@@ -236,7 +322,7 @@ for test_target in "${TEST_TARGETS[@]}"; do
   rm -rf "$LEDGER_DIR"
   mkdir -p "$(dirname "$LEDGER_DIR")"
 
-  echo "[anchor-test] starting local validator for $test_target"
+  echo "[anchor-test] starting local validator for $test_label"
   solana-test-validator \
     --reset \
     --quiet \
@@ -265,22 +351,30 @@ for test_target in "${TEST_TARGETS[@]}"; do
 
   sleep 1
 
-  echo "[anchor-test] running mocha suite for $test_target"
+  echo "[anchor-test] running mocha suite for $test_label"
   mocha_args=(
     -p ./tsconfig.json
     -t "$MOCHA_TIMEOUT_MS"
+    --fail-zero
     --exit
   )
-  if [[ -n "$MOCHA_GREP" ]]; then
-    mocha_args+=(--grep "$MOCHA_GREP")
+  if [[ "$MOCHA_BAIL" == "1" ]]; then
+    mocha_args+=(--bail)
+  fi
+  if [[ -n "$test_grep" ]]; then
+    mocha_args+=(--grep "$test_grep")
   fi
   mocha_args+=("$test_target")
 
-  ANCHOR_PROVIDER_URL="$current_rpc_url" \
-  ANCHOR_WS_URL="$current_ws_url" \
-  ANCHOR_WALLET="$WALLET_PATH" \
-  HYPERIA_MAX_ORACLE_STALENESS_SECONDS="$MAX_ORACLE_STALENESS_SECONDS" \
-    "${TS_MOCHA_COMMAND[@]}" "${mocha_args[@]}" | tee -a "$TEST_LOG"
+  if ! ANCHOR_PROVIDER_URL="$current_rpc_url" \
+    ANCHOR_WS_URL="$current_ws_url" \
+    ANCHOR_WALLET="$WALLET_PATH" \
+    HYPERIA_MAX_ORACLE_STALENESS_SECONDS="$MAX_ORACLE_STALENESS_SECONDS" \
+      "${TS_MOCHA_COMMAND[@]}" "${mocha_args[@]}" 2>&1 | tee -a "$TEST_LOG"; then
+    printf '[anchor-test] failed: %s\n' "$test_label" >&2
+    tail -n 120 "$VALIDATOR_LOG" >&2 || true
+    exit 1
+  fi
 
   stop_validator
   test_index=$((test_index + 1))

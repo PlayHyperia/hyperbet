@@ -18,16 +18,16 @@ export function getUpsertDuelDiscriminatorBytes(): ReadonlyUint8Array { return f
 export type UpsertDuelInstruction<TProgram extends string = typeof FIGHT_ORACLE_PROGRAM_ADDRESS, TAccountReporter extends string | AccountMeta<string> = string, TAccountOracleConfig extends string | AccountMeta<string> = string, TAccountDuelState extends string | AccountMeta<string> = string, TAccountSystemProgram extends string | AccountMeta<string> = "11111111111111111111111111111111", TRemainingAccounts extends readonly AccountMeta<string>[] = []> =
 Instruction<TProgram> & InstructionWithData<ReadonlyUint8Array> & InstructionWithAccounts<[TAccountReporter extends string ? WritableSignerAccount<TAccountReporter> & AccountSignerMeta<TAccountReporter> : TAccountReporter, TAccountOracleConfig extends string ? ReadonlyAccount<TAccountOracleConfig> : TAccountOracleConfig, TAccountDuelState extends string ? WritableAccount<TAccountDuelState> : TAccountDuelState, TAccountSystemProgram extends string ? ReadonlyAccount<TAccountSystemProgram> : TAccountSystemProgram, ...TRemainingAccounts]>;
 
-export type UpsertDuelInstructionData = { discriminator: ReadonlyUint8Array; duelKey: Array<number>; participantAHash: Array<number>; participantBHash: Array<number>; betOpenTs: bigint; betCloseTs: bigint; duelStartTs: bigint; metadataUri: string; status: DuelStatus;  };
+export type UpsertDuelInstructionData = { discriminator: ReadonlyUint8Array; duelKey: Array<number>; participantAHash: Array<number>; participantBHash: Array<number>; competitiveSnapshotVersion: number; competitiveSnapshotDigest: Array<number>; betOpenTs: bigint; betCloseTs: bigint; duelStartTs: bigint; metadataUri: string; status: DuelStatus;  };
 
-export type UpsertDuelInstructionDataArgs = { duelKey: Array<number>; participantAHash: Array<number>; participantBHash: Array<number>; betOpenTs: number | bigint; betCloseTs: number | bigint; duelStartTs: number | bigint; metadataUri: string; status: DuelStatusArgs;  };
+export type UpsertDuelInstructionDataArgs = { duelKey: Array<number>; participantAHash: Array<number>; participantBHash: Array<number>; competitiveSnapshotVersion: number; competitiveSnapshotDigest: Array<number>; betOpenTs: number | bigint; betCloseTs: number | bigint; duelStartTs: number | bigint; metadataUri: string; status: DuelStatusArgs;  };
 
 export function getUpsertDuelInstructionDataEncoder(): Encoder<UpsertDuelInstructionDataArgs> {
-    return transformEncoder(getStructEncoder([['discriminator', fixEncoderSize(getBytesEncoder(), 8)], ['duelKey', getArrayEncoder(getU8Encoder(), { size: 32 })], ['participantAHash', getArrayEncoder(getU8Encoder(), { size: 32 })], ['participantBHash', getArrayEncoder(getU8Encoder(), { size: 32 })], ['betOpenTs', getI64Encoder()], ['betCloseTs', getI64Encoder()], ['duelStartTs', getI64Encoder()], ['metadataUri', addEncoderSizePrefix(getUtf8Encoder(), getU32Encoder())], ['status', getDuelStatusEncoder()]]), (value) => ({ ...value, discriminator: UPSERT_DUEL_DISCRIMINATOR }));
+    return transformEncoder(getStructEncoder([['discriminator', fixEncoderSize(getBytesEncoder(), 8)], ['duelKey', getArrayEncoder(getU8Encoder(), { size: 32 })], ['participantAHash', getArrayEncoder(getU8Encoder(), { size: 32 })], ['participantBHash', getArrayEncoder(getU8Encoder(), { size: 32 })], ['competitiveSnapshotVersion', getU32Encoder()], ['competitiveSnapshotDigest', getArrayEncoder(getU8Encoder(), { size: 32 })], ['betOpenTs', getI64Encoder()], ['betCloseTs', getI64Encoder()], ['duelStartTs', getI64Encoder()], ['metadataUri', addEncoderSizePrefix(getUtf8Encoder(), getU32Encoder())], ['status', getDuelStatusEncoder()]]), (value) => ({ ...value, discriminator: UPSERT_DUEL_DISCRIMINATOR }));
 }
 
 export function getUpsertDuelInstructionDataDecoder(): Decoder<UpsertDuelInstructionData> {
-    return getStructDecoder([['discriminator', fixDecoderSize(getBytesDecoder(), 8)], ['duelKey', getArrayDecoder(getU8Decoder(), { size: 32 })], ['participantAHash', getArrayDecoder(getU8Decoder(), { size: 32 })], ['participantBHash', getArrayDecoder(getU8Decoder(), { size: 32 })], ['betOpenTs', getI64Decoder()], ['betCloseTs', getI64Decoder()], ['duelStartTs', getI64Decoder()], ['metadataUri', addDecoderSizePrefix(getUtf8Decoder(), getU32Decoder())], ['status', getDuelStatusDecoder()]]);
+    return getStructDecoder([['discriminator', fixDecoderSize(getBytesDecoder(), 8)], ['duelKey', getArrayDecoder(getU8Decoder(), { size: 32 })], ['participantAHash', getArrayDecoder(getU8Decoder(), { size: 32 })], ['participantBHash', getArrayDecoder(getU8Decoder(), { size: 32 })], ['competitiveSnapshotVersion', getU32Decoder()], ['competitiveSnapshotDigest', getArrayDecoder(getU8Decoder(), { size: 32 })], ['betOpenTs', getI64Decoder()], ['betCloseTs', getI64Decoder()], ['duelStartTs', getI64Decoder()], ['metadataUri', addDecoderSizePrefix(getUtf8Decoder(), getU32Decoder())], ['status', getDuelStatusDecoder()]]);
 }
 
 export function getUpsertDuelInstructionDataCodec(): Codec<UpsertDuelInstructionDataArgs, UpsertDuelInstructionData> {
@@ -42,6 +42,8 @@ systemProgram?: Address<TAccountSystemProgram>;
 duelKey: UpsertDuelInstructionDataArgs["duelKey"];
 participantAHash: UpsertDuelInstructionDataArgs["participantAHash"];
 participantBHash: UpsertDuelInstructionDataArgs["participantBHash"];
+competitiveSnapshotVersion: UpsertDuelInstructionDataArgs["competitiveSnapshotVersion"];
+competitiveSnapshotDigest: UpsertDuelInstructionDataArgs["competitiveSnapshotDigest"];
 betOpenTs: UpsertDuelInstructionDataArgs["betOpenTs"];
 betCloseTs: UpsertDuelInstructionDataArgs["betCloseTs"];
 duelStartTs: UpsertDuelInstructionDataArgs["duelStartTs"];
@@ -85,6 +87,8 @@ systemProgram?: Address<TAccountSystemProgram>;
 duelKey: UpsertDuelInstructionDataArgs["duelKey"];
 participantAHash: UpsertDuelInstructionDataArgs["participantAHash"];
 participantBHash: UpsertDuelInstructionDataArgs["participantBHash"];
+competitiveSnapshotVersion: UpsertDuelInstructionDataArgs["competitiveSnapshotVersion"];
+competitiveSnapshotDigest: UpsertDuelInstructionDataArgs["competitiveSnapshotDigest"];
 betOpenTs: UpsertDuelInstructionDataArgs["betOpenTs"];
 betCloseTs: UpsertDuelInstructionDataArgs["betCloseTs"];
 duelStartTs: UpsertDuelInstructionDataArgs["duelStartTs"];

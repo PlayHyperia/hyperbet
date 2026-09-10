@@ -1,0 +1,28 @@
+title = "Hyperbet staged and committed source secret policy"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Exact public Storybook duel PDA seed, not signing material"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^packages/hyperbet-ui/\.storybook/mocks/programs\.ts$''']
+regexes = ['''^DUEL_KEY_HEX\s*=\s*"1f1e1d1c1b1a19181716151413121110f1e2d3c4b5a697887766554433221100"$''']
+
+[[rules.allowlists]]
+description = "Exact public Storybook transport duel identifier, not signing material"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^packages/hyperbet-ui/\.storybook/preview\.tsx$''']
+regexes = ['''^STORYBOOK_DUEL_KEY\s*=\s*"1f1e1d1c1b1a19181716151413121110f1e2d3c4b5a697887766554433221100"$''']
+
+[[rules.allowlists]]
+description = "Exact browser test storage-key name, not a credential or signature value"
+condition = "AND"
+regexTarget = "match"
+paths = ['''^packages/hyperbet-solana/app/tests/e2e/solana-clob-ui\.e2e\.ts$''']
+regexes = ['''^pendingKey\s*=\s*"hyperbet\.e2e\.pending-wallet-signature"$''']

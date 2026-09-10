@@ -24,3 +24,10 @@ export function deriveTwoSidedClobProbabilityPercent(
   }
   return (bestBid + bestAsk) / 20;
 }
+
+export function shouldRenderSolanaClobStatusRow(input: {
+  orderEntryAvailable: boolean;
+  tradingUnavailableMessage?: string;
+}): boolean {
+  return input.orderEntryAvailable || !input.tradingUnavailableMessage?.trim();
+}

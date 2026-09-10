@@ -1,4 +1,5 @@
 import { quoteCostLamports } from "./solanaBetAccounting";
+import { allocateFeeByLargestRemainder } from "./solanaClaimAccounting";
 import { normalizeLifecycleFact } from "./solanaLifecycleIndexer";
 import type {
   BetExecutionBaseline,
@@ -6,8 +7,7 @@ import type {
 } from "./solanaBetReconciliation";
 
 export type SolanaTerminalSettlementKind =
-  | "CLAIM_PAYOUT"
-  | "CANCELLATION_REFUND";
+  "CLAIM_PAYOUT" | "CANCELLATION_REFUND" | "LOSER_CLEANUP";
 
 export type SolanaBetTerminalAllocation = {
   betId: string;
@@ -65,50 +65,6 @@ function compareOrderIds(left: string, right: string): number {
   const a = BigInt(left);
   const b = BigInt(right);
   return a < b ? -1 : a > b ? 1 : 0;
-}
-
-function allocateFeeByLargestRemainder(input: {
-  entitlements: Array<{ orderId: string; gross: bigint }>;
-  totalGross: bigint;
-  totalFee: bigint;
-}): Map<string, bigint> {
-  if (
-    input.totalGross <= 0n ||
-    input.totalFee < 0n ||
-    input.totalFee > input.totalGross
-  ) {
-    throw new Error("terminal settlement fee allocation input is invalid");
-  }
-  const rows = input.entitlements.map(({ orderId, gross }) => {
-    if (gross <= 0n) {
-      throw new Error("terminal settlement entitlement must be positive");
-    }
-    const numerator = gross * input.totalFee;
-    return {
-      orderId,
-      fee: numerator / input.totalGross,
-      remainder: numerator % input.totalGross,
-    };
-  });
-  let allocated = rows.reduce((sum, row) => sum + row.fee, 0n);
-  const residual = input.totalFee - allocated;
-  if (residual < 0n || residual >= BigInt(Math.max(1, rows.length))) {
-    throw new Error("terminal settlement fee residual is invalid");
-  }
-  rows.sort((left, right) => {
-    if (left.remainder !== right.remainder) {
-      return left.remainder > right.remainder ? -1 : 1;
-    }
-    return compareOrderIds(left.orderId, right.orderId);
-  });
-  for (let index = 0; index < Number(residual); index += 1) {
-    rows[index]!.fee += 1n;
-    allocated += 1n;
-  }
-  if (allocated !== input.totalFee) {
-    throw new Error("terminal settlement fees do not conserve");
-  }
-  return new Map(rows.map((row) => [row.orderId, row.fee]));
 }
 
 function buildIndexedOrders(
@@ -244,15 +200,15 @@ export function reconcileWalletMarketTerminalSettlements(input: {
   facts: IndexedLifecycleFact[];
   recordedBets: BetExecutionBaseline[];
 }): SolanaWalletMarketTerminalSettlement[] {
-  const facts = input.facts.map(
-    (envelope): IndexedLifecycleFact => ({
-      ...envelope,
-      fact: normalizeLifecycleFact(envelope.fact),
-    }),
-  );
+  const facts = input.facts.map((envelope): IndexedLifecycleFact => ({
+    ...envelope,
+    fact: normalizeLifecycleFact(envelope.fact),
+  }));
   const terminalFacts = facts.filter(
     ({ fact }) =>
-      fact.kind === "CLAIM_PAYOUT" || fact.kind === "CANCELLATION_REFUND",
+      fact.kind === "CLAIM_PAYOUT" ||
+      fact.kind === "CANCELLATION_REFUND" ||
+      fact.kind === "LOSING_BALANCE_CLOSED",
   );
   if (terminalFacts.length === 0) return [];
   const orders = buildIndexedOrders(facts);
@@ -276,16 +232,95 @@ export function reconcileWalletMarketTerminalSettlements(input: {
     recordedByWalletMarket.set(key, records);
   }
 
-  const claimedWalletMarkets = new Set<string>();
+  const settledWalletMarkets = new Set<string>();
   const settlements: SolanaWalletMarketTerminalSettlement[] = [];
   for (const envelope of terminalFacts) {
     const fact = envelope.fact;
     const key = walletMarketKey(fact.marketPda, fact.wallet!);
-    if (claimedWalletMarkets.has(key)) {
+    if (settledWalletMarkets.has(key)) {
       throw new Error("wallet-market terminal settlement is duplicated");
     }
-    claimedWalletMarkets.add(key);
+    settledWalletMarkets.add(key);
     const walletOrders = ordersByWalletMarket.get(key) ?? [];
+    const recorded = recordedByWalletMarket.get(key) ?? [];
+    const validatedRecorded = recorded.map((baseline) => ({
+      baseline,
+      order: validateRecordedBet(
+        baseline,
+        orders.get(orderKey(baseline.marketPda, baseline.orderId)),
+      ),
+    }));
+
+    if (fact.kind === "LOSING_BALANCE_CLOSED") {
+      const losingSide = fact.side!;
+      const winningSide = losingSide === 1 ? 2 : 1;
+      const expectedLosingSide = fact.winner === "a" ? 2 : 1;
+      const winningOrders = walletOrders.filter(
+        (order) => order.side === winningSide,
+      );
+      const losingOrders = walletOrders.filter(
+        (order) =>
+          order.side === losingSide &&
+          (order.matchedAmountUnits > 0n || order.lockedLamports > 0n),
+      );
+      const losingAmountUnits = losingOrders.reduce(
+        (sum, order) => sum + order.matchedAmountUnits,
+        0n,
+      );
+      const losingAmountLamports = losingOrders.reduce(
+        (sum, order) => sum + order.lockedLamports,
+        0n,
+      );
+      const hasWinningBalance = winningOrders.some(
+        (order) => order.matchedAmountUnits > 0n || order.lockedLamports > 0n,
+      );
+      if (
+        fact.status !== "resolved" ||
+        (fact.winner !== "a" && fact.winner !== "b") ||
+        losingSide !== expectedLosingSide ||
+        hasWinningBalance ||
+        losingOrders.length === 0 ||
+        losingAmountUnits !==
+          unsigned(fact.amountUnits, "loser cleanup amount") ||
+        losingAmountLamports !==
+          unsigned(fact.amountLamports, "loser cleanup locked amount")
+      ) {
+        throw new Error(
+          "wallet-market loser cleanup contradicts indexed order custody",
+        );
+      }
+      const eligibleOrderIds = new Set(
+        losingOrders.map((order) => order.orderId),
+      );
+      const allocations = validatedRecorded
+        .filter(({ order }) => eligibleOrderIds.has(order.orderId))
+        .map(({ baseline, order }): SolanaBetTerminalAllocation => ({
+          betId: baseline.betId,
+          orderId: order.orderId,
+          side: order.side,
+          matchedAmountUnits: order.matchedAmountUnits.toString(),
+          grossEntitlementLamports: "0",
+          payoutLamports: "0",
+          feeLamports: "0",
+        }))
+        .sort((left, right) => compareOrderIds(left.orderId, right.orderId));
+      settlements.push({
+        claimSignature: envelope.signature,
+        marketPda: fact.marketPda,
+        wallet: fact.wallet!,
+        kind: "LOSER_CLEANUP",
+        status: "resolved",
+        winner: fact.winner,
+        grossEntitlementLamports: "0",
+        payoutLamports: "0",
+        feeLamports: "0",
+        eligibleOrderCount: losingOrders.length,
+        recordedBetCount: allocations.length,
+        allocations,
+      });
+      continue;
+    }
+
     const entitlementByOrder = new Map<string, bigint>();
     for (const order of walletOrders) {
       const entitlement =
@@ -333,13 +368,8 @@ export function reconcileWalletMarketTerminalSettlements(input: {
       totalGross,
       totalFee: fee,
     });
-    const recorded = recordedByWalletMarket.get(key) ?? [];
-    const allocations = recorded
-      .map((baseline): SolanaBetTerminalAllocation => {
-        const order = validateRecordedBet(
-          baseline,
-          orders.get(orderKey(baseline.marketPda, baseline.orderId)),
-        );
+    const allocations = validatedRecorded
+      .map(({ baseline, order }): SolanaBetTerminalAllocation => {
         const gross = entitlementByOrder.get(order.orderId) ?? 0n;
         const allocatedFee = feesByOrder.get(order.orderId) ?? 0n;
         if (allocatedFee > gross) {

@@ -12,6 +12,40 @@ const DEFAULT_RENDERER_HEALTH_MAX_AGE_MS = 15_000;
 const DEFAULT_PLAYBACK_PRESENTATION_LAG_MS = 250;
 const MAX_TIMELINE_STATES = 512;
 
+type AuthorityState = StreamingStateUpdate & { seq: number; emittedAt: number };
+type RendererRevocation = {
+  seq: number;
+  emittedAt: number;
+  healthUpdatedAt: number;
+  epoch: number;
+};
+
+function isCanonicalTimestamp(
+  value: unknown,
+  nowMs = Date.now(),
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value > 0 &&
+    value <= nowMs
+  );
+}
+
+function hasSameDuelIdentity(a: AuthorityState, b: AuthorityState): boolean {
+  return (
+    typeof a.cycle.cycleId === "string" &&
+    a.cycle.cycleId.length > 0 &&
+    typeof a.cycle.duelId === "string" &&
+    a.cycle.duelId.length > 0 &&
+    typeof a.cycle.duelKeyHex === "string" &&
+    /^[a-f0-9]{64}$/.test(a.cycle.duelKeyHex) &&
+    a.cycle.cycleId === b.cycle.cycleId &&
+    a.cycle.duelId === b.cycle.duelId &&
+    a.cycle.duelKeyHex === b.cycle.duelKeyHex
+  );
+}
+
 type SseSource = {
   onopen: (() => void) | null;
   onerror: (() => void) | null;
@@ -98,22 +132,30 @@ export function isStreamingRendererHealthReady(
   if (
     health?.ready !== true ||
     health.degradedReason !== null ||
-    typeof health.updatedAt !== "number" ||
-    !Number.isFinite(health.updatedAt) ||
-    health.updatedAt <= 0
+    !isCanonicalTimestamp(health.updatedAt, nowMs)
   ) {
     return false;
   }
   return Math.max(0, nowMs - health.updatedAt) <= Math.max(0, maxAgeMs);
 }
 
-function normalizeState(payload: unknown): StreamingStateUpdate | null {
+function normalizeState(payload: unknown): AuthorityState | null {
   if (!payload || typeof payload !== "object") return null;
   const candidate = payload as Partial<StreamingStateUpdate> & {
     cycle?: unknown;
     leaderboard?: unknown;
   };
-  if (!candidate.cycle || !Array.isArray(candidate.leaderboard)) return null;
+  if (
+    !candidate.cycle ||
+    typeof candidate.cycle !== "object" ||
+    Array.isArray(candidate.cycle) ||
+    !Array.isArray(candidate.leaderboard) ||
+    typeof candidate.seq !== "number" ||
+    !Number.isSafeInteger(candidate.seq) ||
+    candidate.seq < 0 ||
+    !isCanonicalTimestamp(candidate.emittedAt)
+  )
+    return null;
   return {
     type: "STREAMING_STATE_UPDATE",
     cycle: candidate.cycle as StreamingStateUpdate["cycle"],
@@ -123,15 +165,9 @@ function normalizeState(payload: unknown): StreamingStateUpdate | null {
       candidate.cameraTarget === null
         ? candidate.cameraTarget
         : null,
-    seq:
-      typeof candidate.seq === "number" && Number.isFinite(candidate.seq)
-        ? candidate.seq
-        : undefined,
-    emittedAt:
-      typeof candidate.emittedAt === "number" &&
-      Number.isFinite(candidate.emittedAt)
-        ? candidate.emittedAt
-        : undefined,
+    preparation: candidate.preparation ?? null,
+    seq: candidate.seq,
+    emittedAt: candidate.emittedAt,
   };
 }
 
@@ -155,6 +191,10 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
 
   const [state, setState] = useState<StreamingStateUpdate | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [currentState, setCurrentState] = useState<StreamingStateUpdate | null>(
+    null,
+  );
+  const [isCurrentConnected, setIsCurrentConnected] = useState(false);
   const [isRendererReady, setIsRendererReady] = useState(false);
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -163,6 +203,12 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
   const lastEventIdRef = useRef(0);
   const reconnectAttemptRef = useRef(0);
   const connectionEpochRef = useRef(0);
+  const authorityStateRef = useRef<AuthorityState | null>(null);
+  const authorityStateEpochRef = useRef(0);
+  const authorityHealthUpdatedAtRef = useRef<number | null>(null);
+  const authorityAvailableRef = useRef(false);
+  const authorityRevisionRef = useRef(0);
+  const rendererRevocationRef = useRef<RendererRevocation | null>(null);
   const closedRef = useRef(false);
   const connectSseRef = useRef<() => void>(() => {});
   const delayedUpdatesRef = useRef<Set<ReturnType<typeof setTimeout>>>(
@@ -209,9 +255,11 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
 
   const markDisconnected = useCallback(() => {
     connectionEpochRef.current += 1;
+    authorityAvailableRef.current = false;
     presentationEpochRef.current = connectionEpochRef.current;
     clearDelayedUpdates();
     setIsConnected(false);
+    setIsCurrentConnected(false);
     setIsRendererReady(false);
   }, [clearDelayedUpdates]);
 
@@ -262,27 +310,104 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
   ]);
 
   const applyState = useCallback(
-    (nextState: StreamingStateUpdate) => {
+    (nextState: AuthorityState) => {
+      if (closedRef.current) return false;
+      const current = authorityStateRef.current;
+      const wasAvailable = authorityAvailableRef.current;
+      // Match the producer's epoch contract: only an observed disconnect plus
+      // strictly newer time permits a restarted sequence. A reset event alone
+      // does not authorize a rollback, nor does a late REST response.
       if (
-        typeof nextState.seq === "number" &&
-        Number.isFinite(nextState.seq) &&
-        nextState.seq > lastEventIdRef.current
+        current &&
+        (wasAvailable
+          ? nextState.seq < current.seq ||
+            nextState.emittedAt < current.emittedAt
+          : nextState.emittedAt <= current.emittedAt)
+      )
+        return false;
+      let revocation = rendererRevocationRef.current;
+      let sameRevocationEpoch =
+        revocation?.epoch === connectionEpochRef.current;
+      if (
+        revocation &&
+        (nextState.emittedAt < revocation.emittedAt ||
+          (sameRevocationEpoch && nextState.seq < revocation.seq))
+      )
+        return false;
+      if (
+        current &&
+        wasAvailable &&
+        nextState.seq === current.seq &&
+        nextState.emittedAt === current.emittedAt
       ) {
-        lastEventIdRef.current = nextState.seq;
+        // Duplicate heartbeats may keep transport alive, but conflicting data
+        // with the same cursor cannot mutate or restore current authority.
+        return true;
+      }
+      const health = nextState.cycle.rendererHealth;
+      const currentHealthAt = authorityHealthUpdatedAtRef.current;
+      if (
+        isCanonicalTimestamp(currentHealthAt) &&
+        isCanonicalTimestamp(health?.updatedAt) &&
+        health.updatedAt < currentHealthAt
+      )
+        return false;
+      lastEventIdRef.current = wasAvailable
+        ? Math.max(lastEventIdRef.current, nextState.seq)
+        : nextState.seq;
+      authorityStateRef.current = nextState;
+      authorityStateEpochRef.current = connectionEpochRef.current;
+      authorityAvailableRef.current = true;
+      authorityRevisionRef.current += 1;
+      const rendererHealthReady = isStreamingRendererHealthReady(
+        health,
+        Date.now(),
+        rendererHealthMaxAgeMs,
+      );
+      // A missing/malformed health field must not erase the last canonical
+      // freshness floor. It revokes confidence, but cannot supply a timestamp
+      // that poisons recovery. Reuse the last known floor until new health is
+      // positively verified; retain it across producer/transport restarts.
+      if (isCanonicalTimestamp(health?.updatedAt)) {
+        authorityHealthUpdatedAtRef.current = health.updatedAt;
+      }
+      const revokedHealthAt = authorityHealthUpdatedAtRef.current;
+      // Semantically unready current authority (including contradictory ready
+      // flags) has the same recovery barrier as a negative timeline frame.
+      if (
+        !rendererHealthReady &&
+        isCanonicalTimestamp(revokedHealthAt) &&
+        (!revocation || revokedHealthAt >= revocation.healthUpdatedAt)
+      ) {
+        revocation = {
+          seq: nextState.seq,
+          emittedAt: nextState.emittedAt,
+          healthUpdatedAt: revokedHealthAt,
+          epoch: connectionEpochRef.current,
+        };
+        rendererRevocationRef.current = revocation;
+        sameRevocationEpoch = true;
       }
 
       setIsRendererReady(
-        isStreamingRendererHealthReady(
-          nextState.cycle.rendererHealth,
-          Date.now(),
-          rendererHealthMaxAgeMs,
-        ),
+        rendererHealthReady &&
+          (!revocation ||
+            (nextState.emittedAt > revocation.emittedAt &&
+              (!sameRevocationEpoch || nextState.seq > revocation.seq) &&
+              isCanonicalTimestamp(health?.updatedAt) &&
+              health.updatedAt > revocation.healthUpdatedAt)),
       );
+      // Keep the latest accepted authority separate from the HLS-aligned
+      // presentation state below. Wagering must use this wall-clock source;
+      // replaying an older decoded frame must never make a current quote stale
+      // or, conversely, reopen a market that has already closed.
+      setCurrentState(nextState);
+      setIsCurrentConnected(true);
 
       const epoch = connectionEpochRef.current;
       appendTimelineState(nextState);
       if (presentationTimeRef.current !== null) {
-        return;
+        return true;
       }
       const commit = () => {
         if (closedRef.current || epoch !== connectionEpochRef.current) return;
@@ -292,7 +417,7 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
 
       if (uiSyncDelayMs <= 0) {
         commit();
-        return;
+        return true;
       }
 
       const timer = setTimeout(() => {
@@ -300,19 +425,30 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
         commit();
       }, uiSyncDelayMs);
       delayedUpdatesRef.current.add(timer);
+      return true;
     },
     [appendTimelineState, rendererHealthMaxAgeMs, uiSyncDelayMs],
   );
 
   const poll = useCallback(async () => {
+    if (closedRef.current) return;
+    const epoch = connectionEpochRef.current;
+    const revision = authorityRevisionRef.current;
+    const isCurrentRequest = () =>
+      !closedRef.current && epoch === connectionEpochRef.current;
     try {
       const response = await fetch(pollUrl, { cache: "no-store" });
+      if (!isCurrentRequest()) return;
       if (!response.ok) throw new Error("stream state unavailable");
       const nextState = normalizeState(await response.json());
+      if (!isCurrentRequest()) return;
       if (!nextState) throw new Error("stream state malformed");
       applyState(nextState);
     } catch {
-      markDisconnected();
+      // A subsequently accepted SSE frame supersedes this request's liveness
+      // evidence too: an old failed poll must not disconnect a recovered feed.
+      if (isCurrentRequest() && revision === authorityRevisionRef.current)
+        markDisconnected();
     }
   }, [applyState, markDisconnected, pollUrl]);
 
@@ -403,14 +539,10 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
       try {
         const nextState = normalizeState(JSON.parse(event.data));
         if (!nextState) return;
-        const eventId = Number.parseInt(event.lastEventId || "", 10);
-        if (Number.isFinite(eventId) && eventId > lastEventIdRef.current) {
-          lastEventIdRef.current = eventId;
-        }
+        if (!applyState(nextState)) return;
         armSseFrameTimeout();
         reconnectAttemptRef.current = 0;
         clearPollTimer();
-        applyState(nextState);
       } catch {
         // A malformed frame has no authority. Keep waiting for a valid frame.
       }
@@ -421,9 +553,49 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
       try {
         const nextState = normalizeState(JSON.parse(event.data));
         if (!nextState) return;
-        const eventId = Number.parseInt(event.lastEventId || "", 10);
-        if (Number.isFinite(eventId) && eventId > lastEventIdRef.current) {
-          lastEventIdRef.current = eventId;
+        lastEventIdRef.current = Math.max(
+          lastEventIdRef.current,
+          nextState.seq,
+        );
+        const current = authorityStateRef.current;
+        const health = nextState.cycle.rendererHealth;
+        const currentHealth = current?.cycle.rendererHealth;
+        const currentHealthAt = authorityHealthUpdatedAtRef.current;
+        const previous = rendererRevocationRef.current;
+        // Replay can withdraw confidence, never grant it. Only forward,
+        // explicitly negative health for the exact current duel may latch.
+        // Missing optional identity is presentation-only, not authority.
+        if (
+          current &&
+          hasSameDuelIdentity(current, nextState) &&
+          nextState.seq >= current.seq &&
+          nextState.emittedAt >= current.emittedAt &&
+          (nextState.seq > current.seq ||
+            nextState.emittedAt > current.emittedAt) &&
+          health?.ready === false &&
+          isCanonicalTimestamp(health.updatedAt) &&
+          (health.degradedReason === null ||
+            typeof health.degradedReason === "string") &&
+          (!isCanonicalTimestamp(currentHealthAt) ||
+            (currentHealth?.ready === true
+              ? health.updatedAt > currentHealthAt
+              : health.updatedAt >= currentHealthAt)) &&
+          (!previous ||
+            (nextState.emittedAt >= previous.emittedAt &&
+              health.updatedAt >= previous.healthUpdatedAt &&
+              (previous.epoch !== authorityStateEpochRef.current ||
+                nextState.seq >= previous.seq)))
+        ) {
+          rendererRevocationRef.current = {
+            seq: nextState.seq,
+            emittedAt: nextState.emittedAt,
+            healthUpdatedAt: health.updatedAt,
+            // A replay before the new authority reset still belongs to the
+            // matched old producer epoch, not the replacement transport.
+            epoch: authorityStateEpochRef.current,
+          };
+          authorityRevisionRef.current += 1;
+          setIsRendererReady(false);
         }
         armSseFrameTimeout();
         reconnectAttemptRef.current = 0;
@@ -467,10 +639,10 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
 
   useEffect(() => {
     closedRef.current = false;
+    markDisconnected();
     if (!disabled) {
       connectSse();
     } else {
-      markDisconnected();
       clearPollTimer();
       clearReconnectTimer();
       clearSseFrameTimer();
@@ -483,6 +655,7 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
     return () => {
       closedRef.current = true;
       connectionEpochRef.current += 1;
+      authorityAvailableRef.current = false;
       clearDelayedUpdates();
       clearPollTimer();
       clearReconnectTimer();
@@ -502,5 +675,11 @@ export function useStreamingState(options: StreamingStateOptions = {}) {
     markDisconnected,
   ]);
 
-  return { state, isConnected, isRendererReady };
+  return {
+    state,
+    isConnected,
+    currentState,
+    isCurrentConnected,
+    isRendererReady,
+  };
 }

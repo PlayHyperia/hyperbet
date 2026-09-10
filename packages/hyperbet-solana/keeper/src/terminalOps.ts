@@ -1,5 +1,6 @@
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
+import { writeSync } from "node:fs";
 
 import {
   TerminalLedger,
@@ -28,8 +29,13 @@ function sanitizeCliError(error: unknown): string {
 }
 
 function printJson(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  writeSync(process.stdout.fd, `${JSON.stringify(value, null, 2)}\n`);
 }
+
+export type TerminalOpsCliIo = {
+  writeJson?: (value: unknown) => void;
+  writeError?: (message: string) => void;
+};
 
 function operatorView(
   record: TerminalOperationRecord,
@@ -57,8 +63,11 @@ function conflictView(
 function withLedger<T>(
   dbPath: string | undefined,
   fn: (ledger: TerminalLedger) => T,
+  options: { readOnly?: boolean } = {},
 ): T {
-  const ledger = new TerminalLedger(dbPath?.trim() || undefined);
+  const ledger = new TerminalLedger(dbPath?.trim() || undefined, {
+    readOnly: options.readOnly === true,
+  });
   try {
     return fn(ledger);
   } finally {
@@ -66,163 +75,197 @@ function withLedger<T>(
   }
 }
 
-const cli = yargs(hideBin(process.argv))
-  .scriptName("terminal-ops")
-  .usage("$0 <command> [options]")
-  .option("db", {
-    type: "string",
-    description: "Keeper SQLite path; defaults to KEEPER_DB_PATH",
-  })
-  .command(
-    "list",
-    "List terminal operations requiring attention",
-    (command) =>
-      command
-        .option("status", {
-          type: "array",
-          string: true,
-          choices: ALL_STATUSES,
-          default: RECOVERY_STATUSES,
-          description: "One or more operation statuses",
-        })
-        .option("limit", {
-          type: "number",
-          default: 50,
-          description: "Maximum records (1-100)",
-        }),
-    (argv) => {
-      withLedger(argv.db, (ledger) => {
-        const statuses = (argv.status ??
-          RECOVERY_STATUSES) as TerminalOperationStatus[];
-        printJson({
-          summary: ledger.getSummary(),
-          operations: ledger
-            .listOperations({ statuses, limit: argv.limit })
-            .map((record) => operatorView(record)),
-        });
-      });
-    },
-  )
-  .command(
-    "inspect <id>",
-    "Inspect one operation and its immutable operator history",
-    (command) =>
-      command
-        .positional("id", {
-          type: "number",
-          demandOption: true,
-          description: "Terminal operation id",
-        })
-        .option("include-event", {
-          type: "boolean",
-          default: false,
-          description: "Include the persisted authoritative feed event",
-        }),
-    (argv) => {
-      withLedger(argv.db, (ledger) => {
-        const record = ledger.getById(argv.id);
-        if (!record)
-          throw new Error(`terminal operation ${argv.id} does not exist`);
-        printJson({
-          operation: operatorView(record, argv.includeEvent),
-          conflicts: ledger
-            .getConflictRecords(argv.id)
-            .map((conflict) => conflictView(conflict, argv.includeEvent)),
-          auditEvents: ledger.getOperatorAuditEvents({ operationId: argv.id }),
-        });
-      });
-    },
-  )
-  .command(
-    "requeue <id>",
-    "Requeue one quarantined/dead-letter operation after independent verification",
-    (command) =>
-      command
-        .positional("id", {
-          type: "number",
-          demandOption: true,
-          description: "Terminal operation id",
-        })
-        .option("confirm-fingerprint", {
-          type: "string",
-          demandOption: true,
-          description: "Exact 64-character fingerprint shown by inspect",
-        })
-        .option("actor", {
-          type: "string",
-          demandOption: true,
-          description: "Stable operator identity for the audit trail",
-        })
-        .option("reason", {
-          type: "string",
-          demandOption: true,
-          description: "10-500 character recovery justification",
-        }),
-    (argv) => {
-      withLedger(argv.db, (ledger) => {
-        const result = ledger.requeueForOperator({
-          id: argv.id,
-          expectedFingerprint: argv.confirmFingerprint,
-          actor: argv.actor,
-          reason: argv.reason,
-        });
-        printJson({
-          ok: true,
-          operation: operatorView(result.operation),
-          auditEvent: result.auditEvent,
-        });
-      });
-    },
-  )
-  .command(
-    "feed-status",
-    "Inspect the durable authoritative-feed continuity checkpoint",
-    () => {},
-    (argv) => {
-      withLedger(argv.db, (ledger) => {
-        printJson({
-          checkpoint: ledger.getBettingFeedCheckpoint(),
-        });
-      });
-    },
-  )
-  .command(
-    "history",
-    "List immutable operator recovery actions",
-    (command) =>
-      command
-        .option("id", {
-          type: "number",
-          description: "Optional terminal operation id",
-        })
-        .option("limit", {
-          type: "number",
-          default: 50,
-          description: "Maximum records (1-100)",
-        }),
-    (argv) => {
-      withLedger(argv.db, (ledger) => {
-        printJson({
-          auditEvents: ledger.getOperatorAuditEvents({
-            operationId: argv.id,
-            limit: argv.limit,
+export async function runTerminalOpsCli(
+  args: string[],
+  io: TerminalOpsCliIo = {},
+): Promise<number> {
+  const writeJson = io.writeJson ?? printJson;
+  const writeError =
+    io.writeError ??
+    ((message: string) => {
+      writeSync(process.stderr.fd, message);
+    });
+  const cli = yargs(args)
+    .scriptName("terminal-ops")
+    .usage("$0 <command> [options]")
+    .option("db", {
+      type: "string",
+      description: "Keeper SQLite path; defaults to KEEPER_DB_PATH",
+    })
+    .command(
+      "list",
+      "List terminal operations requiring attention",
+      (command) =>
+        command
+          .option("status", {
+            type: "array",
+            string: true,
+            choices: ALL_STATUSES,
+            default: RECOVERY_STATUSES,
+            description: "One or more operation statuses",
+          })
+          .option("limit", {
+            type: "number",
+            default: 50,
+            description: "Maximum records (1-100)",
           }),
+      (argv) => {
+        withLedger(
+          argv.db,
+          (ledger) => {
+            const statuses = (argv.status ??
+              RECOVERY_STATUSES) as TerminalOperationStatus[];
+            writeJson({
+              summary: ledger.getSummary(),
+              operations: ledger
+                .listOperations({ statuses, limit: argv.limit })
+                .map((record) => operatorView(record)),
+            });
+          },
+          { readOnly: true },
+        );
+      },
+    )
+    .command(
+      "inspect <id>",
+      "Inspect one operation and its immutable operator history",
+      (command) =>
+        command
+          .positional("id", {
+            type: "number",
+            demandOption: true,
+            description: "Terminal operation id",
+          })
+          .option("include-event", {
+            type: "boolean",
+            default: false,
+            description: "Include the persisted authoritative feed event",
+          }),
+      (argv) => {
+        withLedger(
+          argv.db,
+          (ledger) => {
+            const record = ledger.getById(argv.id);
+            if (!record)
+              throw new Error(`terminal operation ${argv.id} does not exist`);
+            writeJson({
+              operation: operatorView(record, argv.includeEvent),
+              conflicts: ledger
+                .getConflictRecords(argv.id)
+                .map((conflict) => conflictView(conflict, argv.includeEvent)),
+              auditEvents: ledger.getOperatorAuditEvents({
+                operationId: argv.id,
+              }),
+            });
+          },
+          { readOnly: true },
+        );
+      },
+    )
+    .command(
+      "requeue <id>",
+      "Requeue one quarantined/dead-letter operation after independent verification",
+      (command) =>
+        command
+          .positional("id", {
+            type: "number",
+            demandOption: true,
+            description: "Terminal operation id",
+          })
+          .option("confirm-fingerprint", {
+            type: "string",
+            demandOption: true,
+            description: "Exact 64-character fingerprint shown by inspect",
+          })
+          .option("actor", {
+            type: "string",
+            demandOption: true,
+            description: "Stable operator identity for the audit trail",
+          })
+          .option("reason", {
+            type: "string",
+            demandOption: true,
+            description: "10-500 character recovery justification",
+          }),
+      (argv) => {
+        withLedger(argv.db, (ledger) => {
+          const result = ledger.requeueForOperator({
+            id: argv.id,
+            expectedFingerprint: argv.confirmFingerprint,
+            actor: argv.actor,
+            reason: argv.reason,
+          });
+          writeJson({
+            ok: true,
+            operation: operatorView(result.operation),
+            auditEvent: result.auditEvent,
+          });
         });
-      });
-    },
-  )
-  .demandCommand(1)
-  .strict()
-  .recommendCommands()
-  .help()
-  .exitProcess(false)
-  .fail((message, error) => {
-    throw error ?? new Error(message);
-  });
+      },
+    )
+    .command(
+      "feed-status",
+      "Inspect the durable authoritative-feed continuity checkpoint",
+      () => {},
+      (argv) => {
+        withLedger(
+          argv.db,
+          (ledger) => {
+            writeJson({
+              checkpoint: ledger.getBettingFeedCheckpoint(),
+            });
+          },
+          { readOnly: true },
+        );
+      },
+    )
+    .command(
+      "history",
+      "List immutable operator recovery actions",
+      (command) =>
+        command
+          .option("id", {
+            type: "number",
+            description: "Optional terminal operation id",
+          })
+          .option("limit", {
+            type: "number",
+            default: 50,
+            description: "Maximum records (1-100)",
+          }),
+      (argv) => {
+        withLedger(
+          argv.db,
+          (ledger) => {
+            writeJson({
+              auditEvents: ledger.getOperatorAuditEvents({
+                operationId: argv.id,
+                limit: argv.limit,
+              }),
+            });
+          },
+          { readOnly: true },
+        );
+      },
+    )
+    .demandCommand(1)
+    .strict()
+    .recommendCommands()
+    .help()
+    .exitProcess(false)
+    .fail((message, error) => {
+      throw error ?? new Error(message);
+    });
 
-try {
-  await cli.parseAsync();
-} catch (error) {
-  process.stderr.write(`[terminal-ops] ${sanitizeCliError(error)}\n`);
-  process.exitCode = 1;
+  try {
+    await cli.parseAsync();
+    return 0;
+  } catch (error) {
+    writeError(`[terminal-ops] ${sanitizeCliError(error)}\n`);
+    return 1;
+  }
+}
+
+if (import.meta.main) {
+  process.exitCode = await runTerminalOpsCli(hideBin(process.argv));
 }

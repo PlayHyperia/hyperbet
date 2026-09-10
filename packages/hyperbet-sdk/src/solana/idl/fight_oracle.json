@@ -1,5 +1,5 @@
 {
-  "address": "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM",
+  "address": "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu",
   "metadata": {
     "name": "fight_oracle",
     "version": "0.1.0",
@@ -379,7 +379,7 @@
         },
         {
           "name": "program",
-          "address": "GFdnu7kUnZGiXh4ejWiJSBCUxvq4UfdEeUv9jjFzr5EM"
+          "address": "FHXu3csARjtD4hEcuw3WobxoEU98h6j2vVhXjwuJhnJu"
         },
         {
           "name": "program_data"
@@ -931,6 +931,19 @@
           }
         },
         {
+          "name": "competitive_snapshot_version",
+          "type": "u32"
+        },
+        {
+          "name": "competitive_snapshot_digest",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
           "name": "bet_open_ts",
           "type": "i64"
         },
@@ -1194,27 +1207,52 @@
     {
       "code": 6025,
       "name": "TimingImmutable",
-      "msg": "Bet timing is immutable after betting opens"
+      "msg": "Duel timing is immutable after betting opens"
     },
     {
       "code": 6026,
+      "name": "InvalidCompetitiveSnapshot",
+      "msg": "Competitive snapshot version and digest must be present"
+    },
+    {
+      "code": 6027,
+      "name": "CompetitiveSnapshotImmutable",
+      "msg": "Competitive snapshot commitment is immutable after betting opens"
+    },
+    {
+      "code": 6028,
+      "name": "ResultHashMismatch",
+      "msg": "Result hash does not match the canonical duel outcome commitment"
+    },
+    {
+      "code": 6029,
+      "name": "UnsupportedAccountSchema",
+      "msg": "Account schema version is unsupported; use a fresh v2 program identity"
+    },
+    {
+      "code": 6030,
       "name": "AlreadyInitialized",
       "msg": "Config is already initialized"
     },
     {
-      "code": 6027,
+      "code": 6031,
       "name": "OraclePaused",
       "msg": "Oracle operations are paused"
     },
     {
-      "code": 6028,
+      "code": 6032,
       "name": "ConfigFrozen",
       "msg": "Config is permanently frozen"
     },
     {
-      "code": 6029,
+      "code": 6033,
       "name": "MetadataUriTooLong",
       "msg": "Metadata URI exceeds 200 byte limit"
+    },
+    {
+      "code": 6034,
+      "name": "ConfigNotFrozen",
+      "msg": "Oracle config must be permanently frozen before betting opens"
     }
   ],
   "types": [
@@ -1447,6 +1485,23 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "competitive_snapshot_version",
+            "type": "u32"
+          },
+          {
+            "name": "competitive_snapshot_digest",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "account_schema_version",
+            "type": "u16"
           }
         ]
       }
@@ -1515,6 +1570,19 @@
             "type": "i64"
           },
           {
+            "name": "competitive_snapshot_version",
+            "type": "u32"
+          },
+          {
+            "name": "competitive_snapshot_digest",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
             "name": "metadata_uri",
             "type": "string"
           }
@@ -1574,6 +1642,10 @@
           {
             "name": "bump",
             "type": "u8"
+          },
+          {
+            "name": "account_schema_version",
+            "type": "u16"
           }
         ]
       }
