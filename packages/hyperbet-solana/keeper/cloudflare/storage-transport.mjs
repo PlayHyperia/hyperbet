@@ -44,6 +44,7 @@ export function createStorageTransport({ url, token, timeoutMs = 10_000 }) {
   });
   let failed = false;
   let closed = false;
+  let closing;
   // A blocked caller cannot process events. Its own deadline also covers a
   // thread that exits before it can publish a reply.
   worker.on("error", () => { failed = true; });
@@ -83,10 +84,12 @@ export function createStorageTransport({ url, token, timeoutMs = 10_000 }) {
         throw new StorageTransportError("outcome-unconfirmed");
       }
     },
-    async close() {
+    close() {
+      if (closing) return closing;
       closed = true;
       port1.close();
-      await worker.terminate();
+      closing = worker.terminate().then(() => {});
+      return closing;
     },
   };
 }
