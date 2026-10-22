@@ -77,7 +77,9 @@ The public origin must be the Worker's HTTPS origin. Administrative routes are
 Tests live in `keeper/cloudflare/tests/`. The HTTPS transport test requires
 OpenSSL; supervisor tests require Linux, and the runtime shim test runs inside
 the built image with a disposable HTTPS fixture. The live keeper remains on
-Railway pending hosted controller verification, quiesced export, and live checks.
+Railway pending quiesced export, upstream repair, and live checks. Frontend
+defaults target the Cloudflare Worker; deployed `VITE_GAME_API_URL` and WebSocket
+overrides must change only after the keeper handoff is verified.
 
 ```bash
 bun run dev
