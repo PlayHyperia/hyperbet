@@ -57,6 +57,13 @@ and refuses to overwrite an existing output directory; an optional argument
 selects a fresh output path. This prepares source only. Cloudflare activation
 still requires durable storage, a quiesced database transfer, and live checks.
 
+`keeper/cloudflare/storage-transport.mjs` provides synchronous HTTPS calls for
+the pinned runtime. A missing or invalid response permanently stops that client
+from issuing further calls; writes are never retried automatically. Run
+`bun packages/hyperbet-solana/keeper/cloudflare/tests/storage-transport.test.mjs`
+from the repository root to test against a disposable HTTPS server (requires
+OpenSSL). The transport is not connected to the live keeper yet.
+
 ```bash
 bun run dev
 bun run dev:local
