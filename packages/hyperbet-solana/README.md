@@ -46,6 +46,17 @@ bun run verify:deployment:mainnet
 
 ## Development
 
+### Keeper hosting migration
+
+`keeper/cloudflare/runtime-manifest.json` pins the 24 files verified against the
+running keeper, including its deployed contract registry. From the repository
+root, run `node packages/hyperbet-solana/keeper/cloudflare/prepare-runtime.mjs`
+to assemble them in the ignored `.runtime` directory. Fetch the manifest's Git
+commits first if the checkout is shallow. The command verifies every file hash
+and refuses to overwrite an existing output directory; an optional argument
+selects a fresh output path. This prepares source only. Cloudflare activation
+still requires durable storage, a quiesced database transfer, and live checks.
+
 ```bash
 bun run dev
 bun run dev:local

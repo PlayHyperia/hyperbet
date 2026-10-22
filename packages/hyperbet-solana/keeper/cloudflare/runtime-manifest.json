@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "bun": "1.3.8",
+  "sourceRoot": "packages/hyperbet-solana",
+  "files": [
+    {
+      "path": "deployments/contracts.json",
+      "commit": "3f13fa9bc83d64534e59d980919e616dd8b22680",
+      "sha256": "de83de5161d0b57f0583877f24fd0e504c5721eacd945d64dd079e0d4304ca7e"
+    },
+    {
+      "path": "deployments/index.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "6f6eea34923ea2fe240cb39a89f0a65307a2f7018415437f58eebbcb93c7ef55"
+    },
+    {
+      "path": "keeper/bun.lock",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "a7ca4df47d8c3ceb566bf205c04ab789d2e493e2a8771f612f20e4b863cfb379"
+    },
+    {
+      "path": "keeper/package.json",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "556e9d20b0c314d8f14eff445286ac6eea064af7582d20a14ee46f45f8d346d7"
+    },
+    {
+      "path": "keeper/src/bot.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "7b631ffa8dcb5fd5e21a8da40a0fd5f77da8f8437bd91bc6422782af5c818348"
+    },
+    {
+      "path": "keeper/src/common.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "d5a8ef743233b4b3f93996f0571e085aa835350f50a241ee47deb34d797d35a2"
+    },
+    {
+      "path": "keeper/src/db.test.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "b0d65a19d0d2b99d94c5918b351a02581909f219341f0e6c69a74c7443ec769d"
+    },
+    {
+      "path": "keeper/src/db.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "a5703c5e8c824ed0c35bcef6e88fce4337beebbe97470a60101b8b4e5383c4db"
+    },
+    {
+      "path": "keeper/src/fight.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "1709ccf8443866f45732b308602144fe1d91cb341e6d8482f71e6327efb3ba01"
+    },
+    {
+      "path": "keeper/src/game-client.test.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "75242a36d450c61cc20b56f0ac4ee4c9235eb42993767a2a72b89af9c6b3e026"
+    },
+    {
+      "path": "keeper/src/game-client.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "45cf2f8dda0aaac2f350238b5a2b0fb3730073dfec11161902716ef587ee0a7f"
+    },
+    {
+      "path": "keeper/src/idl/fight_oracle.json",
+      "commit": "c7de5d6cf1557c04efed13e3de22979788de4153",
+      "sha256": "53647c8d46e4580bda316e8588894fc069e7f2b84b016d27274a35bc50a73b76"
+    },
+    {
+      "path": "keeper/src/idl/gold_clob_market.json",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "f74b88ba0980298f4f9a6c1e4b8a394fb4f5a742d98e5c0b4002df6c7eb1e9e8"
+    },
+    {
+      "path": "keeper/src/idl/gold_perps_market.json",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "c3db88f7063d6faf4128e660993afa9dfbaf2000f62ef0b53c024206d8c4c30f"
+    },
+    {
+      "path": "keeper/src/modelMarkets.test.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "b725201313096e840099f5d8c1e02b47eeafc1672280a0db00db6ce982655f79"
+    },
+    {
+      "path": "keeper/src/modelMarkets.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "1b4a2e3d639204fa306a5eb8bcbe955d2638ce8e9b008a377fa58ac7951c9932"
+    },
+    {
+      "path": "keeper/src/perpsMath.test.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "c764ca6479809bd6c5174ffb1d878f6dc5d49e0dd9d63b4d3806c4e3b5e677b3"
+    },
+    {
+      "path": "keeper/src/perpsMath.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "43b3cb52d5709cfc1ddc91a2e7c0e185177342e1289c11ce442f278f86cc5b5e"
+    },
+    {
+      "path": "keeper/src/resolve.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "d7aaa4df4f4061b624fe99ceec253b6aa734adffe0ec576a2be1334304b5bd88"
+    },
+    {
+      "path": "keeper/src/service.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "ed4d8daa430a7818c18cfcec0e1ac6562e6c7f56146a59eb181b016c7760274c"
+    },
+    {
+      "path": "keeper/src/trueskill.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "4651812d21e260e92be11a87f4cd182566967b9a3fd878ac09dcd080ff543893"
+    },
+    {
+      "path": "keeper/src/walletKeys.test.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "b1a43cb46b5346fe10cfd9591a707bdf6b14785d721bbc2fef06154c18604d08"
+    },
+    {
+      "path": "keeper/src/walletKeys.ts",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "cbb5a1a5d51bdae6ac18e567a6ce278f502756bd3fee3b1c9cdde1539f941abd"
+    },
+    {
+      "path": "keeper/tsconfig.json",
+      "commit": "86dbdd2a3f4a4d0d9634d209e039e30d7c41df41",
+      "sha256": "bdf8e09920880e231330e53482fc220b1ed184489f6654a5e9d0ca22f68888bb"
+    }
+  ]
+}
