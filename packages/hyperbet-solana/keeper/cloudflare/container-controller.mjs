@@ -26,6 +26,7 @@ export function createContainerController({ storage, container, waitUntil }) {
   function freeze(ownerId, reason) {
     storage.transactionSync(() => {
       if (control().owner_id !== ownerId) return;
+      if (control().phase === "frozen" && lifecycle().state === "reconcile") return;
       freezeStorageOwner(storage, ownerId);
       storage.sql.exec("UPDATE _keeper_lifecycle SET state='reconcile',owner_id=?,reason=?,reconciliation_sha256=NULL WHERE id=1", ownerId, reason);
     });
@@ -41,7 +42,7 @@ export function createContainerController({ storage, container, waitUntil }) {
     }
     waitUntil(Promise.resolve(monitor).then(
       () => freeze(ownerId, "container-stopped"),
-      () => freeze(ownerId, "container-failed"),
+      error => freeze(ownerId, Number.isInteger(error?.exitCode) ? `container-exit-${error.exitCode}` : "container-failed"),
     ).finally(() => { if (watchedOwner === ownerId) watchedOwner = undefined; }));
   }
   return {
@@ -83,16 +84,20 @@ export function createContainerController({ storage, container, waitUntil }) {
           activateStorageOwner(storage, snapshotDigest, ownerId);
           storage.sql.exec("UPDATE _keeper_lifecycle SET state='starting',owner_id=?,reason=NULL WHERE id=1", ownerId);
         });
+        let stage = "start";
         try {
           container.start({ enableInternet: true, labels: { owner: ownerId }, env: { ...env, KEEPER_STORAGE_OWNER_ID: ownerId } });
+          stage = "monitor";
           watch(ownerId);
+          stage = "inactivity-timeout";
           await container.setInactivityTimeout(21_600_000);
+          stage = "admission";
           if (control().phase !== "active" || lifecycle().state !== "starting") fail("container-stopped-during-start");
           storage.sql.exec("UPDATE _keeper_lifecycle SET state='running' WHERE id=1");
           // Running is process state, not application readiness.
           return { ownerId, state: "running" };
         } catch {
-          freeze(ownerId, "start-failed");
+          freeze(ownerId, `start-failed-${stage}`);
           if (container.running) await container.destroy();
           throw new StorageAdmissionError("container-start-failed");
         }

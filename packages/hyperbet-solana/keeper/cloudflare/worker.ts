@@ -81,7 +81,9 @@ export class KeeperContainer extends DurableObject<KeeperEnv> {
     }
     if (this.env.KEEPER_ENABLED !== "true" || !this.controller.canProxy()) return unavailable(request);
     try {
-      return await this.ctx.container!.getTcpPort(8080).fetch(request);
+      const target = new URL(request.url);
+      target.protocol = "http:";
+      return await this.ctx.container!.getTcpPort(8080).fetch(new Request(target, request));
     } catch {
       // An HTTP failure does not prove that a financial process stopped.
       return unavailable();

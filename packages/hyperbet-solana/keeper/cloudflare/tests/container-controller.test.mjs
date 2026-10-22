@@ -54,6 +54,9 @@ function fixture() {
     await f.settle();
     assert.equal(recovered.status().phase, "frozen");
     assert.equal(recovered.status().state, "reconcile");
+    assert.equal(recovered.status().reason, "container-exit-78");
+    await recovered.stop();
+    assert.equal(recovered.status().reason, "container-exit-78", "cleanup must preserve the first failure");
     assert.equal(recovered.canProxy(), false);
     await assert.rejects(recovered.activate(snapshot, {}), /container-not-stopped/);
     await assert.rejects(recovered.reconcile(crypto.randomUUID(), "b".repeat(64)), /not-admitted/);
