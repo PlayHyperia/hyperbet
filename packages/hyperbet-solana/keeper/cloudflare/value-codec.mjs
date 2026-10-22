@@ -1,12 +1,16 @@
 // Tag every structured value so ordinary records cannot collide with Map/Set
 // envelopes. Undefined is needed for the pinned functions' optional arguments.
-export function encodeValue(value, ancestors = new Set()) {
+export function encodeValue(value) {
+  return encodeWithAncestors(value, new Set());
+}
+
+function encodeWithAncestors(value, ancestors) {
   if (value === undefined) return { type: "undefined" };
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (typeof value !== "object" || ancestors.has(value)) throw new Error("Unsupported keeper storage value");
   ancestors.add(value);
-  const encode = item => encodeValue(item, ancestors);
+  const encode = item => encodeWithAncestors(item, ancestors);
   let encoded;
   if (value instanceof Map) encoded = { type: "map", value: [...value].map(([key, item]) => [encode(key), encode(item)]) };
   else if (value instanceof Set) encoded = { type: "set", value: [...value].map(encode) };
