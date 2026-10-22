@@ -4,6 +4,7 @@ type Row = Record<string, unknown>;
 export interface KeeperSqlStorage {
   sql: {
     exec(sql: string, ...bindings: Binding[]): {
+      readonly columnNames: string[];
       toArray(): Row[];
       one(): Row;
     };

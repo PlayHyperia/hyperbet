@@ -1,0 +1,21 @@
+const rating = { mu: 100, sigma: 5, gamesPlayed: 2 };
+export const operationFixtures = {
+  loadAll: [],
+  saveBet: [{ id: "bet", bettorWallet: "wallet", chain: "SOLANA", sourceAsset: "GOLD", sourceAmount: 1,
+    goldAmount: 1, feeBps: 10, txSignature: "fixture", marketPda: null, inviteCode: null, externalBetRef: null, recordedAt: 100 }],
+  saveWalletDisplay: ["wallet", "Fixture"],
+  saveWalletPoints: ["wallet", { selfPoints: 1, winPoints: 2, referralPoints: 3, stakingPoints: 4 }],
+  savePointsEvent: [{ wallet: "wallet", eventType: "fixture", status: "CONFIRMED", totalPoints: 1,
+    referenceType: null, referenceId: null, relatedWallet: null, createdAt: 100 }],
+  saveWalletGoldState: ["wallet", { goldBalance: 5, goldHoldDays: 1, updatedAt: 100 }],
+  saveWalletCanonical: ["wallet", "canonical"], saveIdentityMembers: ["canonical", new Set(["wallet"])],
+  deleteIdentityMembers: ["canonical"], saveInviteCode: ["wallet", "code"],
+  saveReferral: ["wallet", "referrer", "code"], saveInvitedWallet: ["wallet", "invitee"],
+  saveReferralFees: ["wallet", 1, 2], loadAgentRatings: [],
+  loadPerpsOracleSnapshots: [undefined, 100], loadPerpsMarkets: ["ACTIVE"],
+  saveAgentRating: ["agent", rating], saveAgentRatings: [{ agent: rating }],
+  savePerpsOracleSnapshot: [{ agentId: "agent", marketId: 1, spotIndex: 1, conservativeSkill: 1, mu: 100, sigma: 5, recordedAt: 100 }],
+  savePerpsMarket: [{ agentId: "agent", marketId: 1, rank: null, name: "Fixture", provider: "fixture", model: "fixture",
+    wins: 1, losses: 1, winRate: 50, combatLevel: 1, currentStreak: 0, status: "ACTIVE", lastSeenAt: 100,
+    deprecatedAt: null, updatedAt: 100 }],
+};
