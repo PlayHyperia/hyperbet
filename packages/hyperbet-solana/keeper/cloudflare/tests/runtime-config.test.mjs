@@ -4,6 +4,7 @@ const env = {
   KEEPER_STORAGE_TOKEN: "s".repeat(40), KEEPER_ADMIN_TOKEN: "a".repeat(40),
   KEEPER_PUBLIC_ORIGIN: "https://keeper.example.com", KEEPER_RUNTIME_CONFIG: JSON.stringify({
     BOT_ENABLED: "true", RPC_URL: "https://rpc.example.com", RAILWAY_SERVICE_ID: "source", PORT: "3000", KEEPER_DB_PATH: "/data/keeper.sqlite",
+    PATH: "/railway/bun", HOME: "/root", BUN_RUNTIME_TRANSPILER_CACHE_PATH: "/railway/cache",
   }),
 };
 const result = buildRuntimeEnv(env);
@@ -12,6 +13,9 @@ assert.equal(result.PORT, "8080");
 assert.equal(result.KEEPER_STORAGE_URL, "https://keeper.example.com/rpc");
 assert.equal(result.RAILWAY_SERVICE_ID, undefined);
 assert.equal(result.KEEPER_ADMIN_TOKEN, undefined);
+assert.equal(result.PATH, undefined);
+assert.equal(result.HOME, undefined);
+assert.equal(result.BUN_RUNTIME_TRANSPILER_CACHE_PATH, undefined);
 for (const origin of ["http://keeper.example.com", "https://user:pass@keeper.example.com", "https://keeper.example.com/secret", "https://keeper.example.com?q=1", "https://127.0.0.1", "https://keeper.internal"]) {
   assert.throws(() => buildRuntimeEnv({ ...env, KEEPER_PUBLIC_ORIGIN: origin }), /Invalid keeper runtime configuration/);
 }

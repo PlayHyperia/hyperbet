@@ -16,7 +16,8 @@ export function buildRuntimeEnv(env) {
   const result = {};
   for (const [key, value] of Object.entries(settings)) {
     if (!/^[A-Z][A-Z0-9_]*$/.test(key) || typeof value !== "string" || value.includes("\0")) invalid();
-    if (key.startsWith("RAILWAY_") || ["PORT", "NODE_ENV", "KEEPER_DB_PATH"].includes(key)) continue;
+    if (key.startsWith("RAILWAY_") || ["PORT", "NODE_ENV", "KEEPER_DB_PATH", "PATH", "HOME", "HOSTNAME",
+      "PWD", "SHLVL", "BUN_INSTALL_BIN", "BUN_RUNTIME_TRANSPILER_CACHE_PATH"].includes(key)) continue;
     if (key.startsWith("KEEPER_STORAGE_") || key.startsWith("KEEPER_SUPERVISOR_") ||
         ["KEEPER_PROCESS_GROUP_ID", "KEEPER_ADMIN_TOKEN"].includes(key)) invalid();
     // Railway's private DNS is inaccessible from the Cloudflare container.
