@@ -5,6 +5,7 @@ import { createDurableSqlDatabase } from "../durable-sql.mjs";
 import { createStorageExecutor } from "../storage-executor.mjs";
 import { prepareStorageImport, importPreparedStorage } from "../storage-import.mjs";
 import { operationFixtures } from "./operation-fixtures.mjs";
+import { createContainerController } from "../container-controller.mjs";
 
 const databases = [];
 function database() {
@@ -38,10 +39,13 @@ try {
   const prepared = await prepareStorageImport(snapshot, manifest);
   const target = database();
   const execute = createStorageExecutor(target.storage, target.operations);
+  const controller = createContainerController({ storage: target.storage, container: { running: false }, waitUntil() {} });
   assert.throws(() => importPreparedStorage(target.storage, { ...prepared }), /unverified-import/);
   assert.throws(() => { prepared.snapshot.tables[0].rows.push({}); });
   const imported = importPreparedStorage(target.storage, prepared);
   assert.equal(imported.phase, "imported");
+  assert.equal(controller.status().state, "idle");
+  assert.equal(controller.canProxy(), false, "import must not activate the controller");
   for (const table of snapshot.tables) assert.equal(imported.counts[table.name], table.rows.length);
   assert.deepEqual(importPreparedStorage(target.storage, prepared), imported);
   assert.deepEqual(target.operations.loadAll(), source.operations.loadAll());

@@ -61,7 +61,7 @@ export function importPreparedStorage(storage, prepared) {
     const control = storage.sql.exec("SELECT phase,snapshot_sha256 FROM _keeper_control WHERE id=1").one();
     const replay = control.phase === "imported" && control.snapshot_sha256 === digest;
     if (control.phase !== "prepared" && !replay) fail("import-not-admitted");
-    const metadata = new Set(["_keeper_control", "_keeper_receipts", "_keeper_owners", "__miniflare_do_name"]);
+    const metadata = new Set(["_keeper_control", "_keeper_receipts", "_keeper_owners", "_keeper_lifecycle", "__miniflare_do_name"]);
     if (!replay && (storage.sql.exec("SELECT COUNT(*) AS n FROM _keeper_receipts").one().n !== 0 ||
         storage.sql.exec("SELECT COUNT(*) AS n FROM _keeper_owners").one().n !== 0)) fail("target-not-empty");
     const targetSchema = storage.sql.exec("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL").toArray()

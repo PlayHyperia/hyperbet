@@ -64,6 +64,10 @@ The host preserves the service and bot source and replaces database calls with
 authenticated HTTPS. Uncertain storage results stop their isolated process group;
 durable owner IDs prevent stale database writes after a handoff. Imports
 verify all 15 tables and remain inactive until separately activated.
+The controller and administrative handlers require separate runtime/admin tokens,
+explicit activation, and receipt/chain reconciliation after any process exit.
+They never automatically restart a financial owner. Worker bindings and routes
+are still pending; these modules do not constitute a deployed service.
 
 Tests live in `keeper/cloudflare/tests/`. The HTTPS transport test requires
 OpenSSL; supervisor tests require Linux, and the runtime shim test runs inside
