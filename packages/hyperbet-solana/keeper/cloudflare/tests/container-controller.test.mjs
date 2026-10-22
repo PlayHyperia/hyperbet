@@ -45,8 +45,10 @@ function fixture() {
     assert.equal(f.container.options.env.KEEPER_STORAGE_OWNER_ID, first.ownerId);
     assert.equal(f.controller.canProxy(), true);
     await assert.rejects(f.controller.activate(snapshot, {}), /container-not-stopped/);
+    f.storage.sql.exec("UPDATE _keeper_lifecycle SET state='starting' WHERE id=1");
     const recovered = f.make();
     await recovered.recover();
+    assert.equal(recovered.status().state, "running", "recover the confirmed owner after an interrupted start response");
     assert.equal(f.container.starts, 1, "DO reconstruction must not start another process");
     f.container.exit(Object.assign(new Error("fixture"), { exitCode: 78 }));
     await f.settle();

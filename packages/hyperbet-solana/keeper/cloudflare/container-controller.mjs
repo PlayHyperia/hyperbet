@@ -35,6 +35,7 @@ export function createContainerController({ storage, container, waitUntil }) {
     watchedOwner = ownerId;
     let monitor;
     try { monitor = container.monitor(); } catch {
+      watchedOwner = undefined;
       freeze(ownerId, "monitor-unavailable");
       throw new StorageAdmissionError("monitor-unavailable");
     }
@@ -57,6 +58,9 @@ export function createContainerController({ storage, container, waitUntil }) {
             if (info?.labels?.owner !== current.owner_id) fail("container-owner-mismatch");
             watch(current.owner_id);
             await container.setInactivityTimeout(21_600_000);
+            if (control().phase === "active" && control().owner_id === current.owner_id) {
+              storage.sql.exec("UPDATE _keeper_lifecycle SET state='running' WHERE id=1 AND state='starting'");
+            }
           } catch {
             freeze(current.owner_id, "recovery-failed");
             if (container.running) await container.destroy();

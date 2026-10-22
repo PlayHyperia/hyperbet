@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const runtime = resolve(process.argv[2] ?? join(here, ".runtime"));
-const manifest = JSON.parse(readFileSync(join(here, "runtime-manifest.json"), "utf8"));
+const manifestBytes = readFileSync(join(here, "runtime-manifest.json"));
+const manifest = JSON.parse(manifestBytes.toString("utf8"));
+const manifestSha256 = createHash("sha256").update(manifestBytes).digest("hex");
 const path = "keeper/src/db.ts";
 const entry = manifest.files.find(file => file.path === path);
 const bytes = readFileSync(join(runtime, path));
@@ -40,6 +42,7 @@ const generated = `// Generated from verified keeper db.ts SHA-256 ${entry.sha25
   `  run(sql: string): void;\n` +
   `  prepare(sql: string): { all(...args: (string | number | null)[]): Record<string, unknown>[]; run(named: Record<string, string | number | null>): { lastInsertRowid: unknown } };\n` +
   `  transaction<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R;\n` +
-  `};\n` + source + `\nreturn { ${operations.join(", ")} };\n}\nexport { createOperations };\n`;
+  `};\n` + source + `\nreturn { ${operations.join(", ")} };\n}\nexport { createOperations };\n` +
+  `export const runtimeManifestSha256 = "${manifestSha256}";\n`;
 writeFileSync(join(runtime, "operations.ts"), generated, { flag: "wx" });
 console.log(`Prepared ${operations.length} unchanged keeper database operations`);

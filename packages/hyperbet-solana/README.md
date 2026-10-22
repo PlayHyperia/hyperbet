@@ -66,13 +66,18 @@ durable owner IDs prevent stale database writes after a handoff. Imports
 verify all 15 tables and remain inactive until separately activated.
 The controller and administrative handlers require separate runtime/admin tokens,
 explicit activation, and receipt/chain reconciliation after any process exit.
-They never automatically restart a financial owner. Worker bindings and routes
-are still pending; these modules do not constitute a deployed service.
+They never automatically restart a financial owner. `cloudflare/wrangler.toml`
+binds one container to the same SQLite Durable Object and defaults to inactive.
+Set separate `KEEPER_ADMIN_TOKEN`, `KEEPER_STORAGE_TOKEN`,
+`KEEPER_RUNTIME_CONFIG`, and `KEEPER_PUBLIC_ORIGIN` secrets before deployment.
+The public origin must be the Worker's HTTPS origin. Administrative routes are
+`/admin/status`, `/admin/import`, `/admin/activate`, `/admin/stop`, and
+`/admin/reconcile`; `/rpc` is reserved for the runtime storage credential.
 
 Tests live in `keeper/cloudflare/tests/`. The HTTPS transport test requires
 OpenSSL; supervisor tests require Linux, and the runtime shim test runs inside
 the built image with a disposable HTTPS fixture. The live keeper remains on
-Railway pending controller wiring, quiesced export, deployment, and live checks.
+Railway pending hosted controller verification, quiesced export, and live checks.
 
 ```bash
 bun run dev

@@ -1,0 +1,31 @@
+name = "hyperbet-keeper"
+main = "worker.ts"
+account_id = "23cf6feaeaa541f6a0675053c33da768"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = false
+
+[vars]
+KEEPER_ENABLED = "false"
+
+[observability]
+enabled = true
+
+[triggers]
+crons = ["* * * * *"]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["KeeperContainer"]
+
+[[containers]]
+class_name = "KeeperContainer"
+image = "./Dockerfile"
+image_build_context = "."
+max_instances = 1
+instance_type = "standard-1"
+
+[[durable_objects.bindings]]
+name = "KEEPER"
+class_name = "KeeperContainer"
