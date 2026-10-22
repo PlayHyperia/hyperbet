@@ -5,8 +5,10 @@ import { encodeValue, decodeValue } from "../value-codec.mjs";
 import { operationFixtures as cases } from "./operation-fixtures.mjs";
 const rating = cases.saveAgentRating[1];
 const token = "a".repeat(32);
+const ownerId = "11111111-1111-4111-8111-111111111111";
 let calls = 0;
-const execute = (_id, operation, args) => {
+const execute = (_id, operation, args, _fingerprint, owner) => {
+  assert.equal(owner, ownerId);
   calls++;
   assert.deepEqual(args, cases[operation]);
   return new Map([["result", { members: new Set(["wallet"]), optional: undefined }]]);
@@ -15,7 +17,7 @@ function request(payload, headers = {}, url = "https://fixture.invalid/rpc") {
   return new Request(url, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...headers }, body: JSON.stringify(payload) });
 }
 function payload(operation, args = cases[operation]) {
-  return { requestId: crypto.randomUUID(), operation, args: args.map(encodeValue) };
+  return { requestId: crypto.randomUUID(), ownerId, operation, args: args.map(encodeValue) };
 }
 assert.equal(Object.keys(cases).length, 20);
 for (const [operation, args] of Object.entries(cases)) {
@@ -36,6 +38,7 @@ assert.equal((await handleStorageRequest(request(payload("loadAll"), { authoriza
 assert.equal((await handleStorageRequest(request(payload("loadAll"), { "content-type": "text/plain" }), { token, execute })).status, 415);
 assert.equal((await handleStorageRequest(request(payload("loadAll"), {}, "https://fixture.invalid/admin"), { token, execute })).status, 404);
 assert.equal((await handleStorageRequest(request({ ...payload("loadAll"), requestId: "wrong" }), { token, execute })).status, 400);
+assert.equal((await handleStorageRequest(request({ ...payload("loadAll"), ownerId: "wrong" }), { token, execute })).status, 400);
 assert.equal(calls, 20, "invalid requests must not reach storage");
 const failed = await handleStorageRequest(request(payload("loadAll")), { token, execute() { throw new Error("private details"); } });
 assert.equal(failed.status, 409);

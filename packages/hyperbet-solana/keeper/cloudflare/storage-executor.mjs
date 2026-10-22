@@ -14,9 +14,15 @@ export function createStorageExecutor(storage, operations) {
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS _keeper_control (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     phase TEXT NOT NULL CHECK (phase IN ('prepared', 'imported', 'active', 'frozen')),
-    snapshot_sha256 TEXT
+    snapshot_sha256 TEXT,
+    owner_id TEXT
   )`);
   storage.sql.exec("INSERT OR IGNORE INTO _keeper_control (id,phase) VALUES (1,'prepared')");
+  storage.sql.exec(`CREATE TABLE IF NOT EXISTS _keeper_owners (
+    owner_id TEXT PRIMARY KEY,
+    snapshot_sha256 TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`);
   storage.sql.exec(`CREATE TABLE IF NOT EXISTS _keeper_receipts (
     request_id TEXT PRIMARY KEY,
     operation TEXT NOT NULL,
@@ -25,10 +31,11 @@ export function createStorageExecutor(storage, operations) {
     created_at INTEGER NOT NULL
   )`);
 
-  return (requestId, operation, args, fingerprint) => storage.transactionSync(() => {
-    const control = storage.sql.exec("SELECT phase,snapshot_sha256 FROM _keeper_control WHERE id = 1").one();
+  return (requestId, operation, args, fingerprint, ownerId) => storage.transactionSync(() => {
+    const control = storage.sql.exec("SELECT phase,snapshot_sha256,owner_id FROM _keeper_control WHERE id = 1").one();
     if (control.phase !== "active" || typeof control.snapshot_sha256 !== "string" ||
         !/^[a-f0-9]{64}$/.test(control.snapshot_sha256)) throw new StorageAdmissionError("inactive");
+    if (typeof ownerId !== "string" || ownerId !== control.owner_id) throw new StorageAdmissionError("stale-owner");
     if (!validateOperation(operation, args) || !Object.hasOwn(operations, operation) ||
         typeof operations[operation] !== "function" || typeof fingerprint !== "string" ||
         !/^[a-f0-9]{64}$/.test(fingerprint) || typeof requestId !== "string" ||

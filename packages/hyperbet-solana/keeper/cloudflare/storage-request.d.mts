@@ -3,6 +3,7 @@ export type StorageExecute = (
   operation: string,
   args: unknown[],
   fingerprint: string,
+  ownerId: string,
 ) => unknown;
 
 export function validateOperation(operation: unknown, args: unknown): boolean;

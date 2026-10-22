@@ -48,25 +48,27 @@ bun run verify:deployment:mainnet
 
 ### Keeper hosting migration
 
-`keeper/cloudflare/runtime-manifest.json` pins the 24 files verified against the
-running keeper, including its deployed contract registry. From the repository
-root, run `node packages/hyperbet-solana/keeper/cloudflare/prepare-runtime.mjs`
-to assemble them in the ignored `.runtime` directory. Fetch the manifest's Git
-commits first if the checkout is shallow. The command verifies every file hash
-and refuses to overwrite an existing output directory; an optional argument
-selects a fresh output path. This prepares source only. Cloudflare activation
-still requires durable storage, a quiesced database transfer, and live checks.
-Run `node packages/hyperbet-solana/keeper/cloudflare/prepare-operations.mjs`
-after preparation to generate the Durable Object database operations from the
-verified source. It preserves the SQL and operation bodies and refuses to
-overwrite existing generated output.
+`keeper/cloudflare/runtime-manifest.json` pins the 24 verified live runtime files,
+including the deployed contract registry. Fetch its Git commits before building
+from a shallow checkout. From the repository root:
 
-`keeper/cloudflare/storage-transport.mjs` provides synchronous HTTPS calls for
-the pinned runtime. A missing or invalid response permanently stops that client
-from issuing further calls; writes are never retried automatically. Run
-`bun packages/hyperbet-solana/keeper/cloudflare/tests/storage-transport.test.mjs`
-from the repository root to test against a disposable HTTPS server (requires
-OpenSSL). The transport is not connected to the live keeper yet.
+```bash
+node packages/hyperbet-solana/keeper/cloudflare/prepare-runtime.mjs
+node packages/hyperbet-solana/keeper/cloudflare/prepare-operations.mjs
+node packages/hyperbet-solana/keeper/cloudflare/prepare-host.mjs
+docker build --platform linux/amd64 -t keeper-cloudflare:local packages/hyperbet-solana/keeper/cloudflare
+```
+
+The preparation commands verify source hashes and refuse existing output paths.
+The host preserves the service and bot source and replaces database calls with
+authenticated HTTPS. Uncertain storage results stop their isolated process group;
+durable owner IDs prevent stale database writes after a handoff. Imports
+verify all 15 tables and remain inactive until separately activated.
+
+Tests live in `keeper/cloudflare/tests/`. The HTTPS transport test requires
+OpenSSL; supervisor tests require Linux, and the runtime shim test runs inside
+the built image with a disposable HTTPS fixture. The live keeper remains on
+Railway pending controller wiring, quiesced export, deployment, and live checks.
 
 ```bash
 bun run dev

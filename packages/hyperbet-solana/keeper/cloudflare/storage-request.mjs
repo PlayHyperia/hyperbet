@@ -69,9 +69,11 @@ export async function handleStorageRequest(request, { token, execute }) {
   let payload, args;
   try {
     payload = await request.json();
-    if (!record(payload) || Object.keys(payload).sort().join(",") !== "args,operation,requestId" ||
+    if (!record(payload) || Object.keys(payload).sort().join(",") !== "args,operation,ownerId,requestId" ||
         typeof payload.requestId !== "string" ||
         !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(payload.requestId) ||
+        typeof payload.ownerId !== "string" ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(payload.ownerId) ||
         !Array.isArray(payload.args)) throw new Error("Invalid request");
     args = payload.args.map(decodeValue);
     if (!validateOperation(payload.operation, args)) throw new Error("Invalid operation");
@@ -81,7 +83,7 @@ export async function handleStorageRequest(request, { token, execute }) {
       JSON.stringify({ operation: payload.operation, args: payload.args }),
     ));
     const fingerprint = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
-    const value = execute(payload.requestId, payload.operation, args, fingerprint);
+    const value = execute(payload.requestId, payload.operation, args, fingerprint, payload.ownerId);
     if (value && typeof value.then === "function") throw new Error("Storage execution must be synchronous");
     return Response.json({ requestId: payload.requestId, ok: true, value: encodeValue(value) }, {
       headers: { "cache-control": "no-store" },

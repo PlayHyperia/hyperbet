@@ -2,10 +2,11 @@ import { randomUUID } from "node:crypto";
 import { MessageChannel, receiveMessageOnPort, Worker } from "node:worker_threads";
 
 export class StorageTransportError extends Error {
-  constructor(code) {
+  constructor(code, requestId) {
     super(`Keeper storage transport: ${code}`);
     this.name = "StorageTransportError";
     this.code = code;
+    this.requestId = requestId;
   }
 }
 
@@ -25,14 +26,19 @@ function assertJsonValue(value, ancestors = new Set()) {
 }
 
 /** Synchronous calls preserve the pinned keeper's write-through ordering. */
-export function createStorageTransport({ url, token, timeoutMs = 10_000 }) {
-  const endpoint = new URL(url);
+export function createStorageTransport({ url, token, ownerId, timeoutMs = 10_000 }) {
+  let endpoint;
+  try { endpoint = new URL(url); }
+  catch { throw new StorageTransportError("invalid-endpoint"); }
   if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password ||
       endpoint.search || endpoint.hash) {
     throw new StorageTransportError("invalid-endpoint");
   }
   if (typeof token !== "string" || !/^[A-Za-z0-9_-]{32,}$/.test(token)) {
     throw new StorageTransportError("invalid-credential");
+  }
+  if (typeof ownerId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(ownerId)) {
+    throw new StorageTransportError("invalid-owner");
   }
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
     throw new StorageTransportError("invalid-timeout");
@@ -45,15 +51,18 @@ export function createStorageTransport({ url, token, timeoutMs = 10_000 }) {
   let failed = false;
   let closed = false;
   let closing;
+  let unconfirmedRequestId;
   // A blocked caller cannot process events. Its own deadline also covers a
   // thread that exits before it can publish a reply.
   worker.on("error", () => { failed = true; });
   worker.on("exit", () => { failed = true; });
+  worker.unref();
+  port1.unref();
 
   return {
     call(operation, args) {
       if (closed) throw new StorageTransportError("closed");
-      if (failed) throw new StorageTransportError("outcome-unconfirmed");
+      if (failed) throw new StorageTransportError("outcome-unconfirmed", unconfirmedRequestId);
       if (typeof operation !== "string" || !/^[A-Za-z][A-Za-z0-9]*$/.test(operation) ||
           !Array.isArray(args)) {
         throw new StorageTransportError("invalid-request");
@@ -61,7 +70,7 @@ export function createStorageTransport({ url, token, timeoutMs = 10_000 }) {
       const requestId = randomUUID();
       // Serialization errors happen before dispatch and do not poison state.
       assertJsonValue(args);
-      const body = JSON.stringify({ requestId, operation, args });
+      const body = JSON.stringify({ requestId, operation, args, ownerId });
       const state = new SharedArrayBuffer(4);
       const flag = new Int32Array(state);
       try {
@@ -81,7 +90,8 @@ export function createStorageTransport({ url, token, timeoutMs = 10_000 }) {
         // A response failure cannot prove whether a write committed. Never
         // retry or permit a later operation to overtake the uncertain write.
         failed = true;
-        throw new StorageTransportError("outcome-unconfirmed");
+        unconfirmedRequestId = requestId;
+        throw new StorageTransportError("outcome-unconfirmed", requestId);
       }
     },
     close() {

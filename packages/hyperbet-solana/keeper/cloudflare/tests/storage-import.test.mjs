@@ -23,6 +23,7 @@ function database() {
   return { storage, operations };
 }
 const manifest = "a".repeat(64);
+const ownerId = "11111111-1111-4111-8111-111111111111";
 try {
   const source = database();
   for (const [operation, args] of Object.entries(operationFixtures)) source.operations[operation](...args);
@@ -44,9 +45,9 @@ try {
   for (const table of snapshot.tables) assert.equal(imported.counts[table.name], table.rows.length);
   assert.deepEqual(importPreparedStorage(target.storage, prepared), imported);
   assert.deepEqual(target.operations.loadAll(), source.operations.loadAll());
-  assert.throws(() => execute(crypto.randomUUID(), "loadAll", [], "b".repeat(64)), /inactive/);
-  target.storage.sql.exec("UPDATE _keeper_control SET phase='active'");
-  assert.equal(execute(crypto.randomUUID(), "savePointsEvent", operationFixtures.savePointsEvent, "b".repeat(64)), 101);
+  assert.throws(() => execute(crypto.randomUUID(), "loadAll", [], "b".repeat(64), ownerId), /inactive/);
+  target.storage.sql.exec("UPDATE _keeper_control SET phase='active',owner_id=?", ownerId);
+  assert.equal(execute(crypto.randomUUID(), "savePointsEvent", operationFixtures.savePointsEvent, "b".repeat(64), ownerId), 101);
   assert.throws(() => importPreparedStorage(target.storage, prepared), /import-not-admitted/);
   await assert.rejects(prepareStorageImport({ ...snapshot, sourceQuiesced: false }, manifest), /invalid-snapshot/);
   await assert.rejects(prepareStorageImport(snapshot, "c".repeat(64)), /invalid-snapshot/);
