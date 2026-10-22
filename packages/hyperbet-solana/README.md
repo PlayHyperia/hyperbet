@@ -56,6 +56,10 @@ commits first if the checkout is shallow. The command verifies every file hash
 and refuses to overwrite an existing output directory; an optional argument
 selects a fresh output path. This prepares source only. Cloudflare activation
 still requires durable storage, a quiesced database transfer, and live checks.
+Run `node packages/hyperbet-solana/keeper/cloudflare/prepare-operations.mjs`
+after preparation to generate the Durable Object database operations from the
+verified source. It preserves the SQL and operation bodies and refuses to
+overwrite existing generated output.
 
 `keeper/cloudflare/storage-transport.mjs` provides synchronous HTTPS calls for
 the pinned runtime. A missing or invalid response permanently stops that client
